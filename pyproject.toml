@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+# Run from repo root: conda activate inno3d_ai && pytest tests/unit -q
+testpaths = ["tests/unit"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q --tb=short"
+
+[project]
+name = "inno3d-hbm"
+version = "1.2.0"
+description = "Inno3D 3D HBM void/bump inspection — Python frontend + native DLL backend"
+requires-python = ">=3.12"

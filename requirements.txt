@@ -1,0 +1,54 @@
+# Inno3D HBM — Python Dependencies
+# Generated: 2026-07-22 (pinned from conda env inno3d_ai, Python 3.12, Windows)
+#
+# Install:  conda activate inno3d_ai
+#           pip install -r requirements.txt
+#
+# Native DLLs (BumpVoidSeg, MES, B2B, Restormer ONNX) ship via V2/ folder.
+# See docs/V2_PACKAGE.md for full ship layout.
+# -----------------------------------------------------------------------
+
+# ── Core GUI & Visualization ────────────────────────────────────────────
+PyQt5==5.15.11
+PyQt5_sip==12.17.0
+vtk==9.6.0
+
+# ── Scientific computing ────────────────────────────────────────────────
+numpy==1.26.4
+scipy==1.13.1
+scikit-image==0.25.0
+scikit-learn==1.7.2
+
+# ── Image I/O ───────────────────────────────────────────────────────────
+opencv-contrib-python==4.9.0.80
+Pillow==12.2.0
+tifffile==2025.2.18
+imageio==2.37.0
+
+# ── Plotting / analysis ─────────────────────────────────────────────────
+matplotlib==3.10.8
+networkx==3.4.2
+
+# ── System / networking ──────────────────────────────────────────────────
+requests==2.33.1
+psutil==7.2.2
+
+# ── AI inference (optional — only when ONNX enhance model is used) ───────
+# GPU:  pip install onnxruntime-gpu==1.19.2
+# CPU:  pip install onnxruntime==1.19.2
+# Note: CUDA 12.x + cuDNN 9.x required for GPU path; see docs/V2_PACKAGE.md
+
+# ── Build / packaging (dev-only — NOT required on target machine) ─────────
+pyinstaller==6.19.0
+pyinstaller-hooks-contrib==2026.4
+
+# ── Testing (dev-only) ────────────────────────────────────────────────────
+pytest==9.1.1
+
+# ── NOTES ─────────────────────────────────────────────────────────────────
+# 1. PyQt5, vtk, scipy, numpy — Conda-managed; plain-pip users may need
+#    to match major.minor versions manually.
+# 2. onnxruntime-gpu: must match CUDA / cuDNN versions in V2/.
+#    Contact the team for GPU environment setup notes.
+# 3. openpyxl / pandas — NOT listed; load on demand from inspection_db.py.
+#    Add if needed: openpyxl>=3.1, pandas>=2.2

@@ -75,7 +75,7 @@ NG_THRESHOLD = 1
 # When false, segmentation runs without the ONNX pre-process step.
 ENHANCEMENT_ENABLED = false
 # Path to the ONNX model file for volume enhancement (RestormerNano, etc.)
-ENHANCED_MODEL_PATH = "E:\semiconductor\HBM_DEV_FOR_PROD\RELEASE\LIB_RELEASE\restormer_nano_dynamic_ir9_fp16.onnx"
+ENHANCED_MODEL_PATH = "V2/restormer_nano_e9900_dynamic_ir9_fp16.onnx"
 # TensorRT engine cache folder (speeds up subsequent runs)
 ENHANCED_TRT_CACHE_PATH = ./TRT_Cache
 # Use GPU for enhancement (true/false)

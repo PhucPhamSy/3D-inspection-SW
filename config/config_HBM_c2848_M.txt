@@ -61,7 +61,7 @@ NG_THRESHOLD = 1.0
 # Path to the ONNX model file for volume enhancement (RestormerNano, etc.)
 # Leave empty to skip enhancement step.
 ENHANCEMENT_ENABLED = false
-ENHANCED_MODEL_PATH = "E:\phuc\HBM\LIB_RELEASE\V2\restormer_nano_e9900_dynamic_ir9_fp16.onnx"
+ENHANCED_MODEL_PATH = "V2/restormer_nano_e9900_dynamic_ir9_fp16.onnx"
 # TensorRT engine cache folder (speeds up subsequent runs)
 ENHANCED_TRT_CACHE_PATH = ./TRT_Cache
 # Use GPU for enhancement (true/false)

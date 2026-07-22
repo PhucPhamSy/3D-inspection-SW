@@ -52,7 +52,6 @@ def default_dll_dir() -> Optional[str]:
     if not getattr(sys, "frozen", False):
         # Dev monorepo layout: …/all_v2/HBM_frontend_backend_v12 and …/all_v2/V2
         candidates.append(project_root().parent / "V2")
-        candidates.append(Path(r"E:\semiconductor\HBM_DEV_FOR_PROD\DEV\all_v2\V2"))
 
     for c in candidates:
         try:

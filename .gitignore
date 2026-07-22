@@ -17,10 +17,18 @@ build/
 *.swp
 *.swo
 
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
 # Application runtime
 Inno3D_Logs/
 Inno3D_Data/
 *.db
+*.db-wal
+*.db-shm
+*.log
 
 # OS
 Thumbs.db
@@ -29,11 +37,16 @@ Desktop.ini
 
 # Native binaries (too large for git)
 V2/
+BoundaryDll/
+BoundaryGPU/
 
 # .NET build output
 [Bb]in/
 [Oo]bj/
 
+# Agent / tool caches
+.gemini/
+.antigravityignore
+
 # Misc
 *.pyc
-.antigravityignore

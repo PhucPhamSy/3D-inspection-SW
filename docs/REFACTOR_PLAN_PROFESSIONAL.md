@@ -1,11 +1,99 @@
 # Inno3D HBM — Professional Source Refactor Plan
 
-**Status:** Ready for execution (Claude Opus / multi-PR stack)  
+**Status:** In progress — Viewer Phase 3 through **3.3b ✅** · Phase 0 ✅ · Phase 1 ✅ · human smoke ✅  
 **Product:** Inno3D Inspection — HBM 3D void/bump analysis (Python + PyQt5 + VTK + native ISP DLLs)  
 **Workspace:** `HBM_frontend_backend_v12`  
 **Audience:** Refactor agent (Claude Opus) + human reviewer  
 **Created:** 2026-07-22  
+**Last updated:** 2026-07-22 (re-audit source; 3.2c–3.3b landed)  
+**Agents:** Claude **Opus** (hard / high-risk), Claude **Sonnet** (easy / mechanical)  
+**Env:** `conda activate inno3d_ai` (Python 3.10+)  
 **Related context:** packaging for outsource (`build_final.bat` + `V2/`), Online progress UX, MPR nav (crosshair/zoom/pan), C# port plans  
+
+---
+
+## 0. Snapshot — repo health (re-audit)
+
+Use this section as the **source of truth for “where we are”** before starting the next agent session.  
+**Verify command:** `conda activate inno3d_ai` then `pytest tests/unit -q`.
+
+### 0.1 Verified OK (automated + human)
+
+| Item | Status |
+|------|--------|
+| Unit tests | **68 passed** (`inno3d_ai`) |
+| Human smoke | **✅ User confirmed OK** |
+| `VERSION` / `inno3d.__version__` | **1.2.0** |
+| Phase 0 artifacts | `requirements.txt`, `pyproject.toml`, `docs/SMOKE_CHECKLIST.md` |
+| Phase 1 paths | relative `ENHANCED_MODEL_PATH` + runtime resolve (logged done) |
+| Method **duplicates** viewer ↔ feature mixins | **none** |
+| Mixin imports | **top of** `tabs/viewer.py` (lines 43–46) |
+| `preview_only` dead path | **removed** (no True/False force left) |
+| Packaged layout | `dist/Inno3D/` + `V2/` + config |
+
+### 0.2 Viewer extract map (current — inspect.getfile)
+
+MRO: `MultiPlanarView` → `MprInputMixin` → `MprRenderMixin` → `MprNavMixin` → `CrosshairMixin` → `QWidget`
+
+| Symbol | Module (owner) | LOC file (approx) |
+|--------|----------------|-------------------|
+| `updatePoint`, hit/click, `update_3d_crosshair`, actors | `features/viewer/crosshair.py` | ~1,100 |
+| zoom/pan/slice scroll helpers | `features/viewer/mpr_nav.py` | ~500 |
+| `eventFilter`, `setup_vtk_observers` | `features/viewer/mpr_input.py` | ~550 |
+| `render_slice`, ruler, `reset_view` | `features/viewer/mpr_render.py` | ~490 |
+| **Still on** `tabs/viewer.py` | UI shell, 3D volume, WL, clip, stats/tables, align, `update_slice`, `save_camera_state`, … | **~12,827 lines / ~277 methods** |
+
+**Progress on viewer size:** ~15k → **~12.8k** (nav+crosshair+input+render extracted). Still far from &lt;2.5k façade target.
+
+### 0.3 Remaining debt (honest feedback)
+
+| ID | Issue | Status | Agent |
+|----|--------|--------|-------|
+| F1 | Crosshair cohesion | **✅ fixed in 3.2c** | — |
+| F2 | `preview_only` dead API | **✅ fixed** | — |
+| F3 | Mid-file imports | **✅ fixed** (top imports) | — |
+| F3b | Mojibake / encoding in comments | ⚠️ low priority if only intentional UTF-8 | Sonnet optional |
+| F4 | God-file remainder (3D, WL, clip, FrozenTable, stats, align) | 🔴 open (~12.8k still on façade) | **Opus 3.4–3.6** |
+| F4b | `save_camera_state` / `update_slice` still on façade (OK short-term) | 🟡 minor | Opus optional with 3.3b/3.4 |
+| F5 | `requirements.txt` | **✅ improved** (scikit-image, tifffile, pyqt5, …) | — |
+| F6 | Layout A (`pipeline/`, `domain/`, `store/`) | ⚪ not started — **wait** | later |
+| F7 | `docs/V2_PACKAGE.md`, `docs/OUTSOURCE_PACKAGE.md` | **✅ present** | — |
+| F8 | `features/viewer/__init__.py` still empty (no public exports) | 🟡 minor | Sonnet |
+| F9 | Teaching / Online / AI god-files untouched | 🔴 open | Opus later phases |
+
+### 0.4 Extract rule (enforced)
+
+**MOVE, never COPY.** Dual definitions = failed PR.  
+After MOVE, keep **related symbols** in the same epic (do not strand hit-test / input next to façade).
+
+### 0.5 Package layout vs target A
+
+Stakeholder target (scale layout):
+
+```text
+inno3d/
+  app/        # shell
+  viewer/     # MPR + volume (final name)
+  pipeline/   # SEG/MES/B2B/enhance + jobs
+  domain/     # pure models
+  store/      # DB
+  ai/
+  online/
+  analysis/
+```
+
+**Current tree is intermediate** (`features/`, `core/`, `modes/`, `tabs/`). Do **not** big-bang rename to A until viewer extract is complete and de-duplicated. Mapping:
+
+| Target A | Interim (now) | Final migration |
+|----------|---------------|-----------------|
+| `app/` | `app/` | keep |
+| `viewer/` | `features/viewer/` + `tabs/viewer.py` | rename after split |
+| `pipeline/` | `core/bumpvoid*` | Phase 2 native/pipeline |
+| `domain/` | bits of `wafer_context`, models | Phase 0+/domain |
+| `store/` | `core/inspection_db.py` | rename later |
+| `online/` | `modes/online.py` | Phase 5 |
+| `analysis/` | `tabs/analysis.py` | Phase 7 |
+| `ai/` | `tabs/ai.py` + `services/` | Phase 7 |
 
 ---
 
@@ -154,13 +242,14 @@ HBM_frontend_backend_v12/
 
 1. **Behavior-preserving first** — golden path Online + Teaching SEG + Viewer load must pass after each PR.
 2. **Strangler fig** — extract modules; keep re-exports so old imports work during transition.
-3. **One PR = one concern** — reviewable; avoid “move everything” commits.
-4. **No drive-by renames** of public DLL symbols / packet layout / DB schema.
-5. **Absolute paths** allowed only as **dev fallback** behind `if not frozen` (document).
-6. **Prefer composition** over another mixin on MainWindow.
-7. **After each phase:** run app manually smoke + any unit tests added.
-8. **Do not** expand `unnecessary/` or leave dead duplicates of moved code.
-
+3. **MOVE, do not COPY** — after extract, **delete** the same methods from the god-file. Dual definitions are a failed extract. **Also import every free name** used by moved methods into the target module (`numpy_support`, `ndimage`, Qt types, …) — Python looks up names in the **defining** module, not the host class.
+4. **One PR = one concern** — reviewable; avoid “move everything” commits.
+5. **No drive-by renames** of public DLL symbols / packet layout / DB schema.
+6. **Absolute paths** allowed only as **dev fallback** behind `if not frozen` (document).
+7. **Prefer composition** over another mixin on MainWindow.
+8. **After each phase:** run app manually smoke + any unit tests added; update §10 Progress log.
+9. **Do not** expand `unnecessary/` or leave dead duplicates of moved code.
+10. **Do not** rename to package layout A until the current god-file for that area is actually thin (< ~2.5k façade).
 ---
 
 ## 5. Phased plan (execute in order)
@@ -169,18 +258,20 @@ HBM_frontend_backend_v12/
 
 **Why:** Safe refactor without regression blindness.
 
+**Status:** ⚠️ **Partial** — unit tests green; missing VERSION / requirements / SMOKE_CHECKLIST.
+
 **Tasks:**
 
 1. Document golden smoke checklist (below §8) in `docs/SMOKE_CHECKLIST.md`.
-2. Add `tests/unit/` with pure tests (no GPU required):
+2. Add `tests/unit/` with pure tests (no GPU required): ✅ largely done
    - `wafer_context.parse_host_volume_path` (or extracted `domain/wafer_path.py`)
    - `resources.default_dll_dir` / `app_runtime_dir` with monkeypatched `sys.frozen` / `sys.executable`
    - Layer Z remap helper if extractable from Online/Teaching
-3. Pin `requirements.txt` (or export from current env) with versions used for build.
-4. Add `VERSION` file or `__version__` in `inno3d/__init__.py`.
+3. Pin `requirements.txt` (or export from current env) with versions used for build. ❌
+4. Add `VERSION` file or `__version__` in `inno3d/__init__.py`. ❌
 5. Ensure `.gitignore` covers `dist/`, `build/`, `Inno3D_Logs/`, `*.pyc`, large local DBs if needed.
 
-**Exit:** `pytest tests/unit -q` green; smoke checklist filled once on dev machine.
+**Exit:** `pytest tests/unit -q` green; smoke checklist filled once on dev machine; VERSION + requirements present.
 
 ---
 
@@ -188,9 +279,11 @@ HBM_frontend_backend_v12/
 
 **Why:** Outsource build failures + hard-coded paths.
 
+**Status:** ⚠️ **Partial** — `infra/paths`, `logging_setup`, `app/settings` exist; recipe absolute paths / full audit may remain.
+
 **Tasks:**
 
-1. Expand `inno3d/core/resources.py` → `inno3d/infra/paths.py` (keep shim re-export).
+1. Expand `inno3d/core/resources.py` → `inno3d/infra/paths.py` (keep shim re-export). ✅
 2. Audit and remove/guard all remaining absolute paths in runtime code:
    ```
    rg "E:\\\\|E:/" --glob "*.py"
@@ -198,7 +291,7 @@ HBM_frontend_backend_v12/
    - Runtime: must use `app_runtime_dir() / "V2"` etc.
    - Dev-only fallbacks OK under `not frozen`.
 3. Config system:
-   - `app/settings.py` reads `app_config.ini` next to exe
+   - `app/settings.py` reads `app_config.ini` next to exe ✅ (theme path)
    - Optional sections: `[DLL] dir=`, `[ONLINE] port=`, `[APPEARANCE] theme=`
 4. Recipe defaults: relative `config/config_HBM_c2848_M.txt`; rewrite absolute `ENHANCED_MODEL_PATH` to `V2/restormer_....onnx` when present.
 5. Central logging in `infra/logging_setup.py`:
@@ -234,25 +327,43 @@ HBM_frontend_backend_v12/
 
 **Why:** 14k LOC blocks all professional work.
 
+**Status:** 🟢 **3.1 → 3.3b DONE** (nav, crosshair+cohesion, input, render). `viewer.py` ~**12.8k** left. **NEXT = 3.4 volume_3d** (or 3.5 WL/clip).
+
 **Suggested extraction order (keep `MultiPlanarView` as façade initially):**
 
-| PR | Extract to | Contents |
-|----|------------|----------|
-| 3.1 | `features/viewer/mpr_nav.py` | Zoom Fiji, pan, wheel, shortcuts, link MPR, hit radii |
-| 3.2 | `features/viewer/crosshair.py` | Hit test, drag, updatePoint sync, 2D/3D hair |
-| 3.3 | `features/viewer/mpr_render.py` | `render_slice`, camera state, ruler |
-| 3.4 | `features/viewer/volume_3d.py` | Volume actor, Dragonfly style host, lighting, TF glue |
-| 3.5 | `features/viewer/window_level.py` + `clip_box.py` | WL widgets, Dragonfly clip |
-| 3.6 | `features/viewer/stats_panel.py` | Object stats / B2B tables if tightly coupled |
+| PR | Extract to | Contents | Status |
+|----|------------|----------|--------|
+| 3.1a/b | `mpr_nav.py` | Zoom Fiji, pan, wheel, shortcuts | ✅ |
+| 3.2a/b/c | `crosshair.py` | updatePoint, hit, click, 2D/3D hair, actors | ✅ |
+| 3.3a | `mpr_input.py` | `eventFilter` + `setup_vtk_observers` | ✅ |
+| 3.3b | `mpr_render.py` | `render_slice`, ruler, `reset_view` | ✅ |
+| **3.4** | **`volume_3d.py`** | Volume actor, Dragonfly interactor host, lighting, TF glue | ❌ **NEXT Opus** |
+| 3.5 | `window_level.py` + `clip_box.py` | WL widgets, Dragonfly clip | not started |
+| 3.6 | `stats_panel.py` + tables | FrozenTable / Excel filters / object stats | not started |
+| 3.7 | rename → `inno3d/viewer` (layout A) | Only after façade thin | later |
+
+**Acceptance so far:** pytest 68 + human smoke ✅ after early phases; re-smoke after each 3.4+ extract.
+
+**3.4 acceptance (next):**
+
+```bash
+conda activate inno3d_ai
+# volume helpers resolve outside tabs/viewer.py
+python -c "from inno3d.tabs.viewer import MultiPlanarView; import inspect; print(inspect.getfile(MultiPlanarView.render_3d))"
+# expect features/viewer/volume_3d.py (or agreed module)
+pytest tests/unit -q
+# human: load volume, 3D track/pan/zoom, lighting still works
+```
 
 **Rules:**
 
-- `updatePoint` remains **single source of truth** for crosshair ↔ sliders (`X/Y/Z` mapping documented).
-- Prefer **one** input path long-term (Qt eventFilter **or** VTK observers); document interim dual-path.
-- Do not reintroduce 3D zoom-to-cursor pan (breaks Track pivot on volume render).
-- Public methods used by Online/Teaching (`set_volume_data`, `update_all_views`, `clear_all_views`, overlay APIs) stay on façade or explicit ports.
+- `updatePoint` remains **single source of truth** for crosshair ↔ sliders.
+- Input already consolidated in `mpr_input.py` — avoid re-duplicating observers.
+- Do not reintroduce 3D zoom-to-cursor pan.
+- MOVE not COPY; prove `inspect.getfile` for every moved public method.
+- Prefer extracting **volume_3d** before stats tables (risk: 3D regressions).
 
-**Exit:** `viewer/tab.py` < ~2.5k LOC façade; nav/crosshair/render in separate files; smoke Viewer OK.
+**Exit (phase 3 overall):** `tabs/viewer.py` ≪ 5k then ≪ 2.5k façade; volume/WL/stats out; smoke Viewer OK.
 
 ---
 
@@ -453,6 +564,26 @@ Do not reformat entire repo. Do not touch V2 binary files.
 | Date | Phase | Notes | Agent |
 |------|-------|-------|-------|
 | 2026-07-22 | Plan authored | Baseline inventory; packaging/nav lessons captured | Planning |
+| 2026-07-22 | 0 partial | `tests/unit` 68 passed; missing VERSION, requirements, SMOKE_CHECKLIST | Prior agent |
+| 2026-07-22 | 1 partial | `infra/paths`, `logging_setup`, `app/settings`; main.py wired | Prior agent |
+| 2026-07-22 | 3.1a / 3.2a | Created `MprNavMixin` / `CrosshairMixin` + MRO; **methods still duplicated in viewer.py** | Prior agent |
+| 2026-07-22 | Health check | Confirmed dead mixin copies; dist/V2 package OK; plan refreshed | Grok review |
+| 2026-07-22 | Plan | §12 Sonnet vs Opus assignment matrix | Grok |
+| 2026-07-22 | **0 ✅ DONE** | `VERSION` (1.2.0), `requirements.txt` (inno3d_ai env pinned), `docs/SMOKE_CHECKLIST.md`, `conftest.py`, `pyproject.toml`; `.gitignore` updated (BoundaryDll/GPU, pytest cache, .log); `inno3d/__init__.py` reads VERSION file; **pytest 68 passed** | **Sonnet** |
+| 2026-07-22 | **3.1b+3.2b ✅ DONE** | DELETED 33 duplicate methods (19 nav + 14 crosshair) from `tabs/viewer.py`. `inspect.getfile` verified mixins. Zero AST duplicates. **pytest 68 passed** | **Opus** |
+| 2026-07-22 | Human smoke | User confirmed **smoke test OK** (Viewer checklist) | Human |
+| 2026-07-22 | Review | Feedback F1–F7 written into plan | Grok |
+| 2026-07-22 | **Bugfix** | Mixin define-scope imports; 3D fullscreen pivot sync | **Opus** |
+| 2026-07-22 | **3.2c ✅ DONE** | hit/click/3d hair → `crosshair.py`; `preview_only` stripped | **Opus** |
+| 2026-07-22 | **1 ✅ DONE** | Relative `ENHANCED_MODEL_PATH` + `app_runtime_dir` resolve | **Opus** |
+| 2026-07-22 | **Bugfix** | Teaching relative enhance path | **Opus** |
+| 2026-07-22 | **3.3a ✅ DONE** | `eventFilter` + `setup_vtk_observers` → `mpr_input.py` | **Opus** |
+| 2026-07-22 | **3.3b ✅ DONE** | `render_slice`/ruler/`reset_view` → `mpr_render.py`; more hair → crosshair | **Opus** |
+| 2026-07-22 | **F3+F5+F7 ✅ DONE** | imports top; requirements; V2/OUTSOURCE docs | **Sonnet** |
+| 2026-07-22 | **Re-audit** | pytest 68; MRO Input→Render→Nav→Crosshair; no dups; viewer ~12827; next 3.4 | Grok |
+| 2026-07-22 | **Bugfix** | Load volume / Online crash: `NameError: numpy_support is not defined` in `mpr_render.render_slice` (extract forgot `from vtk.util import numpy_support` + `scipy.ndimage`). Fixed imports in `features/viewer/mpr_render.py`. | Grok |
+| | **NEXT (Opus)** | **3.4 volume_3d** — when extracting, **import every symbol used in moved code** (define-module scope) | **Opus** |
+| | **NEXT (Sonnet)** | Optional F8 / Phase 9 only — do not block 3.4 | **Sonnet** |
 | | | | |
 
 ---
@@ -464,18 +595,137 @@ Do not reformat entire repo. Do not touch V2 binary files.
 3. **Online progress:** stage-only UI; smooth bar; non-blocking dialog.
 4. **3D zoom:** pivot-based dolly; **do not** re-enable display_xy pan on volume render.
 5. **Crosshair ↔ slicer:** always via `updatePoint` full sync (no desynced preview).
+6. **Extract rule:** MOVE not COPY — dual method definitions = failed PR.
+7. **Extract imports:** methods use **define-module** globals — every name (`numpy_support`, `ndimage`, `vtk`, …) must be imported in the **target** module, not only in `tabs/viewer.py`.
 
 ---
 
-## 12. Appendix — recommended first three PRs for Opus
+## 12. Agent assignment — Opus (hard) vs Sonnet (easy)
 
-If capacity is limited, execute only:
+### 12.1 How to choose
 
-1. **Phase 0** — tests + version + checklist  
-2. **Phase 1** — paths/config/logging  
-3. **Phase 3.1 + 3.2** — extract `mpr_nav` + `crosshair` from `viewer.py`  
+| Prefer **Opus** when… | Prefer **Sonnet** when… |
+|----------------------|-------------------------|
+| Touches `viewer.py` / `teaching.py` / `online.py` core behavior | Adds files without rewriting gods |
+| MOVE extract / **cohesion finish (3.2c, 3.3a)** | Docs, VERSION, requirements freeze, checklists |
+| Crosshair ↔ slider / VTK+Qt event paths | Path audit grep + mechanical rewrites behind tests |
+| Online TCP + pipeline orchestration | Re-exports / shims / `__init__.py` scaffolding |
+| Split that can regress SEG or MPR | Unit tests for pure functions already stable |
+| Judgment on “what stays on façade” | Hygiene: imports to top, mojibake, pin deps from `inno3d_ai` |
 
-Then reassess LOC and Online stability before Teaching/Online splits.
+**Always run agents with:** `conda activate inno3d_ai` then `pytest` / inspect.
+
+**Parallelism:** Sonnet may run **Phase 0 finish** or **docs/package docs** while Opus does **3.1b/3.2b**, as long as they do not both edit `tabs/viewer.py`.
+
+**Never give Sonnet alone:** first-time extract of a new 2k+ slice from `viewer.py` without Opus review; Online pipeline redesign; “rename whole monorepo to layout A” in one shot.
+
+---
+
+### 12.2 Full phase matrix
+
+| Phase | Difficulty | **Agent** | Why |
+|-------|------------|-----------|-----|
+| **0 finish** (VERSION, `requirements.txt`, `SMOKE_CHECKLIST.md`) | 🟢 Easy | **Sonnet** | Mechanical files; low risk |
+| **0 extra** (more unit tests for pure helpers) | 🟢 Easy | **Sonnet** | Tests only; no UI |
+| **1 finish** (recipe `ENHANCED_MODEL_PATH`, path audit, settings sections) | 🟡 Medium–easy | **Sonnet** (default) / Opus if many call sites break | Mostly grep + portable paths; use tests |
+| **2** Native DLL façade (`pipeline/` or `native/`) | 🔴 Hard | **Opus** | ctypes, CUDA search, freeze packaging, SEG fallback |
+| **3.1b + 3.2b** Delete duplicate methods in `viewer.py` | 🔴 Hard | **Opus** | Easy to break MRO / leave stubs / desync; high value |
+| **3.3** `mpr_render` extract (MOVE) | 🔴 Hard | **Opus** | VTK render path; Online/Teaching call into it |
+| **3.4** `volume_3d` extract (MOVE) | 🔴 Hard | **Opus** | Volume + lighting + TF glue |
+| **3.5** WL + clip_box extract | 🟠 Hard–medium | **Opus** | Coupled UI + VTK |
+| **3.6** stats_panel extract | 🟡 Medium | **Sonnet** *after* Opus façade is stable | More UI isolation if ports clear |
+| **3.7** Rename `features/viewer` → `inno3d/viewer` (layout A) | 🟡 Medium | **Sonnet** *after* thin façade | Import rewrites + re-exports; mechanical if plan lists paths |
+| **4** Split `teaching.py` | 🔴 Hard | **Opus** | SEG workers + Online hooks |
+| **5** Online → controller/service | 🔴 Hard | **Opus** | Protocol + pipeline + progress |
+| **6** Thin `main.py` / app shell | 🟡 Medium | **Sonnet** *if* only moves already-isolated code; else **Opus** | Import graph + splash order |
+| **7** Analysis / Batch / AI hygiene | 🟡 Medium | **Sonnet** for AI services tidy; **Opus** if Analysis SOH logic moves | Prefer Sonnet for file moves + tests |
+| **8** Packaging docs + `V2_PACKAGE.md` + slim profile notes | 🟢 Easy | **Sonnet** | Docs + bat comments; no algorithm |
+| **9** Polish (ruff config, ADRs, type hints on public APIs) | 🟢 Easy–medium | **Sonnet** | Incremental; no behavior change |
+
+---
+
+### 12.3 Recommended queue (can run two agents)
+
+```text
+DONE
+  ├─ Opus   → 3.1b/3.2b MOVE, 3.2c cohesion, 3.3a mpr_input, 3.3b mpr_render
+  ├─ Opus   → Phase 1 path/recipe fix
+  ├─ Sonnet → Phase 0 (VERSION, requirements, SMOKE_CHECKLIST)
+  └─ Human  → smoke OK
+
+NOW
+  ├─ Opus   → 3.4 volume_3d (hard)
+  └─ Sonnet → mojibake + V2_PACKAGE.md + OUTSOURCE_PACKAGE.md (easy)
+
+THEN
+  ├─ Opus   → 3.5 WL/clip, 3.6 stats/tables (or Sonnet 3.6 if ports clear)
+  └─ Opus   → Phase 2 native/pipeline when viewer façade &lt; ~8k
+
+LATER
+  ├─ Opus   → Phase 4 teaching, Phase 5 online
+  └─ Sonnet → 3.7 layout A rename, Phase 6 thin main, Phase 9 polish
+```
+
+---
+
+### 12.4 Prompts (copy-paste)
+
+#### A) Opus — next (hard) — 3.4 volume_3d
+
+```text
+You are Claude Opus. Env: conda activate inno3d_ai.
+Read docs/REFACTOR_PLAN_PROFESSIONAL.md §0, Phase 3.4, §11, §12.
+
+Execute ONLY Phase 3.4 (HARD — MOVE volume/3D stack out of tabs/viewer.py):
+1. Create features/viewer/volume_3d.py with Volume3dMixin (or agreed name)
+2. MOVE render_3d / volume actor setup / lighting / TF glue / Dragonfly style host hooks
+   (only methods that clearly belong to 3D volume — do not move MPR render again)
+3. Wire MRO on MultiPlanarView; DELETE originals from viewer.py (MOVE not COPY)
+4. Do NOT touch teaching/online; do NOT rename package to layout A
+5. Preserve: 3D Track/pan/zoom about pivot (NO display_xy pan), LOD if present
+6. **CRITICAL:** in volume_3d.py import ALL names used by moved code (vtk, numpy_support, np, Qt, themes, …). Regression 2026-07-22: mpr_render crash NameError numpy_support.
+
+Verify:
+  conda activate inno3d_ai
+  pytest tests/unit -q
+  python -c "from inno3d.tabs.viewer import MultiPlanarView; import inspect; print(inspect.getfile(MultiPlanarView.render_3d))"
+  # must be features/viewer/volume_3d.py (or listed module)
+  # smoke-load: call path must not NameError on first render_slice / render_3d
+
+Update §10. List human smoke: load volume, 3D rotate/pan/zoom, opacity/lighting.
+```
+
+#### B) Sonnet — optional (easy)
+
+```text
+You are Claude Sonnet. Env: conda activate inno3d_ai.
+Read docs/REFACTOR_PLAN_PROFESSIONAL.md §0.3 F8, Phase 9.
+
+V2_PACKAGE + OUTSOURCE docs already exist. Optional only:
+1. features/viewer/__init__.py — document/export mixins + MRO
+2. Phase 9 polish (ruff config / light typing) — no behavior change
+3. Do NOT extract volume_3d (Opus owns 3.4)
+
+pytest tests/unit -q; update §10 if you ship anything.
+```
+
+#### D) Opus — later hard tracks (pick one per session)
+
+```text
+You are Claude Opus. Read docs/REFACTOR_PLAN_PROFESSIONAL.md.
+
+Execute ONLY [Phase 2 | Phase 3.3 mpr_render | Phase 4 teaching | Phase 5 online].
+MOVE not COPY. One concern. Preserve §11 contracts.
+pytest + list smoke steps. Update §10.
+```
+
+---
+
+### 12.5 Human gate (you)
+
+- **Baseline smoke:** ✅ confirmed OK after 3.1b/3.2b (2026-07-22).
+- After **every later Opus** session that touches Viewer/Teaching/Online: re-run relevant rows of `docs/SMOKE_CHECKLIST.md` (especially crosshair ↔ sliders after 3.2c / 3.3a).
+- Sonnet sessions: `conda activate inno3d_ai` → `pytest tests/unit -q` unless they touched `build_final.bat`.
 
 ---
 
