@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+
+# PyInstaller
+dist/
+build/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Application runtime
+Inno3D_Logs/
+Inno3D_Data/
+*.db
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Native binaries (too large for git)
+V2/
+
+# .NET build output
+[Bb]in/
+[Oo]bj/
+
+# Misc
+*.pyc
+.antigravityignore

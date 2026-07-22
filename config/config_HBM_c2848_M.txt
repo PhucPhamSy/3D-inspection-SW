@@ -1,0 +1,90 @@
+# Bump + VOID DETECTION CONFIG FILE
+
+# === FILE PATHS ===
+INPUT_PATH = E:/phuc/HBM/enhanced/VOLUME_ENHANCEMENT_deploy/Test_model1/350ms-Chip2848CenterLowQualVol360p (2)
+INPUT_MODE = single  # Options: test_1layer, single, multi_layer
+OUTPUT_DIR = E:/phuc/HBM/output_test_
+TEST_NAME = HBM_InspectionDLL
+
+# === BUMP DETECTION ===
+BUMP_THRESHOLD_WEIGHT = 0.9
+BUMP_CLEAN_OPEN_RADIUS_X = 0.0
+BUMP_CLEAN_OPEN_RADIUS_Y = 0.0
+BUMP_CLEAN_OPEN_RADIUS_Z = 4.0
+BUMP_BG_OPEN_RADIUS_X = 41.0
+BUMP_BG_OPEN_RADIUS_Y = 41.0
+BUMP_BG_OPEN_RADIUS_Z = 1.0
+
+# === VOID DETECTION ===
+VOID_THRESHOLD_WEIGHT = 0.5
+VOID_PRE_EM_OPEN_RADIUS_X = 3.0
+VOID_PRE_EM_OPEN_RADIUS_Y = 3.0
+VOID_PRE_EM_OPEN_RADIUS_Z = 3.0
+VOID_TOPHAT_RADIUS_X = 7.0
+VOID_TOPHAT_RADIUS_Y = 7.0
+VOID_TOPHAT_RADIUS_Z = 3.0
+VOID_NOISE_REMOVAL_OPEN_RADIUS_X = 0.5
+VOID_NOISE_REMOVAL_OPEN_RADIUS_Y = 0.5
+VOID_NOISE_REMOVAL_OPEN_RADIUS_Z = 0.0
+TGV_SHRUNK_ERODE_RADIUS_X = 3.0
+TGV_SHRUNK_ERODE_RADIUS_Y = 3.0
+TGV_SHRUNK_ERODE_RADIUS_Z = 1.0
+
+# === BLANK SLICES ===
+TOP_AIR_START_SLICE_NUM = 0
+TOP_AIR_END_SLICE_NUM = 0
+BTM_AIR_START_SLICE_NUM = 0
+BTM_AIR_END_SLICE_NUM = 0
+
+# === OPTIONS ===
+SAVE_TGV_DEBUG_IMG = false
+SAVE_VOID_DEBUG_IMG = false
+SHOW_FLATTENED_TGV_VOID = false
+
+# === CC3D Connected Component Labeling ===
+CC3D_CONNECTIVITY = 26
+CC3D_MIN_VOXELS = 0
+CC3D_USE_GPU = true
+
+# === MEASUREMENT ===
+VOXEL_SIZE_X = 0.309
+VOXEL_SIZE_Y = 0.3355
+VOXEL_SIZE_Z = 0.7335
+Z_STRETCHED_4X = true
+BUMP_MINIMUM_SIZE = 100
+BUMP_MAXIMUM_SIZE = 9999999
+VOID_MINIMUM_SIZE = 10
+VOID_MAXIMUM_SIZE = 9999999
+NG_THRESHOLD = 1.0
+
+# ── Enhancement (ONNX Model) ─────────────────
+# Path to the ONNX model file for volume enhancement (RestormerNano, etc.)
+# Leave empty to skip enhancement step.
+ENHANCEMENT_ENABLED = false
+ENHANCED_MODEL_PATH = "E:\phuc\HBM\LIB_RELEASE\V2\restormer_nano_e9900_dynamic_ir9_fp16.onnx"
+# TensorRT engine cache folder (speeds up subsequent runs)
+ENHANCED_TRT_CACHE_PATH = ./TRT_Cache
+# Use GPU for enhancement (true/false)
+ENHANCED_USE_GPU = true
+# GPU device ID (0 for first GPU)
+ENHANCED_GPU_DEVICE_ID = 0
+
+
+# Enhancement mode: full = all slices; layers = selected LAYER_* ranges only
+ENHANCEMENT_MODE = full
+ENHANCEMENT_SAVE_OUTPUT = true
+# === LAYER DEFINITIONS ===
+# Format: LAYER_N = name,z_start,z_end,selected
+NUM_LAYERS = 12
+LAYER_0 = Layer 1,20,70,true
+LAYER_1 = Layer 2,85,133,true
+LAYER_2 = Layer 3,160,210,true
+LAYER_3 = Layer 4,245,285,true
+LAYER_4 = Layer 5,314,360,true
+LAYER_5 = Layer 6,387,440,true
+LAYER_6 = Layer 7,457,509,true
+LAYER_7 = Layer 8,524,575,true
+LAYER_8 = Layer 9,606,654,true
+LAYER_9 = Layer 10,675,727,true
+LAYER_10 = Layer 11,754,803,true
+LAYER_11 = Layer 12,824,873,true
