@@ -13,6 +13,24 @@ set "BUILD_WORKDIR=%cd%\build\pyinstaller"
 set "SPEC_DIR=%cd%\build\spec"
 set "DIST_DIR=%cd%\dist"
 
+REM Read version from VERSION file
+set "APP_VERSION=unknown"
+if exist "%cd%\VERSION" (
+    set /p APP_VERSION=<"%cd%\VERSION"
+)
+echo Version: %APP_VERSION%
+
+REM PACKAGE_SLIM: set to 1 to copy only core DLLs (SEG/MES/B2B/ENH + OpenCV/CUDA).
+REM Skips large TRT / onnxruntime bulk for UI-only outsource packages.
+REM Usage: set PACKAGE_SLIM=1 && build_final.bat
+if not defined PACKAGE_SLIM set PACKAGE_SLIM=0
+if "%PACKAGE_SLIM%"=="1" (
+    echo [SLIM MODE] Only core DLLs will be copied ^(no TRT bulk^)
+) else (
+    echo [FULL MODE] Full V2 package will be copied
+)
+echo.
+
 REM Step 1: Create icon (optional, skips if script or source missing)
 if exist "%ICON_SCRIPT%" (
     echo [1/4] Creating application icon...
@@ -45,7 +63,6 @@ pyinstaller --noconfirm ^
     --distpath="%DIST_DIR%" ^
     --add-data="%cd%\assets;assets" ^
     --add-data="%cd%\config;config" ^
-    --add-data="%cd%\native;native" ^
     --collect-submodules="inno3d" ^
     --exclude-module="PySide6" ^
     --exclude-module="PySide2" ^
@@ -83,11 +100,16 @@ echo.
 echo [4/4] Verifying build...
 if exist "dist\%APP_NAME%\%APP_NAME%.exe" (
     echo ==========================================
-    echo   BUILD SUCCESSFUL!
-    echo ==========================================
+    echo   BUILD SUCCESSFUL!  v%APP_VERSION%
+    echo ======================================
     echo.
     echo Output: dist\%APP_NAME%\%APP_NAME%.exe
     for %%I in ("dist\%APP_NAME%\%APP_NAME%.exe") do echo Size: %%~zI bytes
+    echo.
+    REM Write version stamp next to exe
+    echo %APP_VERSION%> "dist\%APP_NAME%\VERSION.txt"
+    echo Build: %DATE% %TIME%>> "dist\%APP_NAME%\VERSION.txt"
+    echo Stamped VERSION.txt: %APP_VERSION%
     echo.
     REM Station config + inspection DB live next to the exe (editable / portable)
     if exist "%cd%\app_config.ini" (
@@ -101,13 +123,37 @@ if exist "dist\%APP_NAME%\%APP_NAME%.exe" (
     REM Native SEG/MES/B2B/ENH + CUDA/OpenCV deps — MUST sit next to the exe.
     REM PyInstaller does NOT embed these; outsource machines lack E:\semiconductor\...
     if exist "%cd%\V2" (
-        echo Copying V2 native DLL package next to exe ^(this can take several minutes^)...
         if not exist "dist\%APP_NAME%\V2" mkdir "dist\%APP_NAME%\V2"
-        robocopy "%cd%\V2" "dist\%APP_NAME%\V2" /E /XO /R:1 /W:1 /NFL /NDL /NP
-        if errorlevel 8 (
-            echo WARNING: robocopy reported errors while copying V2
+        if "%PACKAGE_SLIM%"=="1" (
+            echo Copying SLIM V2 ^(core DLLs only — no TRT bulk^)...
+            REM Core native binaries
+            for %%F in (
+                BumpVoidSeg.dll BumpVoidDLL.dll
+                BumpVoidMes.dll
+                BoundaryGPU.dll BumpVoidB2B.dll
+                BumpVoid_ISP_ENH.dll EnhancedVolumeDLL.dll
+                opencv_world4110.dll
+            ) do (
+                if exist "%cd%\V2\%%F" (
+                    copy /Y "%cd%\V2\%%F" "dist\%APP_NAME%\V2\%%F" >nul
+                    echo   Copied %%F
+                )
+            )
+            REM CUDA runtime essentials (cublas, cudart, curand — skip cuDNN/TRT bulk)
+            for %%F in (cublas64*.dll cublasLt64*.dll cudart64*.dll curand64*.dll) do (
+                for %%G in ("%cd%\V2\%%F") do (
+                    if exist "%%G" copy /Y "%%G" "dist\%APP_NAME%\V2\" >nul
+                )
+            )
+            echo Slim V2 copied  ^(SEG+MES+B2B+ENH+OpenCV+CUDA-core^)
         ) else (
-            echo Copied V2\ next to exe  ^(required for BumpVoidSeg / OpenCV / CUDA deps^)
+            echo Copying full V2 native DLL package next to exe ^(this can take several minutes^)...
+            robocopy "%cd%\V2" "dist\%APP_NAME%\V2" /E /XO /R:1 /W:1 /NFL /NDL /NP
+            if errorlevel 8 (
+                echo WARNING: robocopy reported errors while copying V2
+            ) else (
+                echo Copied V2\ next to exe  ^(required for BumpVoidSeg / OpenCV / CUDA deps^)
+            )
         )
     ) else (
         echo WARNING: V2\ folder not found. Packaged app will fail to load native DLLs.
@@ -132,6 +178,12 @@ if exist "dist\%APP_NAME%\%APP_NAME%.exe" (
     echo Zip the entire dist\%APP_NAME%\ folder ^(do not send only the .exe^).
     echo Icon should now display correctly!
     echo ==========================================
+    echo.
+    REM Optional: post-build smoke check (no GPU required)
+    if exist "%cd%\scripts\post_build_smoke.py" (
+        echo Running post-build smoke check...
+        python "%cd%\scripts\post_build_smoke.py" --dist-dir "dist\%APP_NAME%"
+    )
 ) else (
     echo ==========================================
     echo   BUILD FAILED!

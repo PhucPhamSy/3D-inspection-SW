@@ -1,9 +1,8 @@
 # Bump + VOID DETECTION CONFIG FILE
+# Recipe parameters only — INPUT/OUTPUT paths are set by the app at runtime.
 
-# === FILE PATHS ===
-INPUT_PATH = E:/phuc/HBM/enhanced/VOLUME_ENHANCEMENT_deploy/Test_model1/350ms-Chip2848CenterLowQualVol360p (2)
+# === RECIPE META ===
 INPUT_MODE = single  # Options: test_1layer, single, multi_layer
-OUTPUT_DIR = E:/phuc/HBM/output_test_
 TEST_NAME = HBM_InspectionDLL
 
 # === BUMP DETECTION ===

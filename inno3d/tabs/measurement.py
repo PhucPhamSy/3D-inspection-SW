@@ -20,8 +20,8 @@ class InspectionResultTab(QWidget):
     def __init__(self):
         super().__init__()
         self.segmentation_data = None
-        self.class1_data = None  # ThÃªm
-        self.class2_data = None  # ThÃªm        
+        self.class1_data = None  # Thêm
+        self.class2_data = None  # Thêm        
         self.labeled_data = None
         self.spacing = [1.0, 1.0, 1.0]
         self.downsample_factor = 1
@@ -29,7 +29,7 @@ class InspectionResultTab(QWidget):
         # Colors: BG tá»‘i, Class1 vÃ ng gold, Class2 Ä‘á»
         self.colors = {
             0:   [0.10, 0.10, 0.12],   # BG xÃ¡m ráº¥t tá»‘i
-            128: [1.00, 0.84, 0.00],   # Class 1 - vÃ ng gold
+            128: [1.00, 0.84, 0.00],   # Class 1 - vàng gold
             255: [1.00, 0.10, 0.10]    # Class 2 - Ä‘á»
         }
         
@@ -656,7 +656,7 @@ class InspectionResultTab(QWidget):
         self.progress.setValue(0)
         
         self.load_class1_btn.setEnabled(False)  # Thay vÃ¬ self.load_btn
-        self.load_class2_btn.setEnabled(False)  # ThÃªm dÃ²ng nÃ y
+        self.load_class2_btn.setEnabled(False)  # Added
         self.rerender_btn.setEnabled(False)
         self.calc_stats_btn.setEnabled(False)
         
@@ -690,7 +690,7 @@ class InspectionResultTab(QWidget):
     def on_render_finished(self, actors, error):
         self.progress.close()
         self.load_class1_btn.setEnabled(True)  # Thay vÃ¬ self.load_btn
-        self.load_class2_btn.setEnabled(True)  # ThÃªm dÃ²ng nÃ y
+        self.load_class2_btn.setEnabled(True)  # Added
         self.rerender_btn.setEnabled(True)
         self.calc_stats_btn.setEnabled(True)
         
@@ -978,7 +978,7 @@ class InspectionResultTab(QWidget):
     
     def merge_class_masks(self):
         """Merge cÃ¡c class masks thÃ nh segmentation_data"""
-        # Láº¥y shape tá»« class cÃ³ sáºµn
+      
         if self.class1_data is not None:
             shape = self.class1_data.shape
         elif self.class2_data is not None:

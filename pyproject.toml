@@ -11,3 +11,47 @@ name = "inno3d-hbm"
 version = "1.2.0"
 description = "Inno3D 3D HBM void/bump inspection — Python frontend + native DLL backend"
 requires-python = ">=3.12"
+
+# ─── Ruff linter (Phase 9 polish) ─────────────────────────────────────────────
+# Run: ruff check inno3d/ --fix
+# Run: ruff format inno3d/
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+exclude = [
+    "inno3d/tabs/ai.py",       # intentionally deferred (user request)
+    "build/",
+    "dist/",
+    ".venv/",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes (undefined names, unused imports)
+    "I",    # isort (import order)
+    "UP",   # pyupgrade (modern Python syntax)
+    "B",    # flake8-bugbear (common bugs)
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "E402",   # module level import not at top (splash/lazy imports in main.py)
+    "F401",   # unused import — some re-exports are intentional
+    "F403",   # star import (PyQt5 wildcard — acceptable for UI code)
+    "F405",   # star import may be undefined (PyQt5)
+    "B008",   # do not perform function call in default argument
+    "SIM105", # use contextlib.suppress — not always cleaner
+    "UP007",  # use X | Y for unions — requires Python 3.10+, keep compat
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["inno3d"]
+force-sort-within-sections = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false

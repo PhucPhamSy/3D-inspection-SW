@@ -1,4 +1,4 @@
-﻿import time
+import time
 from PyQt5.QtCore import Qt, QPropertyAnimation, pyqtProperty, pyqtSignal, QTimer, QRect, QPoint, QEasingCurve
 from PyQt5.QtGui import QPainter, QColor, QFont, QBrush, QPen, QLinearGradient, QPainterPath
 from PyQt5.QtWidgets import (

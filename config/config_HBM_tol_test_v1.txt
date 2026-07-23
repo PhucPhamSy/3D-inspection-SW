@@ -1,8 +1,7 @@
 # Bump + VOID DETECTION CONFIG FILE
+# Recipe parameters only — INPUT/OUTPUT paths are set by the app at runtime.
 
-# === FILE PATHS ===
-INPUT_PATH = E:/semiconductor/HBM_DEV_FOR_PROD/dataset/tol_test_lastChance_v4/PKg-1440-80kv-8w-100ms-2500mDegree-1/sep_layer_6x6\Layer9.tif
-OUTPUT_DIR = E:/semiconductor/HBM_DEV_FOR_PROD/dataset/tol_test_lastChance_v4/PKg-1440-80kv-8w-100ms-2500mDegree-1/out
+# === RECIPE META ===
 TEST_NAME = HBM_InspectionDLL
 
 # === BUMP DETECTION ===

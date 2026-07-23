@@ -155,4 +155,68 @@ Run: **P1–P6** on a clean machine without source tree.
 
 ---
 
-*Last updated: 2026-07-22 | Maintainer: refactor agent (Sonnet/Opus per phase)*
+## Known-good baseline (2026-07-23 — post Phase 4–8 partial)
+
+- Unit tests: **82 passed** (`tests/unit/` — added `test_native_loader.py`) ✅
+- **Startup smoke (S1–S4):** ✅ App boots, all tabs visible, no import crash (post P1b slim)
+- **Online smoke (O1–O6):** ✅ Full FOV pipeline verified:
+  - Server starts port 8000 ✅
+  - Packet 520 bytes received (Counter #13) ✅
+  - 12 layers segmented (BumpVoidSeg.dll v0.0.0) ✅
+  - MES: 457 objects, 1.3s ✅
+  - B2B: 1530 gaps / 12 layers (BoundaryGPU.dll) ✅
+  - DB catalogued (run_id `run_9c4933b9b612`) ✅
+  - 3D viewer load after pipeline ✅
+- **main.py:** 154 LOC (−93%) ✅
+- **tabs/analysis.py:** 30 LOC (−99%) ✅
+- **tabs/batch_review.py:** 36 LOC (−98%) ✅
+- **tabs/teaching.py:** 156 LOC (−99%) ✅
+- **modes/online.py:** 54 LOC (−98%) ✅
+
+---
+
+### After Phase 6 (main.py slim — P1b)
+
+```bash
+conda activate inno3d_ai
+python -c "
+import ast
+src = open('main.py').read()
+classes = [c.name for c in ast.walk(ast.parse(src)) if isinstance(c, type(ast.parse('class X: pass').body[0]))]
+print('Classes in main.py (should be empty):', classes)
+n = src.count(chr(10))
+print(f'main.py: {n} lines (target < 200)')
+"
+# Expected: Classes in main.py: [] | lines: 154
+```
+
+Then run: **S1–S4** (full startup).
+
+### After Phase 7 (analysis/batch slim — P1)
+
+```bash
+conda activate inno3d_ai
+python -c "
+from inno3d.tabs.analysis import AnalysisTab
+from inno3d.features.analysis.tab_ui import AnalysisTab as FeatAT
+print('Same class:', AnalysisTab is FeatAT)
+from inno3d.tabs.batch_review import BatchReviewTab
+from inno3d.features.batch_review.tab import BatchReviewTab as FeatBR
+print('Same class:', BatchReviewTab is FeatBR)
+"
+# Expected: Same class: True (both lines)
+```
+
+### After Phase 8 (packaging — Sonnet)
+
+Run: **P1–P6** on a clean machine without source tree.
+
+```bash
+# Verify VERSION.txt written next to exe after build_final.bat:
+type dist\Inno3D\VERSION.txt
+# Expected: 1.2.0
+```
+
+---
+
+*Last updated: 2026-07-23 | Maintainer: refactor agent (Sonnet/Opus per phase)*

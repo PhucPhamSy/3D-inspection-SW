@@ -11,6 +11,8 @@ from inno3d.core.resources import (
     resource_path,
     default_dll_dir,
     default_config_path,
+    config_dir,
+    list_config_files,
 )
 
 
@@ -106,3 +108,38 @@ class TestDefaultConfigPath:
         if result is not None:
             assert Path(result).is_file()
             assert result.endswith(".txt")
+
+
+class TestConfigDirAndList:
+    def test_config_dir_points_at_recipes(self):
+        if getattr(sys, "frozen", False):
+            pytest.skip("Running in frozen mode")
+        d = config_dir()
+        assert isinstance(d, Path)
+        assert d.name == "config"
+        assert d.is_dir()
+
+    def test_list_config_files_finds_hbm_recipes(self):
+        if getattr(sys, "frozen", False):
+            pytest.skip("Running in frozen mode")
+        files = list_config_files()
+        assert isinstance(files, list)
+        names = {p.name for p in files}
+        # At least the primary HBM recipes should ship in repo config/
+        assert "config_HBM_c2848_M.txt" in names or "config_HBM.txt" in names
+        for p in files:
+            assert p.is_file()
+            assert p.suffix.lower() == ".txt"
+
+    def test_recipes_are_parameter_only(self):
+        """Shipped recipes should not hard-code machine INPUT_PATH / OUTPUT_DIR."""
+        if getattr(sys, "frozen", False):
+            pytest.skip("Running in frozen mode")
+        for p in list_config_files():
+            text = p.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                assert not s.startswith("INPUT_PATH"), f"{p.name} still has INPUT_PATH"
+                assert not s.startswith("OUTPUT_DIR"), f"{p.name} still has OUTPUT_DIR"

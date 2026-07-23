@@ -407,6 +407,7 @@ def write_combined_gap(path: str, rows: List[Dict[str, Any]]) -> str:
     fieldnames = [
         "#",
         "Layer",
+        "z_start",  # layer Z origin for local→global voxel mapping (Teaching/Viewer)
         "Src_row",
         "Src_col",
         "Direction",

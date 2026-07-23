@@ -229,13 +229,13 @@ class PixelDecoderFPN(nn.Module):
 
     def forward(self, features):
         # Top-down path
-        laterals = [lat(f) for lat, f in zip(self.lateral_convs, features)]
+        laterals = [lat(f) for lat, f in zip(self.lateral_convs, features, strict=False)]
         # FPN fusion from coarse to fine
         for i in range(len(laterals) - 2, -1, -1):
             up = F.interpolate(laterals[i + 1], size=laterals[i].shape[2:], mode='bilinear', align_corners=True)
             laterals[i] = laterals[i] + up
         # Output convolutions
-        outs = [conv(lat) for conv, lat in zip(self.output_convs, laterals)]
+        outs = [conv(lat) for conv, lat in zip(self.output_convs, laterals, strict=False)]
         # Finest-scale mask features
         mask_feats = self.mask_features(outs[0])
         # Memory for transformer = coarsest feature flattened

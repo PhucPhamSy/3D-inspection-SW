@@ -1,10 +1,9 @@
 # BumpVoid_config.ini
 # ============================================
 # Bump + Void Detection Configuration
+# Recipe parameters only — INPUT/OUTPUT paths are set by the app at runtime.
 # ============================================
 
-INPUT_PATH = D:/data/sample_stack.tif
-OUTPUT_DIR = D:/data/results
 TEST_NAME = HBM_InspectionDLL
 
 # ── Bump Detection ──────────────────────────

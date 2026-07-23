@@ -7,8 +7,8 @@ packaging.
 Layer: infra (may import stdlib only; no Qt, no VTK).
 """
 import os
-import sys
 from pathlib import Path
+import sys
 from typing import Optional
 
 
@@ -38,7 +38,7 @@ def resource_path(relative_path: str) -> str:
     return str((base_path / relative_path).resolve())
 
 
-def default_dll_dir() -> Optional[str]:
+def default_dll_dir() -> str | None:
     """Resolve portable V2/ native DLL folder for SEG / MES / B2B / ENH.
 
     Search order:
@@ -62,31 +62,73 @@ def default_dll_dir() -> Optional[str]:
     return None
 
 
-def default_config_path() -> Optional[str]:
-    """Resolve a default HBM config file for first launch."""
-    names = (
+# Recipe files are parameter-only (no INPUT_PATH / OUTPUT_DIR).
+# Plain KEY = value text — fast line parse, human-editable, DLL-native.
+RECIPE_EXTENSIONS = (".txt",)
+
+
+def config_dir() -> Path:
+    """Directory of inspection recipes shipped next to the app.
+
+    Prefer ``<exe_or_project>/config`` (populated by build). Dev fallback:
+    project ``config/``. Does not create the folder.
+    """
+    candidates = [app_runtime_dir() / "config"]
+    if not getattr(sys, "frozen", False):
+        candidates.append(project_root() / "config")
+        try:
+            candidates.append(Path(resource_path("config")))
+        except Exception:
+            pass
+    for d in candidates:
+        try:
+            if d.is_dir():
+                return d.resolve()
+        except OSError:
+            continue
+    return (app_runtime_dir() / "config")
+
+
+def list_config_files() -> list[Path]:
+    """Sorted list of recipe files under :func:`config_dir` (basename order)."""
+    d = config_dir()
+    if not d.is_dir():
+        return []
+    files: list[Path] = []
+    try:
+        for p in d.iterdir():
+            if p.is_file() and p.suffix.lower() in RECIPE_EXTENSIONS:
+                files.append(p.resolve())
+    except OSError:
+        return []
+    return sorted(files, key=lambda p: p.name.lower())
+
+
+def default_config_path() -> str | None:
+    """Resolve a default HBM recipe for first launch (prefer known names)."""
+    preferred = (
         "config_HBM_c2848_M.txt",
         "config_HBM.txt",
     )
-    search_dirs = [
-        app_runtime_dir() / "config",
-        project_root() / "config" if not getattr(sys, "frozen", False) else None,
-        Path(resource_path("config")),
-    ]
+    by_name = {p.name.lower(): p for p in list_config_files()}
+    for name in preferred:
+        hit = by_name.get(name.lower())
+        if hit is not None:
+            return str(hit)
+    # Any remaining recipe in config/
+    files = list_config_files()
+    if files:
+        return str(files[0])
+    # Last-resort search (legacy absolute / monorepo layouts in dev only)
     if not getattr(sys, "frozen", False):
-        search_dirs.append(project_root().parent)
-        search_dirs.append(Path(r"E:\semiconductor\HBM_DEV_FOR_PROD\DEV\all_v2"))
-
-    for d in search_dirs:
-        if d is None:
-            continue
-        for name in names:
-            p = Path(d) / name
-            try:
-                if p.is_file():
-                    return str(p.resolve())
-            except OSError:
-                continue
+        for d in (project_root().parent, Path(r"E:\semiconductor\HBM_DEV_FOR_PROD\DEV\all_v2")):
+            for name in preferred:
+                p = Path(d) / name
+                try:
+                    if p.is_file():
+                        return str(p.resolve())
+                except OSError:
+                    continue
     return None
 
 

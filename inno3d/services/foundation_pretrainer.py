@@ -16,23 +16,24 @@ Author: INNO3D Team
 Version: 1.0.0
 """
 
-import os
+from collections.abc import Callable
 import copy
 import math
+import os
+from typing import Optional, Tuple
+
 import numpy as np
-from typing import Optional, Tuple, Callable
 
 try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    from torch.utils.data import Dataset, DataLoader
+    from torch.utils.data import DataLoader, Dataset
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
 
 from PyQt5.QtCore import QThread, pyqtSignal
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. Semiconductor-Specific Augmentations
@@ -53,7 +54,7 @@ class SemiconductorAugmentations:
     def random_crop(img: torch.Tensor, crop_size: int = 96) -> torch.Tensor:
         """Random spatial crop from a slice."""
         _, H, W = img.shape
-        if H <= crop_size or W <= crop_size:
+        if crop_size >= H or crop_size >= W:
             return F.interpolate(
                 img.unsqueeze(0), size=(crop_size, crop_size),
                 mode='bilinear', align_corners=False
@@ -332,10 +333,10 @@ class BYOL(nn.Module):
     def update_target(self):
         """Update target network via exponential moving average."""
         for op, tp in zip(self.online_encoder.parameters(),
-                          self.target_encoder.parameters()):
+                          self.target_encoder.parameters(), strict=False):
             tp.data = self.ema_decay * tp.data + (1 - self.ema_decay) * op.data
         for op, tp in zip(self.online_projector.parameters(),
-                          self.target_projector.parameters()):
+                          self.target_projector.parameters(), strict=False):
             tp.data = self.ema_decay * tp.data + (1 - self.ema_decay) * op.data
 
     @staticmethod
@@ -556,7 +557,7 @@ def load_pretrained_encoder(
     pretrained_path: str,
     device: torch.device = None,
     strict: bool = False,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """
     Load pre-trained foundation encoder weights into a segmentation model.
     

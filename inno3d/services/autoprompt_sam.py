@@ -26,11 +26,11 @@ Author: AutoPrompt-SAM Pipeline
 """
 
 import traceback
+
 import numpy as np
+from PyQt5.QtCore import QThread, pyqtSignal
 from scipy import ndimage
 from skimage import filters, measure, morphology
-
-from PyQt5.QtCore import QThread, pyqtSignal
 
 try:
     import cv2

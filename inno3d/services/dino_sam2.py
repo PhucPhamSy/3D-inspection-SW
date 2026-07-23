@@ -14,8 +14,8 @@ Usage:
     worker.start()
 """
 import traceback
-import numpy as np
 
+import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
 # Lazy imports — heavy libs loaded only when needed
@@ -39,7 +39,7 @@ def _load_gdino():
     if _gdino_model is not None:
         return _gdino_processor, _gdino_model
     import torch
-    from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
     GDINO_ID = "IDEA-Research/grounding-dino-base"
     _gdino_processor = AutoProcessor.from_pretrained(GDINO_ID)
     _gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(GDINO_ID).to(_get_device())
@@ -57,10 +57,10 @@ def _load_sam(checkpoint_path=None):
     global _sam_predictor
     if _sam_predictor is not None:
         return _sam_predictor
-    
+
+    from segment_anything import SamPredictor, sam_model_registry
     import torch
-    from segment_anything import sam_model_registry, SamPredictor
-    
+
     if checkpoint_path is None:
         # Try common paths
         import os
@@ -75,24 +75,24 @@ def _load_sam(checkpoint_path=None):
             if os.path.exists(cp):
                 checkpoint_path = cp
                 break
-        
+
         if checkpoint_path is None:
             # Auto-download vit_b (smallest, ~375MB)
             import urllib.request
             os.makedirs(os.path.expanduser("~/.cache/sam"), exist_ok=True)
             checkpoint_path = os.path.expanduser("~/.cache/sam/sam_vit_b_01ec64.pth")
             url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-            print(f"Downloading SAM vit_b checkpoint (~375MB)...")
+            print("Downloading SAM vit_b checkpoint (~375MB)...")
             urllib.request.urlretrieve(url, checkpoint_path)
             print("Download complete.")
-    
+
     # Detect model type from filename
     mt = "vit_b"
     if "vit_l" in checkpoint_path.lower():
         mt = "vit_l"
     elif "vit_h" in checkpoint_path.lower():
         mt = "vit_h"
-    
+
     sam = sam_model_registry[mt](checkpoint=checkpoint_path)
     if torch.cuda.is_available():
         sam.to(device="cuda")
@@ -109,18 +109,18 @@ def detect(image_pil, text_prompts, box_threshold=0.25, text_threshold=0.25):
     import torch
     processor, model = _load_gdino()
     device = _get_device()
-    
+
     # Clean prompts: each item is a separate detection target
     cleaned = [p.lower().strip().rstrip('.') for p in text_prompts]
     # Grounding DINO expects: "prompt1. prompt2. prompt3."
     text_string = ". ".join(cleaned) + "."
-    
+
     print(f"[DINO] Text input: '{text_string}' | box_threshold={box_threshold}")
-    
+
     inputs = processor(images=image_pil, text=text_string, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
-    
+
     try:
         # Older transformers versions (e.g. 4.46.3) use 'box_threshold'
         results = processor.post_process_grounded_object_detection(
@@ -135,7 +135,7 @@ def detect(image_pil, text_prompts, box_threshold=0.25, text_threshold=0.25):
             threshold=box_threshold, text_threshold=text_threshold,
             target_sizes=[image_pil.size[::-1]]
         )
-    
+
     r = results[0]
     n_boxes = len(r.get("boxes", []))
     print(f"[DINO] Raw detections: {n_boxes} boxes")
@@ -145,7 +145,7 @@ def detect(image_pil, text_prompts, box_threshold=0.25, text_threshold=0.25):
             score = r["scores"][i].item()
             box = r["boxes"][i].tolist()
             print(f"  [{i}] label='{lbl}' score={score:.3f} box={[round(v,1) for v in box]}")
-    
+
     return r
 
 
@@ -206,14 +206,14 @@ def segment_with_sam(image_np_rgb, boxes_tensor, sam_predictor=None):
     if len(boxes_tensor) == 0:
         h, w = image_np_rgb.shape[:2]
         return np.zeros((0, h, w), dtype=bool), []
-    
+
     predictor = sam_predictor or _load_sam()
     predictor.set_image(image_np_rgb)
-    
+
     boxes_np = boxes_tensor.cpu().numpy()
     all_masks = []
     all_ious = []
-    
+
     for box in boxes_np:
         masks, iou_scores, _ = predictor.predict(
             box=box,
@@ -223,7 +223,7 @@ def segment_with_sam(image_np_rgb, boxes_tensor, sam_predictor=None):
         best_idx = int(np.argmax(iou_scores))
         all_masks.append(masks[best_idx])
         all_ious.append(float(iou_scores[best_idx]))
-    
+
     return np.array(all_masks), all_ious
 
 
@@ -246,12 +246,12 @@ def run_pipeline(image_pil, prompts, box_threshold=0.25, nms_iou=0.5, sam_predic
     results = detect(image_pil, prompts, box_threshold=box_threshold)
     results = filter_large_boxes(results, image_pil)
     results = apply_nms(results, iou_threshold=nms_iou)
-    
+
     if len(results["boxes"]) == 0:
         w, h = image_pil.size
-        print(f"[DINO] No detections after filtering — returning empty masks")
+        print("[DINO] No detections after filtering — returning empty masks")
         return results, np.zeros((0, h, w), dtype=bool), []
-    
+
     image_rgb = np.array(image_pil)
     masks, iou_scores = segment_with_sam(image_rgb, results["boxes"], sam_predictor)
     print(f"[SAM] Generated {len(masks)} masks, IoU scores: {[round(s,3) for s in iou_scores]}")
@@ -321,7 +321,7 @@ class DinoSam2Worker(QThread):
             img = self.image_2d
             print(f"[DinoSam2Worker] Image shape={img.shape} dtype={img.dtype} "
                   f"min={img.min()} max={img.max()}")
-            
+
             if img.ndim == 2:
                 img_pil = Image.fromarray(img).convert("RGB")
             else:

@@ -11,9 +11,9 @@ Features:
 
 Layer: infra (no Qt, no VTK).
 """
+from datetime import datetime
 import logging
 import sys
-from datetime import datetime
 
 from inno3d.infra.paths import log_dir
 

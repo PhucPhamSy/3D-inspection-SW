@@ -62,7 +62,7 @@ def set_theme(theme_name: str) -> None:
 # ──────────────────────────────────────
 # [DLL]
 # ──────────────────────────────────────
-def get_dll_dir() -> Optional[str]:
+def get_dll_dir() -> str | None:
     """DLL override from ini; ``None`` → use ``default_dll_dir()`` fallback."""
     raw = _read_ini().get("DLL", "dir", fallback="").strip()
     if raw and Path(raw).is_dir():

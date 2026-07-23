@@ -17,11 +17,12 @@ Author: INNO3D Team
 Version: 1.0.0
 """
 
-import os
-import math
-import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+import math
+import os
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 try:
     import torch
@@ -32,7 +33,6 @@ except ImportError:
     HAS_TORCH = False
 
 from PyQt5.QtCore import QThread, pyqtSignal
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. Data Structures
@@ -54,11 +54,11 @@ class SliceUncertainty:
 @dataclass
 class ActiveLearningState:
     """Persistent state for the active learning session."""
-    labeled_slices: List[int] = field(default_factory=list)
-    recommended_slices: List[int] = field(default_factory=list)
-    all_uncertainties: List[SliceUncertainty] = field(default_factory=list)
-    entropy_map: Optional[np.ndarray] = None  # (D, H, W) per-pixel entropy
-    accuracy_history: List[Tuple[int, float]] = field(default_factory=list)
+    labeled_slices: list[int] = field(default_factory=list)
+    recommended_slices: list[int] = field(default_factory=list)
+    all_uncertainties: list[SliceUncertainty] = field(default_factory=list)
+    entropy_map: np.ndarray | None = None  # (D, H, W) per-pixel entropy
+    accuracy_history: list[tuple[int, float]] = field(default_factory=list)
     total_slices: int = 0
     mc_passes: int = 0
     status: str = "idle"
@@ -98,7 +98,7 @@ class MCDropoutEstimator:
         z_from: int = 0,
         z_to: int = -1,
         progress_callback=None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Run MC-Dropout estimation on a volume.
         
@@ -236,9 +236,9 @@ class CoreSetSelector:
     def select_diverse(
         features: np.ndarray,
         n_select: int,
-        labeled_indices: List[int] = None,
-        candidate_indices: List[int] = None,
-    ) -> List[int]:
+        labeled_indices: list[int] = None,
+        candidate_indices: list[int] = None,
+    ) -> list[int]:
         """
         Greedy CoreSet selection: pick slices that maximize minimum
         distance to the already-selected set.
@@ -280,7 +280,7 @@ class CoreSetSelector:
             candidate_indices.remove(seed)
             n_select -= 1
             selected = [seed]
-        
+
         selected = labeled_indices.copy() if labeled_indices else (
             [seed] if 'seed' in dir() else []
         )
@@ -288,11 +288,11 @@ class CoreSetSelector:
         for _ in range(n_select):
             if not candidate_indices:
                 break
-            
+
             cand_feats = features[candidate_indices]
             dists = cdist(cand_feats, selected_features, metric='euclidean')
             min_dists = dists.min(axis=1)
-            
+
             best_local = np.argmax(min_dists)
             best_idx = candidate_indices[best_local]
 
@@ -383,7 +383,7 @@ class ActiveLearningWorker(QThread):
 
             def on_progress(current, total):
                 pct = 5 + int(current / total * 70)
-                self.progress.emit(pct, 100, 
+                self.progress.emit(pct, 100,
                     f"Uncertainty scan: slice {current}/{total}")
 
             entropy_map, variance_map, mean_pred = estimator.estimate_volume(
