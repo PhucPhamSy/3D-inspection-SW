@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import numpy as np
 import vtk
-from scipy import ndimage
 from vtk.util import numpy_support
 from PyQt5.QtCore import Qt
+
+from inno3d.features.shared.mes_mpr_highlight import (
+    build_mes_selection_highlight_rgb,
+    labeled_slice_for_orientation,
+)
 
 
 class MprRenderMixin:
@@ -106,8 +110,11 @@ class MprRenderMixin:
             cache.get('display_mode') != _display_mode
         )
         
-        # Overlay visibility/opacity must be part of the cache key so C1/C2/opacity
-        # toggles always rebuild the actor stack (not a stale RGB film).
+        # Overlay visibility/opacity/colour must be part of the cache key so
+        # C1/C2/opacity/colour toggles always rebuild (not a stale RGB film).
+        _seg = getattr(self, "seg_colors", {}) or {}
+        _c1_col = tuple(_seg.get(128, [1.0, 1.0, 0.0]))
+        _c2_col = tuple(_seg.get(255, [1.0, 0.0, 0.0]))
         overlay_state = (
             has_overlays,
             _c1_on,
@@ -115,6 +122,8 @@ class MprRenderMixin:
             _op_val,
             bool(self.selected_highlight_objects) if self.volume_data is not None else False,
             _display_mode,
+            _c1_col,
+            _c2_col,
         )
         if cache and cache.get('overlay_state') != overlay_state:
             need_full_rebuild = True
@@ -263,7 +272,8 @@ class MprRenderMixin:
             camera.SetFocalPoint(center_x, center_y, 0)
             camera.SetViewUp(0, 1, 0)
             
-            # Fit image to viewport: use aspect ratio to determine scale
+            # Fit this pane independently (fill viewport). Do not unify scale
+            # across MPR planes — shared µm/px makes large XY look too small.
             widget = getattr(self, f'{orientation}_widget')
             vp_size = widget.GetRenderWindow().GetSize()
             vp_w_px = max(vp_size[0], 1)
@@ -285,82 +295,39 @@ class MprRenderMixin:
         # Segmentation mask is already baked into the base image when want_overlay
         # (see _compose_mpr_overlay_rgb). No second ImageActor — avoids black film.
 
-        # --- Object Highlight Overlay (for selected objects from stats table) ---
+        # --- Object Highlight Overlay (shared cyan fill + white outline) ---
         if self.selected_highlight_objects and self.volume_data is not None:
-            # Get the labeled slice for the current orientation
-            labeled_data = self.labeled_class1_data  # All objects are C1-based
-            if labeled_data is not None:
-                slice_idx_hl = self.current_slices[orientation]
-                
-                if orientation == 'axial':
-                    actual_idx = (labeled_data.shape[0] - 1 - slice_idx_hl) if self.reverse_z else slice_idx_hl
-                    if actual_idx < labeled_data.shape[0]:
-                        labeled_slice = labeled_data[actual_idx, :, :]
-                    else:
-                        labeled_slice = None
-                elif orientation == 'coronal':
-                    if slice_idx_hl < labeled_data.shape[1]:
-                        labeled_slice = np.flipud(labeled_data[:, slice_idx_hl, :])
-                    else:
-                        labeled_slice = None
-                else:  # sagittal Ã¢â‚¬â€ same flip/rot as main render
-                    if slice_idx_hl < labeled_data.shape[2]:
-                        labeled_slice = np.transpose(labeled_data[:, :, slice_idx_hl])
-                    else:
-                        labeled_slice = None
-                
-                if labeled_slice is not None:
-                    highlight_rgb = np.zeros((h, w, 4), dtype=np.uint8)  # RGBA
-                    has_highlight = False
-                    
-                    for class_num, obj_label in self.selected_highlight_objects:
-                        obj_mask = (labeled_slice == obj_label)
-                        
-                        if np.any(obj_mask):
-                            # Create outline: dilate - original = border (3px thick)
-                            dilated = ndimage.binary_dilation(obj_mask, iterations=3)
-                            outline = dilated & ~obj_mask
-                            
-                            # Fill interior with semi-transparent highlight
-                            hl_color = self.highlight_color
-                            hl_r = int(hl_color[0] * 255)
-                            hl_g = int(hl_color[1] * 255)
-                            hl_b = int(hl_color[2] * 255)
-                            
-                            # Interior fill (low alpha)
-                            highlight_rgb[obj_mask, 0] = np.maximum(highlight_rgb[obj_mask, 0], hl_r)
-                            highlight_rgb[obj_mask, 1] = np.maximum(highlight_rgb[obj_mask, 1], hl_g)
-                            highlight_rgb[obj_mask, 2] = np.maximum(highlight_rgb[obj_mask, 2], hl_b)
-                            highlight_rgb[obj_mask, 3] = np.maximum(highlight_rgb[obj_mask, 3], 100)
-                            
-                            # Bright border (high alpha white-cyan)
-                            highlight_rgb[outline, 0] = 255
-                            highlight_rgb[outline, 1] = 255
-                            highlight_rgb[outline, 2] = 255
-                            highlight_rgb[outline, 3] = 220
-                            
-                            has_highlight = True
-                    
-                    if has_highlight:
-                        hl_rgb_only = highlight_rgb[:, :, :3]
-                        
-                        hl_transposed = np.transpose(hl_rgb_only, (1, 0, 2))
-                        hl_flat = np.ascontiguousarray(hl_transposed.reshape(-1, 3, order='F'))
-                        
-                        vtk_hl = vtk.vtkImageData()
-                        vtk_hl.SetDimensions(w, h, 1)
-                        vtk_hl.SetSpacing(1.0, 1.0, 1.0)
-                        vtk_hl.SetOrigin(0.0, 0.0, 0.0)
-                        
-                        vtk_hl_arr = numpy_support.numpy_to_vtk(hl_flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
-                        vtk_hl_arr.SetNumberOfComponents(3)
-                        vtk_hl.GetPointData().SetScalars(vtk_hl_arr)
-                        
-                        hl_actor = vtk.vtkImageActor()
-                        hl_actor.GetMapper().SetInputData(vtk_hl)
-                        hl_actor.SetOpacity(0.7)
-                        
-                        renderer.AddActor(hl_actor)
+            labeled_slice = labeled_slice_for_orientation(
+                getattr(self, "labeled_class1_data", None),
+                orientation,
+                self.current_slices[orientation],
+                reverse_z=bool(getattr(self, "reverse_z", False)),
+            )
+            hl_rgb_only = build_mes_selection_highlight_rgb(
+                labeled_slice,
+                self.selected_highlight_objects,
+                getattr(self, "highlight_color", None),
+                outline_iterations=3,
+            )
+            if hl_rgb_only is not None and hl_rgb_only.shape[:2] == (h, w):
+                hl_transposed = np.transpose(hl_rgb_only, (1, 0, 2))
+                hl_flat = np.ascontiguousarray(hl_transposed.reshape(-1, 3, order="F"))
+
+                vtk_hl = vtk.vtkImageData()
+                vtk_hl.SetDimensions(w, h, 1)
+                vtk_hl.SetSpacing(1.0, 1.0, 1.0)
+                vtk_hl.SetOrigin(0.0, 0.0, 0.0)
+
+                vtk_hl_arr = numpy_support.numpy_to_vtk(
+                    hl_flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
+                )
+                vtk_hl_arr.SetNumberOfComponents(3)
+                vtk_hl.GetPointData().SetScalars(vtk_hl_arr)
+
+                hl_actor = vtk.vtkImageActor()
+                hl_actor.GetMapper().SetInputData(vtk_hl)
+                hl_actor.SetOpacity(0.7)
+                renderer.AddActor(hl_actor)
         
         if self.crosshair_enabled:
             # Use the unified persistent crosshair system to avoid double crosshair

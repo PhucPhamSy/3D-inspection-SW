@@ -23,10 +23,10 @@ from scipy import ndimage
 from skimage import io, measure
 from vtk.util import numpy_support
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QItemSelection, QItemSelectionModel
 from PyQt5.QtGui import QColor, QFont, QKeySequence
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QGroupBox, QHBoxLayout, QLabel, QMessageBox, QProgressDialog,
     QRadioButton, QShortcut, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -35,6 +35,19 @@ from inno3d.core import bumpvoid
 from inno3d.core.resources import config_dir, list_config_files
 from inno3d.core.styles import SemiconductorTheme
 from inno3d.core.view_support import LoadVolumeThread, RawImportDialog
+from inno3d.features.shared.mes_mapping import (
+    MesPickDebounce,
+    centroid_nav_xyz as _shared_centroid_nav_xyz,
+    highlights_from_stats_indices as _shared_highlights_from_stats_indices,
+    label_at_volume_xyz as _shared_label_at_volume_xyz,
+    resolve_stat_label as _shared_resolve_stat_label,
+    stats_index_for_label as _shared_stats_index_for_label,
+)
+from inno3d.features.shared.mes_mpr_highlight import (
+    blend_mes_selection_highlight as _shared_blend_mes_hl,
+    build_mes_selection_highlight_rgb as _shared_build_mes_hl_rgb,
+    labeled_slice_for_orientation as _shared_labeled_slice,
+)
 from inno3d.features.teaching.workers import (
     SegmentationInspectionThread, EnhancementThread,
     DistanceTransformThread, BoundaryAnalysisThread,
@@ -1614,84 +1627,207 @@ class SegmentationPipelineMixin:
             return None
 
     def on_object_selection_changed(self):
-        selected_rows = sorted(list(set(index.row() for index in self.object_stats_table.selectedIndexes())))
-        
-        self.selected_highlight_objects = []
-        target_centroid = None
-        _z_offset = getattr(self, '_measurement_start_slice', 0)
-        
-        # Map visual rows to actual stats indices via UserRole
+        """MES table → MPR highlight + navigate + 3D cyan surfaces (shared)."""
+        selected_rows = sorted(
+            list(set(index.row() for index in self.object_stats_table.selectedIndexes()))
+        )
+        _z_offset = int(getattr(self, "_measurement_start_slice", 0) or 0)
+        labeled = getattr(self, "labeled_class1_data", None)
+
+        stats_indices = []
         current_item = self.object_stats_table.currentItem()
         target_visual_row = current_item.row() if current_item else -1
-        
+        target_stat = None
+
         for visual_row in selected_rows:
-            # Get the original stats index from the first column's UserRole
             id_item = self.object_stats_table.item(visual_row, 0)
             if id_item is None:
                 continue
             stats_idx = id_item.data(Qt.UserRole)
-            if stats_idx is None or stats_idx >= len(self.object_stats):
+            if stats_idx is None:
                 continue
-            stat = self.object_stats[stats_idx]
-            self.selected_highlight_objects.append((1, stat['label']))
-            if visual_row == target_visual_row:
-                if getattr(self, 'input_mode', 'single') == 'multi_layer':
-                    if hasattr(self, 'layer_filter_combo'):
-                        layer_name = stat.get('layer_name')
-                        if layer_name and layer_name != self.current_display_layer:
-                            idx = self.layer_filter_combo.findData(layer_name)
-                            if idx >= 0:
-                                self.layer_filter_combo.setCurrentIndex(idx)
-                                
-                nav_z = int(stat['centroid_z'])
-                target_centroid = (
-                    nav_z + _z_offset,
-                    int(stat['centroid_y']),
-                    int(stat['centroid_x']),
-                )
-        
-        # Fallback to the first selected item
-        if target_centroid is None and selected_rows:
-            id_item = self.object_stats_table.item(selected_rows[0], 0)
-            if id_item is not None:
-                stats_idx = id_item.data(Qt.UserRole)
-                if stats_idx is not None and stats_idx < len(self.object_stats):
-                    stat = self.object_stats[stats_idx]
-                    
-                    # Ensure we switch to the right layer to visualize this object
-                    if getattr(self, 'input_mode', 'single') == 'multi_layer':
-                        if hasattr(self, 'layer_filter_combo'):
-                            layer_name = stat.get('layer_name')
-                            if layer_name and layer_name != self.current_display_layer:
-                                idx = self.layer_filter_combo.findData(layer_name)
-                                if idx >= 0:
-                                    self.layer_filter_combo.setCurrentIndex(idx)
-                    
-                    nav_z = int(stat['centroid_z'])  # Use local Z
-                    target_centroid = (nav_z + _z_offset, int(stat['centroid_y']), int(stat['centroid_x']))
+            try:
+                stats_idx = int(stats_idx)
+            except (TypeError, ValueError):
+                continue
+            if stats_idx < 0 or stats_idx >= len(self.object_stats or []):
+                continue
+            stats_indices.append(stats_idx)
+            st = self.object_stats[stats_idx]
+            if visual_row == target_visual_row or target_stat is None:
+                target_stat = st
 
-        if target_centroid is not None and self.volume_data is not None:
-            cz, cy, cx = target_centroid
-            z_max = self.volume_data.shape[0] - 1
-            y_max = self.volume_data.shape[1] - 1
-            x_max = self.volume_data.shape[2] - 1
-            
-            self.axial_slice_slider.setValue(min(max(0, cz), z_max))
-            self.coronal_slice_slider.setValue(min(max(0, cy), y_max))
-            self.sagittal_slice_slider.setValue(min(max(0, cx), x_max))
-        
+        self.selected_highlight_objects = _shared_highlights_from_stats_indices(
+            self.object_stats,
+            stats_indices,
+            labeled=labeled,
+            z_offset=_z_offset,
+        )
+
+        # Multi-layer: switch display layer for navigate target
+        if target_stat is not None and getattr(self, "input_mode", "single") == "multi_layer":
+            if hasattr(self, "layer_filter_combo"):
+                layer_name = target_stat.get("layer_name")
+                if layer_name and layer_name != self.current_display_layer:
+                    idx = self.layer_filter_combo.findData(layer_name)
+                    if idx >= 0:
+                        self.layer_filter_combo.setCurrentIndex(idx)
+
+        if target_stat is not None and self.volume_data is not None:
+            xyz = _shared_centroid_nav_xyz(target_stat, z_offset=_z_offset)
+            if xyz is not None and hasattr(self, "updatePoint"):
+                cx, cy, cz = xyz
+                try:
+                    self.updatePoint(cx, cy, cz)
+                except Exception:
+                    # Fallback: sliders only
+                    z_max = self.volume_data.shape[0] - 1
+                    y_max = self.volume_data.shape[1] - 1
+                    x_max = self.volume_data.shape[2] - 1
+                    self.axial_slice_slider.setValue(min(max(0, cz), z_max))
+                    self.coronal_slice_slider.setValue(min(max(0, cy), y_max))
+                    self.sagittal_slice_slider.setValue(min(max(0, cx), x_max))
+
         if self.volume_data is not None:
-            for ori in ['axial', 'coronal', 'sagittal']:
-                self.update_plane_view(ori)
+            for ori in ["axial", "coronal", "sagittal"]:
+                self.update_plane_view(ori, preserve_camera=True)
+            if hasattr(self, "_update_mes_3d_highlight"):
+                try:
+                    self._update_mes_3d_highlight()
+                except Exception as e:
+                    print(f"[MES] Teaching 3D highlight skipped: {e}")
 
     def clear_object_selection(self):
         self.object_stats_table.blockSignals(True)
         self.object_stats_table.clearSelection()
         self.object_stats_table.blockSignals(False)
         self.selected_highlight_objects = []
+        if hasattr(self, "_clear_mes_3d_highlight"):
+            try:
+                self._clear_mes_3d_highlight(render=True)
+            except Exception:
+                pass
         if self.volume_data is not None:
-            for ori in ['axial', 'coronal', 'sagittal']:
-                self.update_plane_view(ori)
+            for ori in ["axial", "coronal", "sagittal"]:
+                self.update_plane_view(ori, preserve_camera=True)
+
+    # ── MES pick: MPR → table (shared mapping; Teaching Multi always ON) ──
+
+    def is_mes_multi_select(self):
+        """Teaching MES table is always MultiSelection (parity with Viewer Multi ON)."""
+        return True
+
+    def _mes_pick_is_duplicate(self, lab):
+        deb = getattr(self, "_mes_pick_debounce_obj", None)
+        if deb is None:
+            deb = MesPickDebounce(0.12)
+            self._mes_pick_debounce_obj = deb
+        return deb.is_duplicate(lab)
+
+    def _visual_row_for_stats_index(self, stats_idx):
+        table = getattr(self, "object_stats_table", None)
+        if table is None or stats_idx is None:
+            return None
+        for row in range(table.rowCount()):
+            if table.isRowHidden(row):
+                continue
+            item = table.item(row, 0)
+            if item is None:
+                continue
+            try:
+                if int(item.data(Qt.UserRole)) == int(stats_idx):
+                    return row
+            except (TypeError, ValueError):
+                if row == int(stats_idx):
+                    return row
+        return None
+
+    def _apply_mes_pick_label(self, lab, xyz=None, source="mpr"):
+        """Sticky multi-toggle MES row + MPR/3D highlight (shared label map)."""
+        try:
+            lab = int(lab)
+        except (TypeError, ValueError):
+            return False
+        if lab <= 0:
+            return False
+        if self._mes_pick_is_duplicate(lab):
+            return True
+        if not getattr(self, "object_stats", None):
+            return False
+
+        _z_off = int(getattr(self, "_measurement_start_slice", 0) or 0)
+        stats_idx = _shared_stats_index_for_label(
+            self.object_stats,
+            lab,
+            labeled=getattr(self, "labeled_class1_data", None),
+            z_offset=_z_off,
+        )
+        if stats_idx is None:
+            print(f"[MES pick] Teaching label={lab} not in object_stats source={source}")
+            return False
+
+        visual_row = self._visual_row_for_stats_index(stats_idx)
+        if visual_row is None:
+            return False
+
+        table = self.object_stats_table
+        model = table.model()
+        sm = table.selectionModel()
+        if model is None or sm is None:
+            return False
+        left = model.index(int(visual_row), 0)
+        right = model.index(int(visual_row), max(0, table.columnCount() - 1))
+        if not left.isValid():
+            return False
+        sel = QItemSelection(left, right)
+
+        table.blockSignals(True)
+        try:
+            # Teaching Multi ON: toggle row (never setCurrentCell — clears multi)
+            already = False
+            try:
+                already = any(
+                    int(idx.row()) == int(visual_row) for idx in sm.selectedRows()
+                )
+            except Exception:
+                pass
+            sm.select(sel, QItemSelectionModel.Toggle | QItemSelectionModel.Rows)
+            sm.setCurrentIndex(left, QItemSelectionModel.NoUpdate)
+            try:
+                table.scrollTo(left, QAbstractItemView.PositionAtCenter)
+            except Exception:
+                pass
+            action = "removed" if already else "added"
+        finally:
+            table.blockSignals(False)
+
+        # Rebuild highlights from full selection (same as table click path)
+        self.on_object_selection_changed()
+        print(
+            f"[MES pick] Teaching source={source} {action} "
+            f"stats_idx={stats_idx} visual_row={visual_row} label={lab} sticky"
+        )
+        return True
+
+    def select_mes_object_from_mpr(self, orientation, pos):
+        """Ctrl+click MPR → toggle MES row + highlight (Viewer sticky multi)."""
+        if self.volume_data is None:
+            return False
+        if not getattr(self, "object_stats", None):
+            return False
+        if getattr(self, "labeled_class1_data", None) is None:
+            return False
+        if not hasattr(self, "_mpr_pick_volume_xyz"):
+            return False
+        xyz = self._mpr_pick_volume_xyz(orientation, pos)
+        if xyz is None:
+            return False
+        x, y, z = xyz
+        lab = _shared_label_at_volume_xyz(self.labeled_class1_data, x, y, z)
+        if lab <= 0:
+            print(f"[MES pick] Teaching MPR miss at ({x},{y},{z})")
+            return False
+        return self._apply_mes_pick_label(lab, xyz=(x, y, z), source="mpr")
 
     def delete_selected_objects(self):
         """Delete user-selected objects from statistics and masks."""
@@ -3039,82 +3175,263 @@ class SegmentationPipelineMixin:
             self._update_test1_volume_info()
         
     
+    def _window_level_to_uint8(self, slice_data, window, level):
+        """Map scalar slice through W/L to display uint8 (H,W) — same as 3D Viewer."""
+        arr = np.asarray(slice_data, dtype=np.float32)
+        half = max(float(window), 1e-6) * 0.5
+        lo = float(level) - half
+        hi = float(level) + half
+        if hi <= lo:
+            hi = lo + 1.0
+        out = (arr - lo) * (255.0 / (hi - lo))
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def _compose_teaching_mpr_overlay_rgb(
+        self,
+        slice_data,
+        window,
+        level,
+        bump_slice,
+        void_slice,
+        bump_on,
+        void_on,
+        opacity,
+        orientation,
+        slice_idx,
+    ):
+        """Alpha-blend Bump/Void masks onto W/L-mapped CT → RGB uint8 (H,W,3).
+
+        Matches 3D Viewer ``_compose_mpr_overlay_rgb``:
+          - background keeps pure CT gray (no black film from a second actor)
+          - hard mask edges (no VTK linear interpolation on a separate overlay)
+          - Void overwrites Bump on shared voxels
+        """
+        gray = self._window_level_to_uint8(slice_data, window, level)
+        h, w = gray.shape[:2]
+        rgb = np.stack([gray, gray, gray], axis=-1).astype(np.float32)
+        a = float(np.clip(opacity, 0.0, 1.0))
+
+        c1 = getattr(self, "class1_color", None) or [1.0, 1.0, 0.0]
+        c2 = getattr(self, "class2_color", None) or [1.0, 0.0, 0.0]
+        c1_color = np.array([float(v * 255) for v in c1], dtype=np.float32)
+        c2_color = np.array([float(v * 255) for v in c2], dtype=np.float32)
+
+        def _mask_positive(src):
+            if src is None:
+                return None
+            arr = np.asarray(src)
+            if arr.ndim > 2:
+                arr = arr[..., 0]
+            if arr.shape[:2] != (h, w):
+                return None
+            # Binary 0/255, label 128/255, or any positive foreground
+            return arr > 0
+
+        m_bump = None
+        m_void = None
+        if bump_on and bump_slice is not None:
+            m_bump = _mask_positive(bump_slice)
+            if m_bump is not None and np.any(m_bump):
+                rgb[m_bump] = (1.0 - a) * rgb[m_bump] + a * c1_color
+
+        if void_on and void_slice is not None:
+            m_void = _mask_positive(void_slice)
+            if m_void is not None and np.any(m_void):
+                rgb[m_void] = (1.0 - a) * rgb[m_void] + a * c2_color
+
+        # MES selection highlight — 100% Viewer SoT (cyan fill + white outline only).
+        # No dim of non-selected objects (Viewer does not dim on MPR).
+        if getattr(self, "selected_highlight_objects", None) and getattr(
+            self, "labeled_class1_data", None
+        ) is not None:
+            try:
+                labeled_slice = _shared_labeled_slice(
+                    self.labeled_class1_data,
+                    orientation,
+                    slice_idx,
+                    reverse_z=bool(getattr(self, "reverse_z", False)),
+                )
+                if labeled_slice is not None and labeled_slice.shape == (h, w):
+                    hl_rgb = _shared_build_mes_hl_rgb(
+                        labeled_slice,
+                        self.selected_highlight_objects,
+                        getattr(self, "highlight_color", [0.0, 1.0, 1.0]),
+                        outline_iterations=3,
+                    )
+                    # Same effective opacity as Viewer vtkImageActor.SetOpacity(0.7)
+                    rgb = _shared_blend_mes_hl(rgb, hl_rgb, opacity=0.7)
+            except (IndexError, ValueError, TypeError) as e:
+                print(f"[MES HL] Teaching MPR highlight skipped: {e}")
+
+        return np.clip(rgb, 0, 255).astype(np.uint8)
+
     def update_plane_view(self, orientation, preserve_camera=False):
-        """Update a single plane view"""
+        """Update one MPR pane — parity with 3D Viewer ``render_slice``.
+
+        Key parity fixes vs old Teaching path:
+          - bake CT + mask into one RGB ImageActor (no second actor / black film)
+          - nearest-neighbor interpolation (crisp mask pixels, no bilinear blur)
+          - viewport-aspect camera fit (not crude max(h,w)*0.55)
+          - use cached per-orientation window/level when available
+        """
         if self.volume_data is None:
             return
-            
-        renderer = getattr(self, f'{orientation}_renderer')
+
+        renderer = getattr(self, f"{orientation}_renderer")
         slice_idx = self.current_slices[orientation]
-        
-        # Save camera state
-        if preserve_camera and hasattr(self, 'camera_states') and isinstance(self.camera_states, dict):
+
+        # Save camera state before rebuild
+        if preserve_camera and hasattr(self, "camera_states") and isinstance(
+            self.camera_states, dict
+        ):
             camera = renderer.GetActiveCamera()
             self.camera_states[orientation] = {
-                'position': camera.GetPosition(),
-                'focal_point': camera.GetFocalPoint(),
-                'view_up': camera.GetViewUp(),
-                'parallel_scale': camera.GetParallelScale()
+                "position": camera.GetPosition(),
+                "focal_point": camera.GetFocalPoint(),
+                "view_up": camera.GetViewUp(),
+                "parallel_scale": camera.GetParallelScale(),
             }
-        
-        if orientation == 'axial':
-            actual_z = slice_idx
-            if getattr(self, 'reverse_z', False):
+
+        actual_z = slice_idx
+        if orientation == "axial":
+            if getattr(self, "reverse_z", False):
                 actual_z = self.volume_data.shape[0] - 1 - slice_idx
-            
             slice_data = self.volume_data[actual_z, :, :]
-            bump_slice = np.copy(self.bump_segmentation[actual_z, :, :]) if self.bump_segmentation is not None else None
-            void_slice = np.copy(self.void_segmentation[actual_z, :, :]) if self.void_segmentation is not None else None
-                
-        elif orientation == 'coronal':
+            bump_slice = (
+                self.bump_segmentation[actual_z, :, :]
+                if self.bump_segmentation is not None
+                else None
+            )
+            void_slice = (
+                self.void_segmentation[actual_z, :, :]
+                if self.void_segmentation is not None
+                else None
+            )
+        elif orientation == "coronal":
             slice_data = np.flipud(self.volume_data[:, slice_idx, :])
-            bump_slice = np.flipud(self.bump_segmentation[:, slice_idx, :]).copy() if self.bump_segmentation is not None else None
-            void_slice = np.flipud(self.void_segmentation[:, slice_idx, :]).copy() if self.void_segmentation is not None else None
-                
+            bump_slice = (
+                np.flipud(self.bump_segmentation[:, slice_idx, :])
+                if self.bump_segmentation is not None
+                else None
+            )
+            void_slice = (
+                np.flipud(self.void_segmentation[:, slice_idx, :])
+                if self.void_segmentation is not None
+                else None
+            )
         else:
             slice_data = np.transpose(self.volume_data[:, :, slice_idx])
-            bump_slice = np.transpose(self.bump_segmentation[:, :, slice_idx]).copy() if self.bump_segmentation is not None else None
-            void_slice = np.transpose(self.void_segmentation[:, :, slice_idx]).copy() if self.void_segmentation is not None else None
-            
+            bump_slice = (
+                np.transpose(self.bump_segmentation[:, :, slice_idx])
+                if self.bump_segmentation is not None
+                else None
+            )
+            void_slice = (
+                np.transpose(self.void_segmentation[:, :, slice_idx])
+                if self.void_segmentation is not None
+                else None
+            )
+
         h, w = slice_data.shape
         renderer.RemoveAllViewProps()
-        
-        # Base image
+
+        # Window / level — prefer cached W/L (same as Viewer); fallback to slice min/max
+        wl = getattr(self, "window_level", None) or {}
+        if isinstance(wl, dict) and wl.get(orientation) is not None:
+            base_window, base_level = wl[orientation]
+            window = float(base_window)
+            level = float(base_level)
+        else:
+            v_min, v_max = float(slice_data.min()), float(slice_data.max())
+            window = v_max - v_min if v_max > v_min else 1.0
+            level = v_min + window / 2.0
+
+        bump_check = getattr(self, f"{orientation}_overlay_bump", None)
+        void_check = getattr(self, f"{orientation}_overlay_void", None)
+        opacity_slider = getattr(self, f"{orientation}_opacity_slider", None)
+        bump_enabled = bump_check.isChecked() if bump_check else False
+        void_enabled = void_check.isChecked() if void_check else False
+        opacity = (opacity_slider.value() / 100.0) if opacity_slider else 0.7
+        opacity = float(np.clip(opacity, 0.0, 1.0))
+
+        want_overlay = (
+            (bump_enabled or void_enabled)
+            and opacity > 0.0
+            and (bump_slice is not None or void_slice is not None)
+        )
+
         vtk_image = vtk.vtkImageData()
         vtk_image.SetDimensions(w, h, 1)
+        vtk_image.SetSpacing(1.0, 1.0, 1.0)
         vtk_image.SetOrigin(0.0, 0.0, 0.0)
-        
-        slice_transposed = np.transpose(slice_data, (1, 0))
-        flat_data = np.ascontiguousarray(slice_transposed.flatten('F'))
-        
-        # Assume uint16 or uint8
-        if slice_data.dtype == np.uint8:
-            vtk_array = numpy_support.numpy_to_vtk(flat_data, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
-        else:
-            vtk_array = numpy_support.numpy_to_vtk(flat_data, deep=True, array_type=vtk.VTK_UNSIGNED_SHORT)
-            
-        vtk_image.GetPointData().SetScalars(vtk_array)
+
         image_actor = vtk.vtkImageActor()
         image_actor.GetMapper().SetInputData(vtk_image)
-        
         prop = image_actor.GetProperty()
-        v_min, v_max = float(slice_data.min()), float(slice_data.max())
-        window = v_max - v_min if v_max > v_min else 1.0
-        level = v_min + window / 2.0
-        
-        prop.SetColorWindow(window)
-        prop.SetColorLevel(level)
+        # Critical for sharp mask edges when zoomed (Viewer does the same)
         prop.SetInterpolationTypeToNearest()
+
+        if want_overlay:
+            display_rgb = self._compose_teaching_mpr_overlay_rgb(
+                slice_data,
+                window,
+                level,
+                bump_slice,
+                void_slice,
+                bump_enabled,
+                void_enabled,
+                opacity,
+                orientation,
+                slice_idx,
+            )
+            overlay_transposed = np.transpose(display_rgb, (1, 0, 2))
+            flat_rgb = np.ascontiguousarray(
+                overlay_transposed.reshape(-1, 3, order="F")
+            )
+            vtk_array = numpy_support.numpy_to_vtk(
+                flat_rgb, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
+            )
+            vtk_array.SetNumberOfComponents(3)
+            # Identity W/L — pixels already display-mapped (must stay 255/127.5)
+            prop.SetColorWindow(255.0)
+            prop.SetColorLevel(127.5)
+        else:
+            slice_transposed = np.transpose(slice_data, (1, 0))
+            flat_data = np.ascontiguousarray(slice_transposed.flatten("F"))
+            if slice_data.dtype == np.uint8:
+                vtk_array = numpy_support.numpy_to_vtk(
+                    flat_data, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
+                )
+            elif slice_data.dtype == np.uint16:
+                vtk_array = numpy_support.numpy_to_vtk(
+                    flat_data, deep=True, array_type=vtk.VTK_UNSIGNED_SHORT
+                )
+            else:
+                vtk_array = numpy_support.numpy_to_vtk(
+                    flat_data.astype(np.float32),
+                    deep=True,
+                    array_type=vtk.VTK_FLOAT,
+                )
+            prop.SetColorWindow(window)
+            prop.SetColorLevel(level)
+
+        vtk_image.GetPointData().SetScalars(vtk_array)
+        vtk_image.Modified()
         renderer.AddActor(image_actor)
-        
-        # Camera
-        if preserve_camera and hasattr(self, 'camera_states') and isinstance(self.camera_states, dict) and self.camera_states.get(orientation) is not None:
-             state = self.camera_states[orientation]
-             camera = renderer.GetActiveCamera()
-             camera.SetPosition(state['position'])
-             camera.SetFocalPoint(state['focal_point'])
-             camera.SetViewUp(state['view_up'])
-             camera.SetParallelScale(state['parallel_scale'])
+
+        # Camera — viewport-aspect fit like 3D Viewer (not max(h,w)*0.55)
+        if (
+            preserve_camera
+            and hasattr(self, "camera_states")
+            and isinstance(self.camera_states, dict)
+            and self.camera_states.get(orientation) is not None
+        ):
+            state = self.camera_states[orientation]
+            camera = renderer.GetActiveCamera()
+            camera.SetPosition(state["position"])
+            camera.SetFocalPoint(state["focal_point"])
+            camera.SetViewUp(state["view_up"])
+            camera.SetParallelScale(state["parallel_scale"])
         else:
             camera = renderer.GetActiveCamera()
             camera.ParallelProjectionOn()
@@ -3122,114 +3439,59 @@ class SegmentationPipelineMixin:
             camera.SetPosition(center_x, center_y, 1000)
             camera.SetFocalPoint(center_x, center_y, 0)
             camera.SetViewUp(0, 1, 0)
-            camera.SetParallelScale(max(h, w) * 0.55)
+
+            widget_for_fit = getattr(self, f"{orientation}_widget", None)
+            if widget_for_fit is not None:
+                vp_size = widget_for_fit.GetRenderWindow().GetSize()
+                vp_w_px = max(vp_size[0], 1)
+                vp_h_px = max(vp_size[1], 1)
+                vp_aspect = vp_w_px / float(vp_h_px)
+                img_aspect = w / max(h, 1)
+                if img_aspect > vp_aspect:
+                    parallel_scale = (w / vp_aspect) * 0.5
+                else:
+                    parallel_scale = h * 0.5
+            else:
+                parallel_scale = max(h, w) * 0.5
+            camera.SetParallelScale(parallel_scale)
             renderer.ResetCameraClippingRange()
-            
-        # Add overlay
-        bump_check = getattr(self, f'{orientation}_overlay_bump', None)
-        void_check = getattr(self, f'{orientation}_overlay_void', None)
-        opacity_slider = getattr(self, f'{orientation}_opacity_slider', None)
-        
-        bump_enabled = bump_check.isChecked() if bump_check else False
-        void_enabled = void_check.isChecked() if void_check else False
-        opacity = opacity_slider.value() / 100.0 if opacity_slider else 0.7
-        
-        if (bump_enabled or void_enabled) and (bump_slice is not None or void_slice is not None):
-            overlay_rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            has_overlay = False
-            
-            if bump_enabled and bump_slice is not None:
-                mask_bump = (bump_slice == 128) | (bump_slice == 255)
-                overlay_rgb[mask_bump, 0] = int(self.class1_color[0] * 255)
-                overlay_rgb[mask_bump, 1] = int(self.class1_color[1] * 255)
-                overlay_rgb[mask_bump, 2] = int(self.class1_color[2] * 255)
-                has_overlay = True
-                
-            if void_enabled and void_slice is not None:
-                mask_void = (void_slice == 128) | (void_slice == 255)
-                overlay_rgb[mask_void, 0] = int(self.class2_color[0] * 255)
-                overlay_rgb[mask_void, 1] = int(self.class2_color[1] * 255)
-                overlay_rgb[mask_void, 2] = int(self.class2_color[2] * 255)
-                has_overlay = True
-                
-            # Spotlight effect: dim non-selected bumps, keep selected bright
-            if getattr(self, 'selected_highlight_objects', []) and getattr(self, 'labeled_class1_data', None) is not None:
-                try:
-                    # Get the labeled slice for this view orientation
-                    if orientation == 'axial':
-                        actual_z_hl = (self.labeled_class1_data.shape[0] - 1 - slice_idx) if getattr(self, 'reverse_z', False) else slice_idx
-                        if actual_z_hl < self.labeled_class1_data.shape[0]:
-                            labeled_slice = self.labeled_class1_data[actual_z_hl, :, :]
-                        else:
-                            labeled_slice = None
-                    elif orientation == 'coronal':
-                        if slice_idx < self.labeled_class1_data.shape[1]:
-                            labeled_slice = np.flipud(self.labeled_class1_data[:, slice_idx, :])
-                        else:
-                            labeled_slice = None
-                    else:
-                        if slice_idx < self.labeled_class1_data.shape[2]:
-                            labeled_slice = np.transpose(self.labeled_class1_data[:, :, slice_idx])
-                        else:
-                            labeled_slice = None
-                    
-                    if labeled_slice is not None and labeled_slice.shape == overlay_rgb.shape[:2]:
-                        # Build combined mask of all selected object labels
-                        selected_ids = [obj_id for cls_num, obj_id in self.selected_highlight_objects if cls_num == 1]
-                        if selected_ids:
-                            # Create mask of selected bump pixels
-                            selected_mask = np.isin(labeled_slice, selected_ids)
-                            # Create mask of all overlay-colored pixels (any bump or void)
-                            any_overlay = np.any(overlay_rgb > 0, axis=2)
-                            # Dim non-selected overlay pixels: reduce to 25% brightness
-                            dim_mask = any_overlay & ~selected_mask
-                            overlay_rgb[dim_mask] = (overlay_rgb[dim_mask] * 0.25).astype(np.uint8)
-                            has_overlay = True
-                except (IndexError, ValueError):
-                    pass  # Shape mismatch between labeled data and current view
-                        
-            if has_overlay:
-                overlay_transposed = np.transpose(overlay_rgb, (1, 0, 2))
-                flat_rgb = np.ascontiguousarray(overlay_transposed.reshape(-1, 3, order='F'))
-                vtk_overlay = vtk.vtkImageData()
-                vtk_overlay.SetDimensions(w, h, 1)
-                vtk_overlay.SetOrigin(0.0, 0.0, 0.0)
-                vtk_rgb = numpy_support.numpy_to_vtk(flat_rgb, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
-                vtk_rgb.SetNumberOfComponents(3)
-                vtk_overlay.GetPointData().SetScalars(vtk_rgb)
-                
-                overlay_actor = vtk.vtkImageActor()
-                overlay_actor.GetMapper().SetInputData(vtk_overlay)
-                overlay_actor.SetOpacity(opacity)
-                renderer.AddActor(overlay_actor)
-        
-        # Draw Crosshair (persistent actors — Dragonfly hover/grab like 3D Viewer)
-        if getattr(self, 'crosshair_enabled', False):
-            # RemoveAllViewProps above dropped actors; rebuild/re-add via lightweight path
-            if hasattr(self, '_persistent_crosshair'):
+
+        # Crosshair (persistent actors — Dragonfly hover/grab like 3D Viewer)
+        if getattr(self, "crosshair_enabled", False):
+            if hasattr(self, "_persistent_crosshair"):
                 self._persistent_crosshair[orientation] = {}
             self.update_2d_crosshair(orientation)
 
-        # Draw ROI overlay on axial (XY) view
-        if orientation == 'axial':
+        # ROI overlay on axial (XY)
+        if orientation == "axial":
             self.draw_roi_overlay(renderer, h, w)
 
-        # Draw Object Indices if enabled (on all three views)
-        if getattr(self, 'show_indices_check', None) and self.show_indices_check.isChecked() and self.object_stats:
-            if orientation == 'axial':
-                self.draw_object_labels(renderer, actual_z, orientation='axial', slice_idx=actual_z)
-            elif orientation == 'coronal':
-                self.draw_object_labels(renderer, 0, orientation='coronal', slice_idx=slice_idx)
-            elif orientation == 'sagittal':
-                self.draw_object_labels(renderer, 0, orientation='sagittal', slice_idx=slice_idx)
+        # Object indices if enabled
+        if (
+            getattr(self, "show_indices_check", None)
+            and self.show_indices_check.isChecked()
+            and self.object_stats
+        ):
+            if orientation == "axial":
+                self.draw_object_labels(
+                    renderer, actual_z, orientation="axial", slice_idx=actual_z
+                )
+            elif orientation == "coronal":
+                self.draw_object_labels(
+                    renderer, 0, orientation="coronal", slice_idx=slice_idx
+                )
+            elif orientation == "sagittal":
+                self.draw_object_labels(
+                    renderer, 0, orientation="sagittal", slice_idx=slice_idx
+                )
 
-        # Scale bar (same style as 3D Viewer) — always on, updates with zoom
+        # Scale bar — always on, updates with zoom
         self.add_ruler_overlay(renderer, orientation, (h, w))
 
-        widget = getattr(self, f'{orientation}_widget', None)
+        widget = getattr(self, f"{orientation}_widget", None)
         if widget:
             widget.GetRenderWindow().Render()
-    
+
     def on_slice_changed(self, orientation, value):
         """Handle slice slider change — keep zoom/pan, sync crosshair (3D Viewer)."""
         newX, newY, newZ = list(self.crosshair_position)

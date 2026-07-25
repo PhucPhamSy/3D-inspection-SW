@@ -548,8 +548,9 @@ class Dragonfly3DInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
     def _project_to_sphere(self, display_x, display_y):
         """Shoemake-style map of display point → unit vector on virtual sphere.
 
-        Sphere is centered on the viewport; radius ≈ 0.5·min(w,h) so drag across
-        the view feels like a full free tumble (Dragonfly Track).
+        Sphere is centered on the viewport; radius is chosen so pixel drag
+        sensitivity stays similar in small pane vs fullscreen (see
+        ``_begin_track_gesture``).
         """
         import math
         cx, cy = self._track_ball_center
@@ -563,6 +564,46 @@ class Dragonfly3DInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
             return [px / n, py / n, 0.0]
         return [px, py, math.sqrt(max(0.0, 1.0 - d2))]
 
+    def _viewport_display_metrics(self, ren):
+        """Display origin + size for the active renderer (robust after resize).
+
+        Fullscreen / sidebar layout changes can leave ``ren.GetSize()`` stale
+        for a frame; fall back to interactor / render-window size so the
+        arcball center matches what the user sees.
+        """
+        iren = self.GetInteractor()
+        w = h = 0.0
+        ox = oy = 0.0
+        try:
+            size = ren.GetSize()
+            w, h = float(size[0]), float(size[1])
+            origin = ren.GetOrigin() if hasattr(ren, "GetOrigin") else (0, 0)
+            ox, oy = float(origin[0]), float(origin[1])
+        except Exception:
+            pass
+        if w < 2.0 or h < 2.0:
+            try:
+                if iren is not None:
+                    wsz = iren.GetSize()
+                    w, h = float(wsz[0]), float(wsz[1])
+                    ox, oy = 0.0, 0.0
+            except Exception:
+                pass
+        if w < 2.0 or h < 2.0:
+            try:
+                if iren is not None:
+                    rw = iren.GetRenderWindow()
+                    if rw is not None:
+                        wsz = rw.GetSize()
+                        w, h = float(wsz[0]), float(wsz[1])
+                        ox, oy = 0.0, 0.0
+            except Exception:
+                pass
+        if w < 2.0 or h < 2.0:
+            w, h = 800.0, 600.0
+            ox, oy = 0.0, 0.0
+        return ox, oy, w, h
+
     def _begin_track_gesture(self):
         """Prepare arcball + pivot look-at when left button goes down."""
         ren = self._renderer()
@@ -575,23 +616,31 @@ class Dragonfly3DInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
             self._track_active = False
             return
 
+        # Host may have just left/entered fullscreen — refresh pivot + size
+        host = getattr(self, "_host", None)
+        if host is not None:
+            try:
+                if hasattr(host, "_force_3d_render_window_size"):
+                    host._force_3d_render_window_size()
+                if hasattr(host, "_sync_3d_orbit_pivot"):
+                    host._sync_3d_orbit_pivot()
+            except Exception:
+                pass
+
         pivot = self._track_pivot()
         # Object-centric: always orbit looking at the pivot (no image jump)
         self._look_at_pivot_no_jump(ren, cam, pivot)
 
-        try:
-            # Renderer viewport size in pixels (multi-pane safe)
-            size = ren.GetSize()
-            w = max(float(size[0]), 1.0)
-            h = max(float(size[1]), 1.0)
-            origin = ren.GetOrigin() if hasattr(ren, "GetOrigin") else (0, 0)
-            ox, oy = float(origin[0]), float(origin[1])
-        except Exception:
-            w, h, ox, oy = 400.0, 300.0, 0.0, 0.0
+        ox, oy, w, h = self._viewport_display_metrics(ren)
 
-        # Ball centered in this renderer; radius = half of shorter side
+        # Ball centered in this renderer. Use a *clamped* radius so fullscreen
+        # does not make Track feel sluggish (pure 0.5·min(w,h) scales poorly).
+        # ~half short side, but keep pixel→angle similar to a mid-size pane.
+        short = min(w, h)
         self._track_ball_center = (ox + 0.5 * w, oy + 0.5 * h)
-        self._track_ball_radius = 0.5 * min(w, h)
+        self._track_ball_radius = max(140.0, min(0.5 * short, 280.0))
+        # Store viewport short side for angle normalization in Rotate()
+        self._track_view_short = short
 
         x, y = iren.GetEventPosition()
         self._track_last_sphere = self._project_to_sphere(x, y)
@@ -633,10 +682,14 @@ class Dragonfly3DInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
             self._track_last_sphere = cur
             return
 
-        # Angle on the sphere; MotionFactor scales feel (10 ≈ 1:1 arcball)
+        # Angle on the sphere; MotionFactor scales feel (10 ≈ 1:1 arcball).
+        # Normalize by ball radius vs a reference so fullscreen (large r) is not
+        # sluggish and tiny panes are not hypersensitive — same px ≈ same °.
         angle_rad = math.acos(dot)
         motion = float(self.GetMotionFactor()) if hasattr(self, "GetMotionFactor") else 10.0
-        angle_deg = math.degrees(angle_rad) * (motion / 10.0)
+        r_ball = max(float(getattr(self, "_track_ball_radius", 200.0)), 1.0)
+        r_ref = 200.0
+        angle_deg = math.degrees(angle_rad) * (motion / 10.0) * (r_ball / r_ref)
         if abs(angle_deg) < 1e-6:
             self._track_last_sphere = cur
             return

@@ -10,12 +10,16 @@
 #   ExcelFilterMenu, ExcelFilterHeader
 # -----------------------------------------------------------------------
 
+import os
 import re
 from pathlib import Path
 
 import numpy as np
 
-from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, QSize, QPoint, QRect
+from PyQt5.QtCore import (
+    Qt, QThread, QTimer, pyqtSignal, QSize, QPoint, QRect,
+    QItemSelection, QItemSelectionModel,
+)
 from PyQt5.QtGui import (
     QBrush, QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap,
@@ -29,14 +33,58 @@ from PyQt5.QtWidgets import (
 )
 
 from inno3d.core.styles import SemiconductorTheme
+from inno3d.infra.paths import project_root, resource_path
+
 
 def _ui_icon(name, widget=None, fallback=None):
-    icon_path = Path(__file__).resolve().parents[2] / "assets" / "icons" / name
-    if icon_path.exists():
-        return QIcon(str(icon_path))
+    """Resolve ``assets/icons/<name>`` for dev + PyInstaller.
+
+    Must NOT use ``Path(__file__).parents[N]`` alone — this module lives under
+    ``inno3d/features/viewer/`` (parents[2] = ``inno3d/``, not the project root).
+    """
+    candidates = [
+        Path(resource_path(os.path.join("assets", "icons", name))),
+        project_root() / "assets" / "icons" / name,
+        # Frozen / alternate layouts
+        Path(__file__).resolve().parents[3] / "assets" / "icons" / name,
+    ]
+    for icon_path in candidates:
+        try:
+            if icon_path.is_file():
+                return QIcon(str(icon_path))
+        except OSError:
+            continue
     if widget is not None and fallback is not None:
         return widget.style().standardIcon(fallback)
     return QIcon()
+
+
+def _tinted_ui_icon(name, color=None, size=14, widget=None, fallback=None):
+    """Load a monochrome SVG and tint it for theme contrast.
+
+    Many icons hardcode a light stroke (``#DDE7F2``) which disappears on light
+    ``icon-button`` backgrounds. Tint with ``TEXT_PRIMARY`` (or an explicit
+    color) so the glyph stays visible in both dark and light themes.
+    """
+    base = _ui_icon(name, widget=widget, fallback=fallback)
+    if base is None or base.isNull():
+        return base
+    if color is None:
+        color = QColor(SemiconductorTheme.TEXT_PRIMARY)
+    elif not isinstance(color, QColor):
+        color = QColor(str(color))
+    sz = QSize(int(size), int(size))
+    pixmap = base.pixmap(sz)
+    if pixmap.isNull():
+        return base
+    tinted = QPixmap(pixmap.size())
+    tinted.fill(Qt.transparent)
+    painter = QPainter(tinted)
+    painter.drawPixmap(0, 0, pixmap)
+    painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    painter.fillRect(tinted.rect(), color)
+    painter.end()
+    return QIcon(tinted)
 
 
 def _natural_sort_key(text):
@@ -112,7 +160,11 @@ class StatsRowDelegate(QStyledItemDelegate):
             painter.fillRect(rect, base)
 
         if option.state & QStyle.State_Selected:
-            painter.fillRect(rect, QColor(34, 174, 209, 75))
+            # Strong cyan overlay — must read on solid OK/NG row tints
+            painter.fillRect(rect, QColor(30, 200, 255, 130))
+            # Left accent bar (selection cue independent of row colour)
+            bar = QRect(rect.left(), rect.top(), 3, rect.height())
+            painter.fillRect(bar, QColor(0, 230, 255, 255))
         elif option.state & QStyle.State_MouseOver:
             painter.fillRect(rect, QColor(255, 255, 255, 18))
 
@@ -341,12 +393,51 @@ class FrozenTableWidget(QTableWidget):
         self.refresh_frozen()
 
     def _forward_frozen_click(self, index):
-        """Map frozen-view click → main table cellClicked + current cell."""
+        """Map frozen-view click → main table selection + cellClicked.
+
+        Frozen shares ``selectionModel`` with the main table, so Qt already
+        applied Multi toggle / Single ClearAndSelect on mouse press.  Do **not**
+        Toggle again here (that undoes Multi picks). Only ensure full-row
+        selection in Single mode and keep the current index.
+        """
         if not index.isValid():
             return
-        self.setCurrentIndex(index)
+        model = self.model()
+        sm = self.selectionModel()
+        if model is None or sm is None:
+            return
+
+        row = index.row()
+        left = model.index(row, 0)
+        right = model.index(row, max(0, self.columnCount() - 1))
+        if not left.isValid():
+            return
+        sel = QItemSelection(left, right)
+        mode = self.selectionMode()
+
+        if mode in (
+            QAbstractItemView.MultiSelection,
+            QAbstractItemView.ExtendedSelection,
+        ):
+            # Already toggled by QTableView on press — never Toggle/Select again
+            # (would undo Multi ON deselect). Only pin current index.
+            sm.setCurrentIndex(left, QItemSelectionModel.NoUpdate)
+        else:
+            # Single: full-row sticky selection (kept until another row / Clear)
+            sm.select(
+                sel,
+                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+            )
+            sm.setCurrentIndex(left, QItemSelectionModel.NoUpdate)
+
         try:
-            self.cellClicked.emit(index.row(), index.column())
+            self.cellClicked.emit(row, index.column())
+        except Exception:
+            pass
+        try:
+            self.viewport().update()
+            if getattr(self, "frozenTableView", None) is not None:
+                self.frozenTableView.viewport().update()
         except Exception:
             pass
 

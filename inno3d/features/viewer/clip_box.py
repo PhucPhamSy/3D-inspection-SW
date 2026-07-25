@@ -1545,3 +1545,57 @@ class ClipBoxMixin:
             _add_line(u1, v1, u0, v1, border_col, 2.0)
             _add_line(u0, v1, u0, v0, border_col, 2.0)
             # colored edge accents (Dragonfly axis tint); thicken active edge
+            def _edge_w(u_side=None, v_side=None):
+                if not hover_on or active is None:
+                    return 1.5
+                if active.get('kind') == 'move':
+                    return 2.2
+                if u_side and active.get('u_side') == u_side and active.get('v_side') is None:
+                    return 3.0
+                if v_side and active.get('v_side') == v_side and active.get('u_side') is None:
+                    return 3.0
+                if active.get('kind') == 'corner':
+                    if active.get('u_side') == u_side or active.get('v_side') == v_side:
+                        return 2.5
+                return 1.5
+
+            _add_line(u0, v0, u1, v0, h_color, _edge_w(v_side='lo'))
+            _add_line(u0, v1, u1, v1, h_color, _edge_w(v_side='hi'))
+            _add_line(u0, v0, u0, v1, v_color, _edge_w(u_side='lo'))
+            _add_line(u1, v0, u1, v1, v_color, _edge_w(u_side='hi'))
+
+            # Corner + center handles (when clip enabled — Dragonfly grab targets)
+            if self._df_clip_enabled:
+                corners = [
+                    (u0, v0, 'lo', 'lo'),
+                    (u1, v0, 'hi', 'lo'),
+                    (u0, v1, 'lo', 'hi'),
+                    (u1, v1, 'hi', 'hi'),
+                ]
+                for cx, cy, us, vs in corners:
+                    hl = (
+                        hover_on and active is not None
+                        and active.get('kind') == 'corner'
+                        and active.get('u_side') == us
+                        and active.get('v_side') == vs
+                    )
+                    _add_handle(cx, cy, border_col, size=3.2, highlight=hl)
+                # Center move handle
+                muc, mvc = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+                hl_move = hover_on and active is not None and active.get('kind') == 'move'
+                _add_handle(muc, mvc, (0.4, 0.85, 1.0), size=4.0, highlight=hl_move)
+
+        if show_grid:
+            gs = max(float(self._df_clip_grid_size), 1e-3)
+            max_lines = 24
+            du = max(gs / max(u_spacing, 1e-12), (u1 - u0) / max_lines if u1 > u0 else gs)
+            dv = max(gs / max(v_spacing, 1e-12), (v1 - v0) / max_lines if v1 > v0 else gs)
+            grid_col = (0.5, 0.7, 0.95)
+            u = u0 + du
+            while u < u1 - 1e-9:
+                _add_line(u, v0, u, v1, grid_col, 1.0)
+                u += du
+            v = v0 + dv
+            while v < v1 - 1e-9:
+                _add_line(u0, v, u1, v, grid_col, 1.0)
+                v += dv

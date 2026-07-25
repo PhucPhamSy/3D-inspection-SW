@@ -44,6 +44,13 @@ from inno3d.core.view_support import (
     push_camera_outside_aabb,
     volume_world_aabb,
 )
+from inno3d.features.shared.b2b_gap_3d import (
+    B2BGapOverlay,
+    format_gap_label as _shared_format_gap_label,
+    layer_z_offset as _shared_layer_z_offset,
+    world_spacing as _shared_world_spacing,
+)
+from inno3d.features.shared.mes_highlight_3d import MESHighlightOverlay
 from inno3d.features.teaching.workers import (
     NoScrollDoubleSpinBox, NoScrollSpinBox,
     _ExportLayerVolumesThread, DistanceTransformThread, BoundaryAnalysisThread,
@@ -1054,6 +1061,7 @@ class SegmentationUIMixin:
         btn_roles = (
             ("export_csv_btn", "secondary"),
             ("clear_highlight_btn", "secondary"),
+            ("bnd_clear_btn", "secondary"),
             ("apply_ng_btn", "primary"),
             ("delete_selected_btn", "danger"),
             ("delete_edge_btn", "warning"),
@@ -3345,6 +3353,11 @@ class SegmentationUIMixin:
         overlay_actor = vtk.vtkImageActor()
         overlay_actor.GetMapper().SetInputData(vtk_overlay)
         overlay_actor.SetPosition(0, 0, 0.2)
+        # Nearest — keep ROI edges crisp (match MPR base image / 3D Viewer)
+        try:
+            overlay_actor.GetProperty().SetInterpolationTypeToNearest()
+        except Exception:
+            pass
         renderer.AddActor(overlay_actor)
 
     def _refresh_all_index_views(self):
@@ -3602,42 +3615,24 @@ class SegmentationUIMixin:
         header.addWidget(title)
         header.addStretch()
         
-        # Load CSV button
-        load_btn = QPushButton("📂 Load CSV")
-        load_btn.setMaximumHeight(22)
-        load_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {SemiconductorTheme.BG_LIGHT};
-                color: {SemiconductorTheme.TEXT_PRIMARY};
-                border: 1px solid {SemiconductorTheme.BORDER_DEFAULT};
-                border-radius: 3px; padding: 2px 8px; font-size: 8pt;
-            }}
-            QPushButton:hover {{ background: {SemiconductorTheme.ACCENT_PRIMARY}; color: {SemiconductorTheme.BG_DARK}; }}
-        """)
-        load_btn.setToolTip("Load boundary_summary.csv from file")
-        load_btn.clicked.connect(self._browse_boundary_csv)
-        header.addWidget(load_btn)
-        
-        # Auto-detect button
-        auto_btn = QPushButton("🔍 Auto-detect")
-        auto_btn.setMaximumHeight(22)
-        auto_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {SemiconductorTheme.BG_LIGHT};
-                color: {SemiconductorTheme.TEXT_PRIMARY};
-                border: 1px solid {SemiconductorTheme.BORDER_DEFAULT};
-                border-radius: 3px; padding: 2px 8px; font-size: 8pt;
-            }}
-            QPushButton:hover {{ background: {SemiconductorTheme.ACCENT_PRIMARY}; color: {SemiconductorTheme.BG_DARK}; }}
-        """)
-        auto_btn.setToolTip("Auto-detect boundary_summary.csv from output path")
-        auto_btn.clicked.connect(self._autodetect_boundary_csv)
-        header.addWidget(auto_btn)
-        
         self.bnd_info_label = QLabel("No results loaded")
         self._theme_register("_theme_secondary_labels", self.bnd_info_label)
-        self.bnd_info_label.setStyleSheet(f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 8pt;")
+        self.bnd_info_label.setStyleSheet(
+            f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 8pt;"
+        )
         header.addWidget(self.bnd_info_label)
+
+        # Clear selection — same role as MES Clear (table + 3D gap overlay)
+        self.bnd_clear_btn = self._make_mes_tool_button(
+            "Clear",
+            "Clear B2B row selection and 3D gap overlay",
+            "secondary",
+            self.clear_boundary_selection,
+            icon_name="x.svg",
+            fallback_icon=QStyle.SP_DialogResetButton,
+        )
+        header.addWidget(self.bnd_clear_btn)
+
         layout.addLayout(header)
         
         # Table (Viewer parity: no vertical row header — avoids dual "#" index look)
@@ -3682,6 +3677,39 @@ class SegmentationUIMixin:
         
         self.boundary_results = []  # list of dicts from CSV
         return panel
+
+    def clear_boundary_selection(self):
+        """Clear B2B table selection + 3D gap actors (MES Clear parity)."""
+        table = getattr(self, "boundary_table", None)
+        if table is not None:
+            try:
+                table.blockSignals(True)
+                table.clearSelection()
+                table.blockSignals(False)
+            except Exception:
+                pass
+        if hasattr(self, "_clear_boundary_actors"):
+            try:
+                self._clear_boundary_actors()
+            except Exception:
+                pass
+        # Drop MES 3D pick only if it was cleared for gap spotlight — restore clean 3D
+        n = len(getattr(self, "boundary_results", None) or [])
+        if hasattr(self, "bnd_info_label"):
+            try:
+                if n > 0:
+                    self.bnd_info_label.setText(
+                        f"{n} rows | click row → 3D gap · Clear to hide"
+                    )
+                else:
+                    self.bnd_info_label.setText("No results loaded")
+            except Exception:
+                pass
+        if hasattr(self, "_3d_bnd_info"):
+            try:
+                self._3d_bnd_info.setText("")
+            except Exception:
+                pass
 
     def _find_boundary_csv_paths(self, roots):
         """Discover B2B result CSVs under output folders (gap preferred over summary).
@@ -3782,8 +3810,7 @@ class SegmentationUIMixin:
             print(f"[TEACHING 3D] spacing sync from Viewer skipped: {e}")
 
     def _get_3d_world_spacing(self):
-        """Same contract as Viewer ``StatsPanelMixin._get_3d_world_spacing``."""
-        # Prefer live VTK image used by the volume actor
+        """Same contract as Viewer — prefer live VTK image spacing when present."""
         try:
             vd = getattr(self, "_3d_vtk_data", None)
             if vd is not None:
@@ -3791,57 +3818,36 @@ class SegmentationUIMixin:
                 return (float(sp[0]), float(sp[1]), float(sp[2]))
         except Exception:
             pass
-        spacing = getattr(self, "custom_spacing", None)
-        if spacing is None:
-            spacing = getattr(self, "_3d_original_spacing", None)
-        if spacing is None:
-            spacing = getattr(self, "_3d_spacing", None)
-        if spacing is None:
-            spacing = getattr(self, "spacing", [1.0, 1.0, 1.0])
-        try:
-            return (float(spacing[0]), float(spacing[1]), float(spacing[2]))
-        except Exception:
-            return (1.0, 1.0, 1.0)
+        custom = getattr(self, "custom_spacing", None)
+        if custom is None:
+            custom = getattr(self, "_3d_original_spacing", None)
+        if custom is None:
+            custom = getattr(self, "_3d_spacing", None)
+        return _shared_world_spacing(custom, getattr(self, "spacing", [1.0, 1.0, 1.0]))
 
     def _b2b_layer_z_offset(self, row_dict):
-        """Local B2B layer Z → full-volume Z — **copy of Viewer stats_panel**.
-
-        Combined CSV stores **per-layer local** Src_voxel_Z; must add layer
-        ``z_start`` or markers float at wrong height (e.g. Z=18 vs Z=38).
-        """
-        if not row_dict:
-            return int(getattr(self, "_boundary_z_offset", 0) or 0)
-        for key in ("z_start", "Z_start", "layer_z_start"):
-            if key in row_dict and row_dict[key] not in (None, ""):
-                try:
-                    return int(float(row_dict[key]))
-                except (TypeError, ValueError):
-                    pass
-        ln = str(row_dict.get("Layer", "") or getattr(self, "_boundary_layer_name", "") or "")
-        # 1) MainWindow Online bands (exact Viewer path)
+        """Local B2B layer Z → full-volume Z (shared helper + Teaching bands)."""
+        fallback = int(getattr(self, "_boundary_z_offset", 0) or 0)
+        bands = None
         try:
             mw = self.window()
             if hasattr(mw, "_online_layer_bands"):
                 bands = mw._online_layer_bands()
-                if bands:
-                    key = ln.replace(" ", "_").lower()
-                    for L in bands:
-                        name = str(L.get("name", ""))
-                        if name == ln or name.replace(" ", "_").lower() == key:
-                            return int(L.get("z_start", 0) or 0)
         except Exception:
-            pass
-        # 2) Teaching layer_definitions
-        for L in getattr(self, "layer_definitions", None) or []:
-            name = str(L.get("name", ""))
-            if not name:
-                continue
-            if name == ln or name.replace(" ", "_").lower() == ln.replace(" ", "_").lower():
-                try:
-                    return int(L.get("z_start", 0) or 0)
-                except (TypeError, ValueError):
-                    return 0
-        return int(getattr(self, "_boundary_z_offset", 0) or 0)
+            bands = None
+        # Prefer Teaching layer_definitions as bands when Online bands empty
+        if not bands:
+            bands = [
+                {"name": L.get("name", ""), "z_start": L.get("z_start", 0)}
+                for L in (getattr(self, "layer_definitions", None) or [])
+                if L.get("name")
+            ] or None
+        # Inject Layer from folder detect when row lacks it
+        row = row_dict
+        if row and not row.get("Layer") and getattr(self, "_boundary_layer_name", ""):
+            row = dict(row)
+            row["Layer"] = self._boundary_layer_name
+        return _shared_layer_z_offset(row, layer_bands=bands, fallback=fallback)
 
     def _populate_boundary_table_from_results(self):
         """Fill boundary_table from self.boundary_results (gap or summary)."""
@@ -4098,12 +4104,10 @@ class SegmentationUIMixin:
                 src_rc = f"R{r.get('Src_row','?')}C{r.get('Src_col','?')}"
                 dst_rc = f"R{r.get('Dst_row','?')}C{r.get('Dst_col','?')}"
                 layer = str(r.get('Layer', '') or getattr(self, '_boundary_layer_name', '') or '')
-                label = (
-                    f"{layer}  SRC {src_rc}→DST {dst_rc} ({direction})  {eucl} µm\n"
-                    f"surface voxels  "
-                    f"SRC(Z,Y,X)=({src[0]},{src[1]},{src[2]})  "
-                    f"DST(Z,Y,X)=({dst[0]},{dst[1]},{dst[2]})"
-                ).strip()
+                # Same 3-line callout as Viewer (shared format_gap_label)
+                label = _shared_format_gap_label(
+                    layer, eucl, src_rc, dst_rc, direction, src, dst
+                )
                 print(
                     f"[B2B] Teaching gap Layer={layer!r} z_off={z_offset} "
                     f"localSRC=({_iv('Src_voxel_Z')},{_iv('Src_voxel_Y')},{_iv('Src_voxel_X')}) "
@@ -4470,29 +4474,27 @@ class SegmentationUIMixin:
         
         # Clipping: VTK default (camera stays outside volume — no fly-through)
         
-        # Orientation cube (Dragonfly-style, same as viewer)
-        cube = vtk.vtkAnnotatedCubeActor()
-        cube.SetXPlusFaceText("+X")
-        cube.SetXMinusFaceText("-X")
-        cube.SetYPlusFaceText("+Y")
-        cube.SetYMinusFaceText("-Y")
-        cube.SetZPlusFaceText("+Z")
-        cube.SetZMinusFaceText("-Z")
-        cube.GetCubeProperty().SetColor(0.95, 0.95, 0.95)
-        cube.GetTextEdgesProperty().SetColor(0.2, 0.2, 0.2)
-        cube.GetTextEdgesProperty().SetLineWidth(1)
-        for prop in [
-            cube.GetXPlusFaceProperty(), cube.GetXMinusFaceProperty(),
-            cube.GetYPlusFaceProperty(), cube.GetYMinusFaceProperty(),
-            cube.GetZPlusFaceProperty(), cube.GetZMinusFaceProperty(),
-        ]:
-            prop.SetColor(0.1, 0.1, 0.1)
+        # Orientation cube — Viewer SoT (hover glow + click-to-orient)
+        from inno3d.features.shared.orientation_cube import build_orientation_marker
+        self._ori_hover_face = None
+        marker, ori_state = build_orientation_marker()
+        self._ori_cube_state = ori_state
+        self._axes_cube_actor = ori_state.get("cube")
+        self._ori_face_highlights = ori_state.get("face_highlights") or {}
+        self._ori_face_text_props = ori_state.get("face_text_props") or {}
         self._3d_axes_widget = vtk.vtkOrientationMarkerWidget()
-        self._3d_axes_widget.SetOrientationMarker(cube)
+        self._3d_axes_widget.SetOrientationMarker(marker)
         self._3d_axes_widget.SetInteractor(interactor)
-        self._3d_axes_widget.SetViewport(0.85, 0.0, 1.0, 0.15)
+        # Same viewport family as Viewer
+        self._3d_axes_widget.SetViewport(0.82, 0.0, 1.0, 0.18)
         self._3d_axes_widget.EnabledOn()
         self._3d_axes_widget.InteractiveOff()
+        interactor.AddObserver(
+            "LeftButtonPressEvent", self._on_orientation_cube_click, 10.0
+        )
+        interactor.AddObserver(
+            "MouseMoveEvent", self._on_orientation_cube_hover, 5.0
+        )
         
         self._3d_volume_actor = None
         self._3d_volume_mapper = None  # Store mapper ref for LOD updates
@@ -4531,7 +4533,7 @@ class SegmentationUIMixin:
         self.teaching_3d_container.setVisible(enabled)
         self._bottom_right_info.setVisible(not enabled)
         if enabled:
-            self._render_teaching_3d()
+            self._render_teaching_3d()  # includes update_3d_crosshair
 
     def _render_teaching_3d(self):
         """Render the 3D volume in the teaching tab (Viewer-grade quality).
@@ -4552,18 +4554,13 @@ class SegmentationUIMixin:
         if getattr(self, '_3d_seg_actor', None):
             renderer.RemoveActor(self._3d_seg_actor)
             self._3d_seg_actor = None
-        # Remove F26 GPU mask volume actors (Seg Overlay)
+        # Remove Seg Overlay mask shells (surface actors; legacy volumes OK too)
+        from inno3d.features.viewer.seg_mask_3d import remove_mask_overlay_from_renderer
         if getattr(self, '_3d_c1_actor', None) is not None:
-            try:
-                renderer.RemoveVolume(self._3d_c1_actor)
-            except Exception:
-                pass
+            remove_mask_overlay_from_renderer(renderer, self._3d_c1_actor)
             self._3d_c1_actor = None
         if getattr(self, '_3d_c2_actor', None) is not None:
-            try:
-                renderer.RemoveVolume(self._3d_c2_actor)
-            except Exception:
-                pass
+            remove_mask_overlay_from_renderer(renderer, self._3d_c2_actor)
             self._3d_c2_actor = None
 
         vol = self.volume_data
@@ -4667,16 +4664,14 @@ class SegmentationUIMixin:
             pass
 
         self._apply_3d_transfer_function(vol_prop)
-        # When Seg Overlay: dim grey volume so mask voxels read clearly
+        # Seg Overlay uses glass shells — only light CT dim so structure stays readable
         if mode == "Seg Overlay":
             try:
                 op = vol_prop.GetScalarOpacity()
-                # Scale opacity curve down ~50%
                 if op is not None and op.GetSize() > 0:
-                    # rebuild lighter TF via existing helper scale
                     self._3d_opacity_slider.blockSignals(True)
                     prev = self._3d_opacity_slider.value()
-                    self._3d_opacity_slider.setValue(max(8, int(prev * 0.45)))
+                    self._3d_opacity_slider.setValue(max(12, int(prev * 0.72)))
                     self._apply_3d_transfer_function(vol_prop)
                     self._3d_opacity_slider.setValue(prev)
                     self._3d_opacity_slider.blockSignals(False)
@@ -4693,38 +4688,40 @@ class SegmentationUIMixin:
         self._3d_spacing = (spacing[0], spacing[1], spacing[2])
         self._3d_original_spacing = (spacing[0], spacing[1], spacing[2])
 
-        # ── Seg Overlay: EXACT Viewer create_mask_volume (shared helper) ──
+        # ── Seg Overlay: medical glass shells (shared with 3D Viewer) ──
         if mode == "Seg Overlay":
-            from inno3d.features.viewer.seg_mask_3d import create_mask_volume_actor
+            from inno3d.features.viewer.seg_mask_3d import (
+                create_mask_surface_actor,
+                add_mask_overlay_to_renderer,
+            )
 
             c1_color = list(getattr(self, "class1_color", None) or [1.0, 1.0, 0.0])
             c2_color = list(getattr(self, "class2_color", None) or [1.0, 0.0, 0.0])
-            # Viewer Online often uses green/red; keep Teaching MPR colors (yellow/red)
             bump_seg = getattr(self, "bump_segmentation", None)
             void_seg = getattr(self, "void_segmentation", None)
 
             if bump_seg is not None:
-                c1_actor = create_mask_volume_actor(
-                    bump_seg, spacing, c1_color, base_opacity=0.45
+                c1_actor = create_mask_surface_actor(
+                    bump_seg, spacing, c1_color, base_opacity=0.35, smooth=True
                 )
                 if c1_actor is not None:
-                    renderer.AddVolume(c1_actor)
+                    add_mask_overlay_to_renderer(renderer, c1_actor)
                     self._3d_c1_actor = c1_actor
             else:
                 self._3d_c1_actor = None
 
             if void_seg is not None:
-                c2_actor = create_mask_volume_actor(
-                    void_seg, spacing, c2_color, base_opacity=0.80
+                c2_actor = create_mask_surface_actor(
+                    void_seg, spacing, c2_color, base_opacity=0.48, smooth=True
                 )
                 if c2_actor is not None:
-                    renderer.AddVolume(c2_actor)
+                    add_mask_overlay_to_renderer(renderer, c2_actor)
                     self._3d_c2_actor = c2_actor
             else:
                 self._3d_c2_actor = None
 
             print(
-                f"[TEACHING 3D] Seg Overlay masks "
+                f"[TEACHING 3D] Seg Overlay glass shells "
                 f"c1={'yes' if self._3d_c1_actor else 'no'} "
                 f"c2={'yes' if self._3d_c2_actor else 'no'} "
                 f"spacing={spacing}"
@@ -4752,6 +4749,13 @@ class SegmentationUIMixin:
         
         # Apply GPU-native cropping to all mappers
         self._apply_3d_clipping(render=False)
+
+        # RGB crosshair axes (after volume/masks; final Render below)
+        if hasattr(self, "update_3d_crosshair"):
+            try:
+                self.update_3d_crosshair(render=False)
+            except Exception:
+                pass
         
         self._3d_vtk_widget.GetRenderWindow().Render()
 
@@ -4953,483 +4957,126 @@ class SegmentationUIMixin:
                 ctrl["flip"].blockSignals(False)
         self._apply_3d_clipping(render=True)
 
-    def _clear_boundary_actors(self):
-        """Remove all boundary gap line actors from the 3D scene.
+    def _get_b2b_gap_overlay(self) -> B2BGapOverlay:
+        """Shared B2B gap actor stack (same module as Viewer stats_panel)."""
+        ov = getattr(self, "_b2b_gap_overlay", None)
+        if ov is None:
+            ov = B2BGapOverlay()
+            self._b2b_gap_overlay = ov
+        return ov
 
-        Handles both standard 3D actors and 2D overlay actors (vtkCaptionActor2D).
+    # ── MES 3D highlight (shared MESHighlightOverlay — Viewer SoT) ───────
+
+    def _get_mes_highlight_overlay(self) -> MESHighlightOverlay:
+        ov = getattr(self, "_mes_highlight_overlay", None)
+        if ov is None:
+            ov = MESHighlightOverlay()
+            self._mes_highlight_overlay = ov
+        return ov
+
+    def _clear_mes_3d_highlight(self, render=True, restore_context=True):
+        """Remove MES pick surfaces from Teaching 3D renderer."""
+        ren = getattr(self, "_3d_renderer", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        ov = self._get_mes_highlight_overlay()
+        ov.clear(ren, widget, render=render)
+        self._mes_3d_highlight_actors = ov.actors
+
+    def _update_mes_3d_highlight(self):
+        """Cyan MES pick surfaces on Teaching 3D (shared overlay).
+
+        Only draws when 3D view is already active — does not force-enable 3D
+        (VRAM-conscious Teaching default).
         """
-        ren = getattr(self, '_3d_renderer', None)
-        if ren is None:
-            self._3d_boundary_actors = []
-            self._3d_b2b_2d_actors = []
+        if not getattr(self, "_3d_view_active", False):
             return
-        for actor in getattr(self, '_3d_boundary_actors', []):
+        ren = getattr(self, "_3d_renderer", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        labeled = getattr(self, "labeled_class1_data", None)
+        if ren is None or labeled is None or self.volume_data is None:
+            self._clear_mes_3d_highlight(render=False)
+            return
+        if not getattr(self, "selected_highlight_objects", None):
+            self._clear_mes_3d_highlight(render=True)
+            return
+
+        # Drop B2B gap so MES pick is the spotlight (same as Viewer)
+        if hasattr(self, "_clear_boundary_actors"):
             try:
-                ren.RemoveActor(actor)
+                self._clear_boundary_actors()
             except Exception:
                 pass
-        for actor in getattr(self, '_3d_b2b_2d_actors', []):
-            try:
-                ren.RemoveActor2D(actor)
-            except Exception:
-                pass
+
+        ov = self._get_mes_highlight_overlay()
+        ov.update(
+            ren,
+            widget,
+            labeled,
+            getattr(self, "object_stats", None),
+            self.selected_highlight_objects,
+            self._get_3d_world_spacing(),
+            z_offset=int(getattr(self, "_measurement_start_slice", 0) or 0),
+            highlight_color=getattr(self, "highlight_color", [0.0, 1.0, 1.0]),
+            on_dim_context=None,
+            on_restore_context=None,
+        )
+        self._mes_3d_highlight_actors = ov.actors
+
+    def _clear_boundary_actors(self):
+        """Remove B2B gap actors from Teaching 3D renderer (shared overlay)."""
+        ren = getattr(self, "_3d_renderer", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        ov = self._get_b2b_gap_overlay()
+        ov.clear(ren, widget, render=True)
+        # Legacy lists kept empty so re-render paths do not double-remove
         self._3d_boundary_actors = []
         self._3d_b2b_2d_actors = []
 
-    # ── B2B gap actor helpers (Viewer-grade, F25) ─────────────────────────
-
-    def _3d_b2b_add_gap_actor(self, ren, actor, is_2d=False):
-        """Track + add a B2B overlay actor (3D or 2D CaptionActor2D)."""
-        if is_2d:
-            ren.AddActor2D(actor)
-            if not hasattr(self, '_3d_b2b_2d_actors'):
-                self._3d_b2b_2d_actors = []
-            self._3d_b2b_2d_actors.append(actor)
-        else:
-            ren.AddActor(actor)
-            self._3d_boundary_actors.append(actor)
-
-    def _3d_b2b_add_surface_voxel_marker(self, ren, z, y, x, sx, sy, sz, color,
-                                         label_tag=""):
-        """Mark the exact discrete surface voxel reported by the B2B DLL.
-
-        Identical to Viewer stats_panel._b2b_add_surface_voxel_marker:
-          · Filled translucent cube = 1 voxel cell
-          · Wireframe outline of same cell
-          · Tiny solid bead at voxel sample center
-          · Optional billboard coordinate tag
-        """
-        x0, x1 = (float(x) - 0.5) * sx, (float(x) + 0.5) * sx
-        y0, y1 = (float(y) - 0.5) * sy, (float(y) + 0.5) * sy
-        z0, z1 = (float(z) - 0.5) * sz, (float(z) + 0.5) * sz
-        cx, cy, cz = float(x) * sx, float(y) * sy, float(z) * sz
-        min_sp = max(1e-6, min(sx, sy, sz))
-
-        cube = vtk.vtkCubeSource()
-        cube.SetBounds(x0, x1, y0, y1, z0, z1)
-        cube.Update()
-
-        fill_m = vtk.vtkPolyDataMapper()
-        fill_m.SetInputConnection(cube.GetOutputPort())
-        fill_a = vtk.vtkActor()
-        fill_a.SetMapper(fill_m)
-        fill_a.GetProperty().SetColor(*color)
-        fill_a.GetProperty().SetOpacity(0.55)
-        fill_a.GetProperty().SetLighting(False)
-        fill_a.GetProperty().SetAmbient(1.0)
-        fill_a.GetProperty().SetDiffuse(0.0)
-        self._3d_b2b_add_gap_actor(ren, fill_a)
-
-        wire_m = vtk.vtkPolyDataMapper()
-        wire_m.SetInputConnection(cube.GetOutputPort())
-        wire_a = vtk.vtkActor()
-        wire_a.SetMapper(wire_m)
-        wire_a.GetProperty().SetRepresentationToWireframe()
-        wire_a.GetProperty().SetColor(1.0, 1.0, 1.0)
-        wire_a.GetProperty().SetLineWidth(2.0)
-        wire_a.GetProperty().SetOpacity(1.0)
-        wire_a.GetProperty().SetLighting(False)
-        wire_a.GetProperty().SetAmbient(1.0)
-        self._3d_b2b_add_gap_actor(ren, wire_a)
-
-        bead_r = max(0.35, min_sp * 0.35)
-        sph = vtk.vtkSphereSource()
-        sph.SetCenter(cx, cy, cz)
-        sph.SetRadius(bead_r)
-        sph.SetPhiResolution(14)
-        sph.SetThetaResolution(14)
-        sm = vtk.vtkPolyDataMapper()
-        sm.SetInputConnection(sph.GetOutputPort())
-        sa = vtk.vtkActor()
-        sa.SetMapper(sm)
-        sa.GetProperty().SetColor(*color)
-        sa.GetProperty().SetOpacity(1.0)
-        sa.GetProperty().SetLighting(False)
-        sa.GetProperty().SetAmbient(1.0)
-        self._3d_b2b_add_gap_actor(ren, sa)
-
-        if label_tag:
-            try:
-                tag = vtk.vtkBillboardTextActor3D()
-                tag.SetInput(str(label_tag))
-                tag.SetPosition(cx, cy, cz + max(sz, min_sp) * 1.2)
-                tp = tag.GetTextProperty()
-                tp.SetFontSize(11)
-                tp.SetColor(*color)
-                tp.BoldOn()
-                tp.SetBackgroundColor(0.0, 0.0, 0.0)
-                tp.SetBackgroundOpacity(0.7)
-                tp.SetJustificationToCentered()
-                self._3d_b2b_add_gap_actor(ren, tag)
-            except Exception:
-                pass
-
-    def _3d_b2b_add_local_object_surface(self, ren, z, y, x, sx, sy, sz, color,
-                                         pad=12):
-        """Show local isosurface of the object owning this B2B surface voxel.
-
-        Identical to Viewer stats_panel._b2b_add_local_object_surface — makes it
-        obvious the marker sits on the bump surface, not mid-air.
-        Uses labeled_class1_data (or binary bump_segmentation) around the voxel.
-        """
-        labeled = getattr(self, 'labeled_class1_data', None)
-        c1 = getattr(self, 'bump_segmentation', None)  # Teaching: bump_seg ≈ class1
-        if labeled is None and c1 is None:
-            return
-        try:
-            if labeled is not None:
-                Z, Y, X = labeled.shape
-            else:
-                Z, Y, X = c1.shape
-            z = int(z); y = int(y); x = int(x)
-            if not (0 <= z < Z and 0 <= y < Y and 0 <= x < X):
-                return
-
-            lab = 0
-            if labeled is not None:
-                lab = int(labeled[z, y, x])
-            z0, z1 = max(0, z - pad), min(Z, z + pad + 1)
-            y0, y1 = max(0, y - pad), min(Y, y + pad + 1)
-            x0, x1 = max(0, x - pad), min(X, x + pad + 1)
-
-            if labeled is not None and lab > 0:
-                crop = labeled[z0:z1, y0:y1, x0:x1]
-                mask = (crop == lab)
-            else:
-                src = c1 if c1 is not None else labeled
-                crop = src[z0:z1, y0:y1, x0:x1]
-                mask = crop > 0
-            if not np.any(mask):
-                return
-
-            mask_u8 = np.ascontiguousarray(mask.astype(np.uint8))
-            vtk_img = vtk.vtkImageData()
-            dz, dy, dx = mask_u8.shape
-            vtk_img.SetDimensions(dx, dy, dz)
-            vtk_img.SetSpacing(float(sx), float(sy), float(sz))
-            vtk_img.SetOrigin(float(x0) * sx, float(y0) * sy, float(z0) * sz)
-            flat = np.ascontiguousarray(
-                np.transpose(mask_u8, (2, 1, 0)).ravel(order='F')
-            )
-            vtk_arr = numpy_support.numpy_to_vtk(
-                flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
-            )
-            vtk_img.GetPointData().SetScalars(vtk_arr)
-
-            try:
-                contour = vtk.vtkFlyingEdges3D()
-            except Exception:
-                contour = vtk.vtkMarchingCubes()
-            contour.SetInputData(vtk_img)
-            contour.SetValue(0, 0.5)
-            contour.ComputeNormalsOn()
-            try:
-                contour.ComputeScalarsOff()
-            except Exception:
-                pass
-            contour.Update()
-
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputConnection(contour.GetOutputPort())
-            mapper.ScalarVisibilityOff()
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-            prop = actor.GetProperty()
-            prop.SetColor(*color)
-            prop.SetOpacity(0.38)
-            prop.SetAmbient(0.45)
-            prop.SetDiffuse(0.55)
-            prop.EdgeVisibilityOff()
-            self._3d_b2b_add_gap_actor(ren, actor)
-        except Exception as e:
-            print(f"[B2B] local surface patch skipped: {e}")
-
-    def _3d_world_to_normalized_viewport(self, ren, wx, wy, wz):
-        """Project world point → normalized viewport [0..1]².
-
-        Identical to Viewer stats_panel._world_to_normalized_viewport.
-        Returns (nx, ny) or None if projection fails / point is off-screen.
-        """
-        if ren is None:
-            return None
-        try:
-            coord = vtk.vtkCoordinate()
-            coord.SetCoordinateSystemToWorld()
-            coord.SetValue(float(wx), float(wy), float(wz))
-            dx, dy = coord.GetComputedDisplayValue(ren)
-            origin = ren.GetOrigin()
-            size = ren.GetSize()
-            w = float(size[0]) if size and size[0] else 0.0
-            h = float(size[1]) if size and size[1] else 0.0
-            if w <= 1.0 or h <= 1.0:
-                return None
-            nx = (float(dx) - float(origin[0])) / w
-            ny = (float(dy) - float(origin[1])) / h
-            return (nx, ny)
-        except Exception:
-            return None
-
-    def _3d_b2b_caption_viewport_pos(self, ren, mid_x, mid_y, mid_z,
-                                     box_w=0.38, box_h=0.11):
-        """Place callout box near the gap in screen space (short leader).
-
-        Identical to Viewer stats_panel._b2b_caption_viewport_pos.
-        """
-        proj = self._3d_world_to_normalized_viewport(ren, mid_x, mid_y, mid_z)
-        if proj is None:
-            return (0.55, 0.50)
-        nx, ny = proj
-        if nx < -0.15 or nx > 1.15 or ny < -0.15 or ny > 1.15:
-            return (0.55, 0.50)
-        cap_x = nx + 0.06
-        cap_y = ny + 0.04
-        if cap_x + box_w > 0.98:
-            cap_x = nx - box_w - 0.04
-        if cap_y + box_h > 0.96:
-            cap_y = ny - box_h - 0.04
-        cap_x = max(0.02, min(cap_x, 0.98 - box_w))
-        cap_y = max(0.02, min(cap_y, 0.96 - box_h))
-        return (cap_x, cap_y)
-
     def _draw_boundary_gap_line(self, src_voxel, dst_voxel, label_text=""):
-        """Draw Src→Dst B2B gap on 3D Volume — Viewer-grade (F25).
-
-        Visual design (matches Viewer stats_panel._draw_b2b_gap_line):
-          · Local isosurface patches of the two objects at contact (context)
-          · 1-voxel wireframe cubes at DLL boundary voxels (true surface voxels)
-          · Thin gradient tube cyan SRC → yellow DST
-          · Red cone arrow at DST (gap direction indicator)
-          · Screen-space CaptionActor2D near gap with distance label
-          · Fallback 3D billboard leader if CaptionActor2D fails
-
-        Args:
-            src_voxel: (z, y, x) in global volume voxel indices
-            dst_voxel: (z, y, x) in global volume voxel indices
-            label_text: distance string from B2B CSV (e.g. "12.3 µm")
-        """
-        if not self._3d_view_active or not hasattr(self, '_3d_renderer'):
+        """Draw Src→Dst B2B gap via shared B2BGapOverlay (Viewer SoT)."""
+        if not getattr(self, "_3d_view_active", False) or not hasattr(self, "_3d_renderer"):
             return
-
         ren = self._3d_renderer
-        widget = getattr(self, '_3d_vtk_widget', None)
+        widget = getattr(self, "_3d_vtk_widget", None)
         if self.volume_data is None:
             print("[B2B] 3D gap skipped: no volume")
             return
 
-        self._clear_boundary_actors()
-
-        # CRITICAL: spacing must match the rendered grey volume (Viewer SoT).
-        # Never re-scale by param voxel sizes — that shifted B2B off the volume.
-        sx, sy, sz = self._get_3d_world_spacing()
-
-        src_x = float(src_voxel[2]) * sx
-        src_y = float(src_voxel[1]) * sy
-        src_z = float(src_voxel[0]) * sz
-        dst_x = float(dst_voxel[2]) * sx
-        dst_y = float(dst_voxel[1]) * sy
-        dst_z = float(dst_voxel[0]) * sz
-        mid_x = 0.5 * (src_x + dst_x)
-        mid_y = 0.5 * (src_y + dst_y)
-        mid_z = 0.5 * (src_z + dst_z)
-
-        dx = dst_x - src_x
-        dy = dst_y - src_y
-        dz = dst_z - src_z
-        gap_len = float(np.sqrt(dx * dx + dy * dy + dz * dz))
-        if gap_len < 1e-9:
-            gap_len = 1e-9
-            dx, dy, dz = gap_len, 0.0, 0.0
-        ux, uy, uz = dx / gap_len, dy / gap_len, dz / gap_len
-
-        min_sp = max(1e-6, min(sx, sy, sz))
-        tube_r = max(0.35, min_sp * 0.9)
-        arrow_h = max(min_sp * 2.5, tube_r * 4.0)
-        arrow_r = max(tube_r * 1.8, min_sp * 1.4)
-
-        src_z_i, src_y_i, src_x_i = int(src_voxel[0]), int(src_voxel[1]), int(src_voxel[2])
-        dst_z_i, dst_y_i, dst_x_i = int(dst_voxel[0]), int(dst_voxel[1]), int(dst_voxel[2])
-        col_src = (0.0, 0.92, 1.0)   # cyan
-        col_dst = (1.0, 0.88, 0.15)  # yellow
-
-        # ── 0) Local object surfaces at SRC / DST (context: on bump surface) ──
-        self._3d_b2b_add_local_object_surface(
-            ren, src_z_i, src_y_i, src_x_i, sx, sy, sz, col_src, pad=12
-        )
-        self._3d_b2b_add_local_object_surface(
-            ren, dst_z_i, dst_y_i, dst_x_i, sx, sy, sz, col_dst, pad=12
-        )
-
-        # ── 1) Directional gradient tube (cyan SRC → yellow DST) ───────────
-        pts = vtk.vtkPoints()
-        pts.InsertNextPoint(src_x, src_y, src_z)
-        pts.InsertNextPoint(dst_x, dst_y, dst_z)
-        lines = vtk.vtkCellArray()
-        lines.InsertNextCell(2)
-        lines.InsertCellPoint(0)
-        lines.InsertCellPoint(1)
-        colors = vtk.vtkUnsignedCharArray()
-        colors.SetNumberOfComponents(3)
-        colors.SetName("Colors")
-        colors.InsertNextTuple3(0, 230, 255)    # SRC cyan
-        colors.InsertNextTuple3(255, 220, 40)   # DST yellow
-        poly = vtk.vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-        poly.GetPointData().SetScalars(colors)
-
-        tube = vtk.vtkTubeFilter()
-        tube.SetInputData(poly)
-        tube.SetRadius(tube_r)
-        tube.SetNumberOfSides(16)
-        tube.CappingOn()
-        tube.SetVaryRadiusToVaryRadiusOff()
-        tube.Update()
-
-        line_mapper = vtk.vtkPolyDataMapper()
-        line_mapper.SetInputConnection(tube.GetOutputPort())
-        line_mapper.SetScalarModeToUsePointData()
-        line_mapper.ScalarVisibilityOn()
-        line_actor = vtk.vtkActor()
-        line_actor.SetMapper(line_mapper)
-        line_actor.GetProperty().SetOpacity(1.0)
-        line_actor.GetProperty().SetLighting(False)
-        line_actor.GetProperty().SetAmbient(1.0)
-        line_actor.GetProperty().SetDiffuse(0.0)
-        self._3d_b2b_add_gap_actor(ren, line_actor)
-
-        # ── 2) Exact surface-voxel wireframe cubes ─────────────────────────
-        self._3d_b2b_add_surface_voxel_marker(
-            ren, src_z_i, src_y_i, src_x_i, sx, sy, sz, col_src,
-            label_tag=f"SRC Z{src_z_i},Y{src_y_i},X{src_x_i}",
-        )
-        self._3d_b2b_add_surface_voxel_marker(
-            ren, dst_z_i, dst_y_i, dst_x_i, sx, sy, sz, col_dst,
-            label_tag=f"DST Z{dst_z_i},Y{dst_y_i},X{dst_x_i}",
-        )
-
-        # ── 3) Arrow head at DST (direction Src→Dst) ──────────────────────
-        try:
-            cone = vtk.vtkConeSource()
-            cone.SetRadius(arrow_r)
-            cone.SetHeight(arrow_h)
-            cone.SetResolution(20)
-            cone.SetDirection(ux, uy, uz)
-            back = min(arrow_h * 0.55, gap_len * 0.35)
-            cone.SetCenter(
-                dst_x - ux * back,
-                dst_y - uy * back,
-                dst_z - uz * back,
-            )
-            cone.Update()
-            cone_mapper = vtk.vtkPolyDataMapper()
-            cone_mapper.SetInputConnection(cone.GetOutputPort())
-            cone_actor = vtk.vtkActor()
-            cone_actor.SetMapper(cone_mapper)
-            cone_actor.GetProperty().SetColor(1.0, 0.25, 0.12)
-            cone_actor.GetProperty().SetOpacity(1.0)
-            cone_actor.GetProperty().SetLighting(False)
-            cone_actor.GetProperty().SetAmbient(1.0)
-            cone_actor.GetProperty().SetDiffuse(0.0)
-            self._3d_b2b_add_gap_actor(ren, cone_actor)
-        except Exception as _arr_e:
-            print(f"[B2B] DST arrow skipped: {_arr_e}")
-
-        # ── 4) Screen-space callout near the gap ──────────────────────────
-        if label_text:
-            caption_ok = False
+        ov = self._get_b2b_gap_overlay()
+        spacing = self._get_3d_world_spacing()
+        # Drop MES pick stack so B2B is the only spotlight (Viewer parity)
+        if hasattr(self, "_clear_mes_3d_highlight"):
             try:
-                box_w, box_h = 0.38, 0.11
-                cap_x, cap_y = self._3d_b2b_caption_viewport_pos(
-                    ren, mid_x, mid_y, mid_z, box_w=box_w, box_h=box_h
-                )
-                caption = vtk.vtkCaptionActor2D()
-                caption.SetCaption(str(label_text))
-                caption.SetAttachmentPoint(mid_x, mid_y, mid_z)
-                caption.BorderOn()
-                caption.LeaderOn()
-                try:
-                    caption.ThreeDimensionalLeaderOff()
-                except Exception:
-                    pass
-                try:
-                    caption.SetPadding(3)
-                except Exception:
-                    pass
-                caption.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
-                caption.SetPosition(float(cap_x), float(cap_y))
-                caption.GetPosition2Coordinate().SetCoordinateSystemToNormalizedViewport()
-                caption.SetWidth(box_w)
-                caption.SetHeight(box_h)
-                cprop = caption.GetCaptionTextProperty()
-                cprop.SetFontSize(13)
-                cprop.SetBold(1)
-                cprop.SetColor(1.0, 1.0, 1.0)
-                cprop.SetBackgroundColor(0.05, 0.08, 0.12)
-                cprop.SetBackgroundOpacity(0.88)
-                cprop.ShadowOn()
-                cprop.SetJustificationToLeft()
-                cprop.SetVerticalJustificationToCentered()
-                caption.GetProperty().SetColor(1.0, 0.45, 0.25)
-                caption.GetProperty().SetLineWidth(2.0)
-                try:
-                    caption.GetAttachmentPointCoordinate().SetCoordinateSystemToWorld()
-                except Exception:
-                    pass
-                self._3d_b2b_add_gap_actor(ren, caption, is_2d=True)
-                caption_ok = True
-                print(
-                    f"[B2B] caption pos=({cap_x:.3f},{cap_y:.3f}) "
-                    f"attach=({mid_x:.1f},{mid_y:.1f},{mid_z:.1f})"
-                )
-            except Exception as _cap_e:
-                print(f"[B2B] CaptionActor2D failed ({_cap_e}); fallback billboard")
-
-            if not caption_ok:
-                # Fallback: short 3D leader offset beside the gap
-                try:
-                    off = max(tube_r * 6.0, min_sp * 12.0)
-                    ox, oy, oz = off, 0.0, off * 0.35
-                    try:
-                        cam = ren.GetActiveCamera()
-                        if cam is not None:
-                            vpn = list(cam.GetViewPlaneNormal())
-                            vup = list(cam.GetViewUp())
-                            rx = vup[1] * vpn[2] - vup[2] * vpn[1]
-                            ry = vup[2] * vpn[0] - vup[0] * vpn[2]
-                            rz = vup[0] * vpn[1] - vup[1] * vpn[0]
-                            rl = float(np.sqrt(rx * rx + ry * ry + rz * rz)) or 1.0
-                            ox, oy, oz = off * rx / rl, off * ry / rl, off * rz / rl
-                    except Exception:
-                        pass
-                    lx, ly, lz = mid_x + ox, mid_y + oy, mid_z + oz
-                    text_actor = vtk.vtkBillboardTextActor3D()
-                    text_actor.SetInput(str(label_text))
-                    text_actor.SetPosition(lx, ly, lz)
-                    tp = text_actor.GetTextProperty()
-                    tp.SetFontSize(14)
-                    tp.SetColor(1.0, 1.0, 1.0)
-                    tp.BoldOn()
-                    tp.SetBackgroundColor(0.05, 0.08, 0.12)
-                    tp.SetBackgroundOpacity(0.85)
-                    self._3d_b2b_add_gap_actor(ren, text_actor)
-                except Exception as _fb_e:
-                    print(f"[B2B] label fallback failed: {_fb_e}")
-
-        # Update header info label
-        if hasattr(self, '_3d_bnd_info'):
-            self._3d_bnd_info.setText(f"Gap: {label_text}")
-
-        if widget is not None:
-            try:
-                ren.ResetCameraClippingRange()
-                widget.GetRenderWindow().Render()
+                self._clear_mes_3d_highlight(render=False)
             except Exception:
                 pass
-        print(
-            f"[B2B] 3D gap drawn: {label_text}  "
-            f"src={src_voxel} dst={dst_voxel} spacing=({sx:.3f},{sy:.3f},{sz:.3f}) "
-            f"len={gap_len:.3f}"
+        # Teaching uses bump_segmentation as class1 binary fallback
+        c1 = getattr(self, "bump_segmentation", None)
+        if c1 is None:
+            c1 = getattr(self, "class1_data", None)
+
+        ok = ov.draw(
+            ren,
+            widget,
+            src_voxel,
+            dst_voxel,
+            spacing,
+            label_text=label_text,
+            labeled=getattr(self, "labeled_class1_data", None),
+            class1_binary=c1,
+            on_dim_context=None,
+            volume_world_radius=None,
+            sync_orbit_pivot=None,
+            frame_camera=True,
         )
+        # Keep legacy actor list in sync for re-render paths
+        self._3d_boundary_actors = list(ov.actors)
+        self._3d_b2b_2d_actors = []
+        if hasattr(self, "_3d_bnd_info") and ok:
+            try:
+                self._3d_bnd_info.setText(f"Gap: {label_text}")
+            except Exception:
+                pass
 
     # ── Viewer-grade Transfer Function (Dragonfly metallic) ───────────────
 
@@ -5589,6 +5236,145 @@ class SegmentationUIMixin:
             radius=self._volume_world_radius(),
             bounds=self._volume_world_bounds(),
         )
+
+    # ── Orientation cube (shared Viewer SoT: hover + click-to-orient) ─────
+
+    def _orientation_cube_render(self):
+        widget = getattr(self, "_3d_vtk_widget", None)
+        if widget is not None:
+            try:
+                widget.GetRenderWindow().Render()
+            except Exception:
+                pass
+
+    def _set_orientation_face_hover(self, face):
+        """Highlight one cube face in app primary cyan (or clear if face is None)."""
+        from inno3d.features.shared.orientation_cube import set_orientation_face_hover
+
+        state = getattr(self, "_ori_cube_state", None)
+        if state is None:
+            # Legacy attrs fallback
+            state = {
+                "cube": getattr(self, "_axes_cube_actor", None),
+                "face_highlights": getattr(self, "_ori_face_highlights", {}) or {},
+                "face_text_props": getattr(self, "_ori_face_text_props", {}) or {},
+                "hover_face": getattr(self, "_ori_hover_face", None),
+            }
+            self._ori_cube_state = state
+        if set_orientation_face_hover(state, face):
+            self._ori_hover_face = face
+            self._orientation_cube_render()
+
+    def _is_over_orientation_viewport(self, display_x, display_y):
+        from inno3d.features.shared.orientation_cube import is_over_orientation_viewport
+
+        axes = getattr(self, "_3d_axes_widget", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        if axes is None or widget is None:
+            return False
+        size = widget.GetRenderWindow().GetSize()
+        if not size or size[0] <= 0 or size[1] <= 0:
+            return False
+        return is_over_orientation_viewport(
+            display_x, display_y, size[0], size[1], axes.GetViewport()
+        )
+
+    def _pick_orientation_cube_face(self, display_x, display_y):
+        from inno3d.features.shared.orientation_cube import pick_orientation_cube_face
+
+        axes = getattr(self, "_3d_axes_widget", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        ren = getattr(self, "_3d_renderer", None)
+        if axes is None or widget is None or ren is None:
+            return None
+        size = widget.GetRenderWindow().GetSize()
+        if not size or size[0] <= 0 or size[1] <= 0:
+            return None
+        return pick_orientation_cube_face(
+            display_x,
+            display_y,
+            size[0],
+            size[1],
+            axes.GetViewport(),
+            ren.GetActiveCamera(),
+        )
+
+    def _on_orientation_cube_hover(self, obj, event):
+        """Mouse-move: glow face under cursor (Viewer parity)."""
+        if not getattr(self, "_3d_view_active", False):
+            return
+        axes = getattr(self, "_3d_axes_widget", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        if axes is None or widget is None:
+            return
+        iren = widget.GetRenderWindow().GetInteractor()
+        if iren is None:
+            return
+        x, y = iren.GetEventPosition()
+        face = self._pick_orientation_cube_face(x, y)
+        over_marker = self._is_over_orientation_viewport(x, y)
+        try:
+            if face is not None:
+                widget.setCursor(Qt.PointingHandCursor)
+            elif over_marker:
+                widget.setCursor(Qt.ArrowCursor)
+            elif getattr(self, "_ori_hover_face", None) is not None:
+                widget.unsetCursor()
+        except Exception:
+            pass
+        self._set_orientation_face_hover(face)
+
+    def _on_orientation_cube_click(self, obj, event):
+        """Left-click ±X/±Y/±Z cube → orient Teaching 3D camera to that face."""
+        if not getattr(self, "_3d_view_active", False):
+            return
+        axes = getattr(self, "_3d_axes_widget", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        if axes is None or widget is None:
+            return
+        iren = widget.GetRenderWindow().GetInteractor()
+        if iren is None:
+            return
+        x, y = iren.GetEventPosition()
+        face = self._pick_orientation_cube_face(x, y)
+        if face is None:
+            return
+        try:
+            iren.SetAbortFlag(1)
+        except Exception:
+            pass
+        self._set_orientation_face_hover(face)
+        self._orient_camera_to_face(face)
+
+    def _orient_camera_to_face(self, face):
+        """Snap 3D camera so the given cube face points toward the viewer."""
+        from inno3d.features.shared.orientation_cube import apply_camera_face_preset
+
+        ren = getattr(self, "_3d_renderer", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        if ren is None:
+            return
+        cam = ren.GetActiveCamera()
+        if self.volume_data is not None:
+            cx, cy, cz = self._volume_world_center()
+            r = max(self._volume_world_radius() * 2.5, 1.0)
+        else:
+            cx = cy = cz = 0.0
+            r = 500.0
+        if not apply_camera_face_preset(
+            cam, face, center=(cx, cy, cz), radius=r
+        ):
+            return
+        try:
+            self._sync_3d_orbit_pivot()
+        except Exception:
+            pass
+        ren.ResetCameraClippingRange()
+        if widget is not None:
+            try:
+                widget.GetRenderWindow().Render()
+            except Exception:
+                pass
 
     def _dragonfly_3d_zoom(self, zoom_in=True, strength=1.0, display_xy=None):
         """ORS Dragonfly object zoom — same algorithm as 3D Viewer tab.
@@ -6483,6 +6269,81 @@ class SegmentationUIMixin:
             self.enh_model_input.setText(path)
             self.enhancement_model_path = path
 
+    def _prepare_enhancement_input_dir(self):
+        """Build a folder of **per-slice** TIFFs for BumpVoid_ISP_ENH.
+
+        The enhance DLL treats each file as one 2D image. A multipage TIFF in a
+        parent folder is only **one file** → only the first page is enhanced
+        (classic “opened result has 1 slice” bug).
+
+        Prefer in-memory ``volume_data`` (full Z). Fall back to extracting a
+        multipage file, or use a directory of already-split slices as-is.
+
+        Returns (input_dir, temp_dir_or_None). Caller must clean temp_dir.
+        """
+        import tempfile
+        import tifffile
+
+        input_path = (self.input_path_input.text() or "").strip()
+        vol = getattr(self, "volume_data", None)
+
+        # 1) Prefer loaded 3D volume in memory (most reliable Z count)
+        if vol is not None and getattr(vol, "ndim", 0) == 3 and vol.shape[0] > 0:
+            temp_dir = tempfile.mkdtemp(prefix="inno3d_enh_input_")
+            n = int(vol.shape[0])
+            print(f"[ENHANCE] Exporting {n} slices from volume_data → {temp_dir}")
+            for idx in range(n):
+                tifffile.imwrite(
+                    os.path.join(temp_dir, f"{idx:04d}.tif"),
+                    np.ascontiguousarray(vol[idx]),
+                )
+            return temp_dir, temp_dir
+
+        # 2) Folder of slice TIFFs (already 2D-per-file)
+        if input_path and os.path.isdir(input_path):
+            print(f"[ENHANCE] Using slice folder as-is: {input_path}")
+            return input_path, None
+
+        # 3) Multipage / single TIFF file → explode pages to temp
+        if input_path and os.path.isfile(input_path):
+            temp_dir = tempfile.mkdtemp(prefix="inno3d_enh_input_")
+            try:
+                stack = tifffile.imread(input_path)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to read volume for enhancement:\n{input_path}\n{e}"
+                ) from e
+            stack = np.asarray(stack)
+            if stack.ndim == 2:
+                # Single plane file
+                tifffile.imwrite(
+                    os.path.join(temp_dir, "0000.tif"),
+                    np.ascontiguousarray(stack),
+                )
+                n = 1
+            elif stack.ndim >= 3:
+                # (Z,Y,X) or (Z,Y,X,C)
+                n = int(stack.shape[0])
+                for idx in range(n):
+                    plane = stack[idx]
+                    if plane.ndim > 2:
+                        plane = plane[..., 0]
+                    tifffile.imwrite(
+                        os.path.join(temp_dir, f"{idx:04d}.tif"),
+                        np.ascontiguousarray(plane),
+                    )
+            else:
+                raise RuntimeError(f"Unsupported volume ndim={stack.ndim} for enhance")
+            print(
+                f"[ENHANCE] Split multipage file into {n} slices → {temp_dir} "
+                f"(NOT parent folder — avoids 1-file/1-slice bug)"
+            )
+            return temp_dir, temp_dir
+
+        raise RuntimeError(
+            "No volume loaded. Load a 3D volume (or multipage TIFF) before Run Enhancement."
+        )
+
     def _run_enhancement_only(self):
         """Run enhancement as a standalone step (without segmentation)."""
         model_path = self.enh_model_input.text().strip()
@@ -6495,7 +6356,7 @@ class SegmentationUIMixin:
             return
 
         input_path = self.input_path_input.text().strip()
-        if not input_path:
+        if not input_path and getattr(self, "volume_data", None) is None:
             QMessageBox.warning(self, "Warning", "Please load a volume first.")
             return
 
@@ -6504,11 +6365,13 @@ class SegmentationUIMixin:
             QMessageBox.warning(self, "Warning", "Please specify output path.")
             return
 
-        # Determine input dir (folder of TIFF slices)
-        if os.path.isdir(input_path):
-            input_dir = input_path
-        else:
-            input_dir = os.path.dirname(input_path)
+        # Per-slice folder for DLL (must NOT be multipage-parent dirname)
+        try:
+            input_dir, temp_dir = self._prepare_enhancement_input_dir()
+        except Exception as e:
+            QMessageBox.critical(self, "Enhancement", str(e))
+            return
+        self._enhancement_temp_dir = temp_dir
 
         enhanced_output = os.path.join(output_path, "enhanced_volume")
         os.makedirs(enhanced_output, exist_ok=True)
@@ -6537,23 +6400,63 @@ class SegmentationUIMixin:
             lambda v, m: (progress.setValue(v), progress.setLabelText(m))
         )
         self.enhancement_thread.finished.connect(
-            lambda ok, err: self._on_enhancement_finished(ok, err, progress)
+            lambda ok, err: self._on_enhancement_finished(
+                ok, err, progress, enhanced_output=enhanced_output
+            )
         )
         self.enhancement_thread.start()
 
-    def _on_enhancement_finished(self, success, error, progress):
+    def _cleanup_enhancement_temp_dir(self):
+        temp = getattr(self, "_enhancement_temp_dir", None)
+        if not temp:
+            return
+        try:
+            import shutil
+            shutil.rmtree(temp, ignore_errors=True)
+            print(f"[ENHANCE] Cleaned temp input dir: {temp}")
+        except Exception as e:
+            print(f"[ENHANCE] Temp cleanup failed: {e}")
+        self._enhancement_temp_dir = None
+
+    def _on_enhancement_finished(self, success, error, progress, enhanced_output=None):
         """Handle enhancement completion."""
         if progress:
             progress.close()
+        self._cleanup_enhancement_temp_dir()
+
         if success:
-            self.enh_status_label.setText("Enhancement: Complete ✓")
-            self.enh_status_label.setStyleSheet(self._status_label_qss(SemiconductorTheme.ACCENT_SUCCESS))
-            QMessageBox.information(self, "Enhancement Complete",
+            n_out = 0
+            if enhanced_output and os.path.isdir(enhanced_output):
+                try:
+                    n_out = len(
+                        [
+                            f
+                            for f in os.listdir(enhanced_output)
+                            if f.lower().endswith((".tif", ".tiff"))
+                        ]
+                    )
+                except Exception:
+                    n_out = 0
+            self.enh_status_label.setText(
+                f"Enhancement: Complete ✓ ({n_out} slices)"
+                if n_out
+                else "Enhancement: Complete ✓"
+            )
+            self.enh_status_label.setStyleSheet(
+                self._status_label_qss(SemiconductorTheme.ACCENT_SUCCESS)
+            )
+            msg = (
                 "Volume enhancement finished successfully.\n"
-                "Enhanced images saved to enhanced_volume/ subfolder.")
+                f"Enhanced images saved to:\n{enhanced_output or 'enhanced_volume/'}"
+            )
+            if n_out:
+                msg += f"\n\n{n_out} slice file(s) written (one TIFF per Z)."
+            QMessageBox.information(self, "Enhancement Complete", msg)
         else:
             self.enh_status_label.setText("Enhancement: Failed ✗")
-            self.enh_status_label.setStyleSheet(self._status_label_qss(SemiconductorTheme.ACCENT_ERROR))
+            self.enh_status_label.setStyleSheet(
+                self._status_label_qss(SemiconductorTheme.ACCENT_ERROR)
+            )
             QMessageBox.critical(self, "Enhancement Failed", f"Enhancement error:\n{error}")
 
     def _teaching_header_qss(self):

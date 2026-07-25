@@ -11,7 +11,7 @@ Layer: features/viewer (imports Qt, VTK — not for domain/infra use).
 from __future__ import annotations
 
 import vtk
-from PyQt5.QtCore import Qt, QEvent, QPoint
+from PyQt5.QtCore import Qt, QEvent, QPoint, QTimer
 from PyQt5.QtWidgets import QApplication
 
 
@@ -38,6 +38,18 @@ class MprInputMixin:
             size = vtk_widget.GetRenderWindow().GetSize()
             qt_y = size[1] - y
             qt_pos = QPoint(x, qt_y)
+
+            # Ctrl+LMB → sticky MES pick (single replace / multi toggle; never clear on release).
+            # Prefer Qt eventFilter as primary; VTK is backup when Qt path did not run.
+            if caller.GetControlKey() and hasattr(self, "select_mes_object_from_mpr"):
+                self._mes_ctrl_pick_armed = False
+                # Skip if Qt path already handled this press (avoids Multi toggle-twice)
+                if not getattr(self, "_mes_pick_qt_handled", False):
+                    try:
+                        self.select_mes_object_from_mpr(orientation, qt_pos)
+                    except Exception as e:
+                        print(f"[MES pick] VTK path failed: {e}")
+                return
 
             # 1) Dragonfly clip-box handles (priority over crosshair when CLIP BOX on)
             if getattr(self, '_df_clip_enabled', False):
@@ -156,7 +168,8 @@ class MprInputMixin:
             if cur is not None:
                 vtk_widget.setCursor(cur)
             else:
-                vtk_widget.setCursor(Qt.OpenHandCursor)
+                # Empty space: crosshair = pixel probe (not open-hand pan cue)
+                vtk_widget.setCursor(Qt.CrossCursor)
 
         def on_left_button_release(caller, event):
             if getattr(self, '_df_clip_drag', None):
@@ -266,6 +279,18 @@ class MprInputMixin:
                         self.view_3d_widget.setFocus(Qt.MouseFocusReason)
                     except Exception:
                         pass
+                # Ctrl+LMB → sticky MES pick on 3D volume (same rules as MPR)
+                if (
+                    self.volume_data is not None
+                    and (event.modifiers() & Qt.ControlModifier)
+                    and hasattr(self, "select_mes_object_from_3d")
+                ):
+                    self._mes_ctrl_pick_armed = False
+                    try:
+                        self.select_mes_object_from_3d(event.pos())
+                    except Exception as e:
+                        print(f"[MES pick] 3D path failed: {e}")
+                    return True
                 # Qt backup path for clip-face grab (if VTK style misses the press)
                 if getattr(self, '_df_clip_enabled', False) and self.volume_data is not None:
                     if self._df_clip_3d_try_grab_at_qt_pos(event.pos()):
@@ -357,7 +382,8 @@ class MprInputMixin:
                         )
                         return True
 
-                    # Hover: clip box → oblique → crosshair → open-hand (pan available)
+                    # Hover: clip box → oblique → crosshair → cross (pixel probe)
+                    # Hand cursor only while actively panning (middle / shift+LMB).
                     if not (event.buttons() & (Qt.LeftButton | Qt.MiddleButton)):
                         widget = getattr(self, f'{orientation}_widget')
                         if getattr(self, '_df_clip_enabled', False):
@@ -392,10 +418,10 @@ class MprInputMixin:
                                 if cur is not None:
                                     widget.setCursor(cur)
                                 else:
-                                    # Empty space: pan available (middle / shift+lmb)
-                                    widget.setCursor(Qt.OpenHandCursor)
+                                    # Empty space: probe pixels (pan = middle / shift+LMB)
+                                    widget.setCursor(Qt.CrossCursor)
                         else:
-                            widget.setCursor(Qt.OpenHandCursor)
+                            widget.setCursor(Qt.CrossCursor)
             
             elif event.type() == QEvent.MouseButtonPress:
                 # Middle button → pan
@@ -407,6 +433,25 @@ class MprInputMixin:
                     # Dragonfly-style: focus ring on the pane being interacted with
                     self._set_active_grid_pane(orientation)
                     if self.volume_data is not None:
+                        # Ctrl+LMB → sticky MES pick (same keep policy as table Multi ON)
+                        if event.modifiers() & Qt.ControlModifier:
+                            self._mes_ctrl_pick_armed = False
+                            self._mes_pick_qt_handled = True
+                            if hasattr(self, "select_mes_object_from_mpr"):
+                                try:
+                                    self.select_mes_object_from_mpr(
+                                        orientation, event.pos()
+                                    )
+                                except Exception as e:
+                                    print(f"[MES pick] Qt path failed: {e}")
+                            # Clear flag after event loop so VTK backup can run next press
+                            try:
+                                QTimer.singleShot(
+                                    0, lambda: setattr(self, "_mes_pick_qt_handled", False)
+                                )
+                            except Exception:
+                                self._mes_pick_qt_handled = False
+                            return True
                         # Shift+LMB → pan (unified with middle)
                         if event.modifiers() & Qt.ShiftModifier:
                             self._mpr_pan_begin(orientation, event.pos())
@@ -456,6 +501,22 @@ class MprInputMixin:
                         return True
                 if event.button() == Qt.LeftButton:
                     self.last_mouse_pos = None
+
+                    # End of Ctrl+pick — selection is sticky; only clear drag flags
+                    if getattr(self, "_mes_ctrl_pick_armed", False) or getattr(
+                        self, "_mes_ctrl_pick_active", False
+                    ):
+                        self._mes_ctrl_pick_armed = False
+                        self._mes_ctrl_pick_active = False
+                        self._is_dragging_crosshair = False
+                        self._crosshair_drag_mode = None
+                        self._restore_interactor_style(orientation)
+                        if hasattr(self, "release_mes_ctrl_pick"):
+                            try:
+                                self.release_mes_ctrl_pick()
+                            except Exception as e:
+                                print(f"[MES pick] release failed: {e}")
+                        return True
 
                     if getattr(self, "_mpr_pan", None):
                         self._mpr_pan_end(orientation)

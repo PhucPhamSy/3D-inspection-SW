@@ -269,11 +269,22 @@ class Volume3dMixin:
         if not enabled:
             self._teardown_3d_volume_actors()
             self._show_3d_disabled_placeholder()
+            # Crosshair is independent of GPU volume — restore after teardown
+            if getattr(self, "crosshair_enabled", False) and hasattr(self, "update_3d_crosshair"):
+                try:
+                    self.update_3d_crosshair()
+                except Exception:
+                    pass
             return
 
         self._hide_3d_disabled_placeholder()
         if self.volume_data is not None:
             self.render_3d()
+            if getattr(self, "crosshair_enabled", False) and hasattr(self, "update_3d_crosshair"):
+                try:
+                    self.update_3d_crosshair()
+                except Exception:
+                    pass
 
     def _teardown_3d_volume_actors(self):
         """Remove GPU volumes / MES surfaces to free VRAM when 3D is OFF."""
@@ -286,13 +297,11 @@ class Volume3dMixin:
             except Exception:
                 pass
             self.volume_actor = None
+        from inno3d.features.viewer.seg_mask_3d import remove_mask_overlay_from_renderer
         for name in ("c1_actor_3d", "c2_actor_3d"):
             act = getattr(self, name, None)
             if act is not None:
-                try:
-                    ren.RemoveVolume(act)
-                except Exception:
-                    pass
+                remove_mask_overlay_from_renderer(ren, act)
                 setattr(self, name, None)
         self._clear_mes_3d_highlight(render=False)
         # Keep B2B actors? Clear them when 3D off (no volume to attach to)
@@ -520,11 +529,15 @@ class Volume3dMixin:
         interactor.AddObserver('StartInteractionEvent', _on_interaction_start)
         interactor.AddObserver('EndInteractionEvent', _on_interaction_end)
 
-        # --- 3. Orientation Marker (Dragonfly-style Cube) ---
+        # --- 3. Orientation Marker (shared interactive cube) ---
+        from inno3d.features.shared.orientation_cube import build_orientation_marker
+
         self._ori_hover_face = None
-        self._ori_face_highlights = {}
-        self._ori_face_text_props = {}
-        marker = self._build_orientation_marker()
+        marker, ori_state = build_orientation_marker()
+        self._ori_cube_state = ori_state
+        self._axes_cube_actor = ori_state.get("cube")
+        self._ori_face_highlights = ori_state.get("face_highlights") or {}
+        self._ori_face_text_props = ori_state.get("face_text_props") or {}
 
         self.axes_widget = vtk.vtkOrientationMarkerWidget()
         self.axes_widget.SetOrientationMarker(marker)
@@ -625,7 +638,7 @@ class Volume3dMixin:
         self._current_quality = "High"
 
         self._lighting_look_presets = {
-            "Dragonfly": {
+            "Inno3D": {
                 "shade": True, "ambient": 40, "diffuse": 58, "specular": 18, "power": 16,
                 "edge": 22, "opacity": 100,
                 "key_intensity": 0.72, "key_fill": 1.8, "key_warmth": 0.55,
@@ -650,7 +663,9 @@ class Volume3dMixin:
                 "vol_shadows": False,
             },
         }
-        self._current_lighting_look = "Dragonfly"
+        # Alias: older sessions / docs may still say "Dragonfly"
+        self._lighting_look_presets["Dragonfly"] = self._lighting_look_presets["Inno3D"]
+        self._current_lighting_look = "Inno3D"
 
         # LOD refinement timer
         self._lod_refine_timer = QTimer(self)
@@ -819,6 +834,8 @@ class Volume3dMixin:
         hist_lay.addWidget(plot_lbl)
 
         data_row = QHBoxLayout()
+        # 1px vertical slack so hover border is not clipped by tight layout
+        data_row.setContentsMargins(0, 1, 0, 2)
         self._data_range_min_spin = QDoubleSpinBox()
         self._data_range_min_spin.setDecimals(2)
         self._data_range_min_spin.setRange(-1e9, 1e9)
@@ -828,7 +845,9 @@ class Volume3dMixin:
         data_row.addWidget(self._data_range_min_spin)
 
         self.btn_reset_wl_range = QPushButton("Reset")
-        self.btn_reset_wl_range.setFixedWidth(52)
+        # AlignSidebarMixin helper (same MultiPlanarView instance)
+        from inno3d.features.viewer.align_sidebar import _style_compact_reset_button
+        _style_compact_reset_button(self.btn_reset_wl_range)
         self.btn_reset_wl_range.setToolTip("Reset selected range to full data range")
         self.btn_reset_wl_range.clicked.connect(self._reset_wl_to_data_range)
         data_row.addWidget(self.btn_reset_wl_range)
@@ -1156,10 +1175,10 @@ class Volume3dMixin:
 
         look_row = QHBoxLayout()
         self.lighting_look_combo = QComboBox()
-        self.lighting_look_combo.addItems(["Dragonfly", "Inspection", "Plastic", "Flat"])
-        self.lighting_look_combo.setCurrentText("Dragonfly")
+        self.lighting_look_combo.addItems(["Inno3D", "Inspection", "Plastic", "Flat"])
+        self.lighting_look_combo.setCurrentText("Inno3D")
         self.lighting_look_combo.setToolTip(
-            "Dragonfly: soft metallic (recommended — no plastic highlight caps)\n"
+            "Inno3D: soft metallic (recommended — no plastic highlight caps)\n"
             "Inspection: flatter light for gap / surface metrology\n"
             "Plastic: old glossy demo look (strong specular pop)\n"
             "Flat: shading off (density TF only)"
@@ -1175,7 +1194,7 @@ class Volume3dMixin:
 
         self.shade_check = QCheckBox("Enable Shading")
         self.shade_check.setToolTip(
-            "Phong shading (Dragonfly uses soft shade, not harsh specular)"
+            "Phong shading (Inno3D uses soft shade, not harsh specular)"
         )
         self.shade_check.setChecked(True)
         self.shade_check.stateChanged.connect(self.on_shade_toggled)
@@ -1343,18 +1362,21 @@ class Volume3dMixin:
         self.view_3d_widget.GetRenderWindow().Render()
 
     def _on_apply_lighting_look_clicked(self):
-        name = "Dragonfly"
+        name = "Inno3D"
         if hasattr(self, "lighting_look_combo"):
             name = self.lighting_look_combo.currentText()
         self.apply_lighting_look(name)
 
-    def apply_lighting_look(self, name="Dragonfly", render=True):
-        """Apply a named lighting look (Dragonfly / Inspection / Plastic / Flat).
+    def apply_lighting_look(self, name="Inno3D", render=True):
+        """Apply a named lighting look (Inno3D / Inspection / Plastic / Flat).
 
-        Dragonfly target: soft silver form light, mild edge OP, no plastic specular caps.
+        Inno3D target: soft silver form light, mild edge OP, no plastic specular caps.
         """
         presets = getattr(self, "_lighting_look_presets", None) or {}
-        p = presets.get(name) or presets.get("Dragonfly")
+        # Map legacy name if any caller still passes "Dragonfly"
+        if name == "Dragonfly":
+            name = "Inno3D"
+        p = presets.get(name) or presets.get("Inno3D")
         if not p:
             return
 
@@ -1566,136 +1588,47 @@ class Volume3dMixin:
 
     @staticmethod
     def _theme_primary_rgb():
-        """App primary cyan → (r,g,b) floats for VTK."""
-        h = SemiconductorTheme.PRIMARY_DEFAULT.lstrip("#")
-        try:
-            return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
-        except Exception:
-            return (0.133, 0.682, 0.820)
+        from inno3d.features.shared.orientation_cube import theme_primary_rgb
+        return theme_primary_rgb()
 
     @staticmethod
     def _theme_primary_hover_rgb():
-        h = SemiconductorTheme.PRIMARY_HOVER.lstrip("#")
-        try:
-            return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
-        except Exception:
-            return (0.235, 0.769, 0.910)
+        from inno3d.features.shared.orientation_cube import theme_primary_hover_rgb
+        return theme_primary_hover_rgb()
 
-    # ── Group F: Orientation Marker ───────────────────────────────────────────
+    # ── Group F: Orientation Marker (shared orientation_cube module) ─────────
 
     def _build_orientation_marker(self):
-        """vtkAssembly: AnnotatedCube (+X… labels) + 6 thin face plates used for hover glow."""
-        assembly = vtk.vtkAssembly()
+        """vtkAssembly via shared builder (kept for any external callers)."""
+        from inno3d.features.shared.orientation_cube import build_orientation_marker
 
-        cube = vtk.vtkAnnotatedCubeActor()
-        cube.SetXPlusFaceText("+X")
-        cube.SetXMinusFaceText("-X")
-        cube.SetYPlusFaceText("+Y")
-        cube.SetYMinusFaceText("-Y")
-        cube.SetZPlusFaceText("+Z")
-        cube.SetZMinusFaceText("-Z")
-        cube.GetCubeProperty().SetColor(0.93, 0.94, 0.95)
-        cube.GetTextEdgesProperty().SetColor(0.15, 0.18, 0.22)
-        cube.GetTextEdgesProperty().SetLineWidth(1)
-        cube.SetFaceTextScale(0.35)
-
-        face_prop_getters = {
-            "+X": cube.GetXPlusFaceProperty,
-            "-X": cube.GetXMinusFaceProperty,
-            "+Y": cube.GetYPlusFaceProperty,
-            "-Y": cube.GetYMinusFaceProperty,
-            "+Z": cube.GetZPlusFaceProperty,
-            "-Z": cube.GetZMinusFaceProperty,
-        }
-        self._ori_face_text_props = {}
-        for name, getter in face_prop_getters.items():
-            prop = getter()
-            prop.SetColor(0.12, 0.14, 0.16)
-            prop.SetDiffuse(0.8)
-            prop.SetAmbient(0.4)
-            self._ori_face_text_props[name] = prop
-
-        assembly.AddPart(cube)
-        self._axes_cube_actor = cube
-
-        t = 0.02
-        e = 0.50
-        o = 0.51
-        face_bounds = {
-            "+X": (o - t, o + t, -e, e, -e, e),
-            "-X": (-o - t, -o + t, -e, e, -e, e),
-            "+Y": (-e, e, o - t, o + t, -e, e),
-            "-Y": (-e, e, -o - t, -o + t, -e, e),
-            "+Z": (-e, e, -e, e, o - t, o + t),
-            "-Z": (-e, e, -e, e, -o - t, -o + t),
-        }
-        self._ori_face_highlights = {}
-        pr, pg, pb = self._theme_primary_rgb()
-        for name, bounds in face_bounds.items():
-            src = vtk.vtkCubeSource()
-            src.SetBounds(*bounds)
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputConnection(src.GetOutputPort())
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-            prop = actor.GetProperty()
-            prop.SetColor(pr, pg, pb)
-            prop.SetOpacity(0.0)
-            prop.SetAmbient(0.85)
-            prop.SetDiffuse(0.5)
-            prop.SetSpecular(0.25)
-            prop.LightingOn()
-            assembly.AddPart(actor)
-            self._ori_face_highlights[name] = actor
-
+        assembly, state = build_orientation_marker()
+        self._ori_cube_state = state
+        self._axes_cube_actor = state.get("cube")
+        self._ori_face_highlights = state.get("face_highlights") or {}
+        self._ori_face_text_props = state.get("face_text_props") or {}
         return assembly
 
     def _set_orientation_face_hover(self, face):
         """Highlight one cube face in app primary cyan (or clear if face is None)."""
-        if face == getattr(self, "_ori_hover_face", None):
-            return
-        self._ori_hover_face = face
+        from inno3d.features.shared.orientation_cube import set_orientation_face_hover
 
-        pr, pg, pb = self._theme_primary_rgb()
-        phr, phg, phb = self._theme_primary_hover_rgb()
-        default_text = (0.12, 0.14, 0.16)
-        hover_text = (0.04, 0.08, 0.12)
-
-        for name, actor in getattr(self, "_ori_face_highlights", {}).items():
-            prop = actor.GetProperty()
-            if name == face:
-                prop.SetColor(phr, phg, phb)
-                prop.SetOpacity(0.72)
-            else:
-                prop.SetColor(pr, pg, pb)
-                prop.SetOpacity(0.0)
-
-        for name, tprop in getattr(self, "_ori_face_text_props", {}).items():
-            if name == face:
-                tprop.SetColor(*hover_text)
-                tprop.SetAmbient(1.0)
-                tprop.SetDiffuse(0.2)
-            else:
-                tprop.SetColor(*default_text)
-                tprop.SetAmbient(0.4)
-                tprop.SetDiffuse(0.8)
-
-        cube = getattr(self, "_axes_cube_actor", None)
-        if cube is not None:
-            if face:
-                cube.GetCubeProperty().SetColor(
-                    0.75 * 0.93 + 0.25 * pr,
-                    0.75 * 0.94 + 0.25 * pg,
-                    0.75 * 0.95 + 0.25 * pb,
-                )
-            else:
-                cube.GetCubeProperty().SetColor(0.93, 0.94, 0.95)
-
-        if hasattr(self, "view_3d_widget") and self.view_3d_widget is not None:
-            self.view_3d_widget.GetRenderWindow().Render()
+        state = getattr(self, "_ori_cube_state", None)
+        if state is None:
+            state = {
+                "cube": getattr(self, "_axes_cube_actor", None),
+                "face_highlights": getattr(self, "_ori_face_highlights", {}) or {},
+                "face_text_props": getattr(self, "_ori_face_text_props", {}) or {},
+                "hover_face": getattr(self, "_ori_hover_face", None),
+            }
+            self._ori_cube_state = state
+        if set_orientation_face_hover(state, face):
+            self._ori_hover_face = face
+            if hasattr(self, "view_3d_widget") and self.view_3d_widget is not None:
+                self.view_3d_widget.GetRenderWindow().Render()
 
     def _on_orientation_cube_hover(self, obj, event):
-        """Mouse-move: glow face under cursor (Dragonfly yellow → Inno3D cyan)."""
+        """Mouse-move: glow face under cursor (Viewer SoT)."""
         if not hasattr(self, "axes_widget") or self.axes_widget is None:
             return
         if not hasattr(self, "view_3d_widget") or self.view_3d_widget is None:
@@ -1720,16 +1653,17 @@ class Volume3dMixin:
         self._set_orientation_face_hover(face)
 
     def _is_over_orientation_viewport(self, display_x, display_y):
+        from inno3d.features.shared.orientation_cube import is_over_orientation_viewport
+
         if not hasattr(self, "axes_widget") or self.axes_widget is None:
             return False
         ren_win = self.view_3d_widget.GetRenderWindow()
         size = ren_win.GetSize()
         if not size or size[0] <= 0 or size[1] <= 0:
             return False
-        w, h = float(size[0]), float(size[1])
-        vp = self.axes_widget.GetViewport()
-        nx, ny = display_x / w, display_y / h
-        return vp[0] <= nx <= vp[2] and vp[1] <= ny <= vp[3]
+        return is_over_orientation_viewport(
+            display_x, display_y, size[0], size[1], self.axes_widget.GetViewport()
+        )
 
     def _on_orientation_cube_click(self, obj, event):
         """Left-click on the ±X/±Y/±Z cube → orient volume camera to that face."""
@@ -1753,99 +1687,31 @@ class Volume3dMixin:
 
     def _pick_orientation_cube_face(self, display_x, display_y):
         """Ray-pick the orientation marker cube. Returns face label or None."""
+        from inno3d.features.shared.orientation_cube import pick_orientation_cube_face
+
         ren_win = self.view_3d_widget.GetRenderWindow()
         size = ren_win.GetSize()
         if not size or size[0] <= 0 or size[1] <= 0:
             return None
-        w, h = float(size[0]), float(size[1])
-        vp = self.axes_widget.GetViewport()
-        nx = display_x / w
-        ny = display_y / h
-        if not (vp[0] <= nx <= vp[2] and vp[1] <= ny <= vp[3]):
-            return None
-
-        u = (nx - vp[0]) / max(1e-9, (vp[2] - vp[0]))
-        v = (ny - vp[1]) / max(1e-9, (vp[3] - vp[1]))
-        sx = 2.0 * u - 1.0
-        sy = 2.0 * v - 1.0
-
-        cam = self.view_3d_renderer.GetActiveCamera()
-        pos = np.array(cam.GetPosition(), dtype=float)
-        fp = np.array(cam.GetFocalPoint(), dtype=float)
-        vpn = pos - fp
-        nrm = np.linalg.norm(vpn)
-        if nrm < 1e-12:
-            return None
-        vpn = vpn / nrm
-        vup = np.array(cam.GetViewUp(), dtype=float)
-        nrm = np.linalg.norm(vup)
-        if nrm < 1e-12:
-            return None
-        vup = vup / nrm
-        vright = np.cross(vup, vpn)
-        nrm = np.linalg.norm(vright)
-        if nrm < 1e-12:
-            return None
-        vright = vright / nrm
-        vup = np.cross(vpn, vright)
-
-        scale = 1.35
-        dist = 6.0
-        ray_origin = sx * scale * vright + sy * scale * vup + dist * vpn
-        ray_dir = -vpn
-
-        return self._ray_hit_unit_cube_face(ray_origin, ray_dir)
+        return pick_orientation_cube_face(
+            display_x,
+            display_y,
+            size[0],
+            size[1],
+            self.axes_widget.GetViewport(),
+            self.view_3d_renderer.GetActiveCamera(),
+        )
 
     @staticmethod
     def _ray_hit_unit_cube_face(origin, direction):
-        """Nearest front-face hit of ray vs cube [-1,1]^3. Returns '+X'… or None."""
-        origin = np.asarray(origin, dtype=float)
-        direction = np.asarray(direction, dtype=float)
-        nrm = np.linalg.norm(direction)
-        if nrm < 1e-12:
-            return None
-        direction = direction / nrm
-
-        planes = [
-            (np.array([1.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]), "+X"),
-            (np.array([-1.0, 0.0, 0.0]), np.array([-1.0, 0.0, 0.0]), "-X"),
-            (np.array([0.0, 1.0, 0.0]), np.array([0.0, 1.0, 0.0]), "+Y"),
-            (np.array([0.0, -1.0, 0.0]), np.array([0.0, -1.0, 0.0]), "-Y"),
-            (np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, 1.0]), "+Z"),
-            (np.array([0.0, 0.0, -1.0]), np.array([0.0, 0.0, -1.0]), "-Z"),
-        ]
-        best_t = None
-        best_face = None
-        eps = 1e-6
-        for n, p0, name in planes:
-            denom = float(np.dot(n, direction))
-            if denom >= -1e-12:
-                continue
-            t = float(np.dot(n, p0 - origin) / denom)
-            if t < eps:
-                continue
-            hit = origin + t * direction
-            if (
-                abs(hit[0]) <= 1.02
-                and abs(hit[1]) <= 1.02
-                and abs(hit[2]) <= 1.02
-            ):
-                if best_t is None or t < best_t:
-                    best_t = t
-                    best_face = name
-        return best_face
+        from inno3d.features.shared.orientation_cube import ray_hit_unit_cube_face
+        return ray_hit_unit_cube_face(origin, direction)
 
     def _orient_camera_to_face(self, face):
         """Snap 3D camera so the given cube face points toward the viewer."""
-        face_to_preset = {
-            "+X": "Right",
-            "-X": "Left",
-            "+Y": "Back",
-            "-Y": "Front",
-            "+Z": "Top",
-            "-Z": "Bottom",
-        }
-        preset = face_to_preset.get(face)
+        from inno3d.features.shared.orientation_cube import FACE_TO_PRESET
+
+        preset = FACE_TO_PRESET.get(face)
         if preset is None:
             return
         if self.volume_data is None:
@@ -1855,23 +1721,13 @@ class Volume3dMixin:
 
     def _orient_camera_to_face_no_volume(self, face):
         """Fallback orient when no volume is loaded yet."""
+        from inno3d.features.shared.orientation_cube import apply_camera_face_preset
+
         if not hasattr(self, 'view_3d_renderer') or self.view_3d_renderer is None:
             return
         cam = self.view_3d_renderer.GetActiveCamera()
-        r = 500.0
-        cx = cy = cz = 0.0
-        cam.SetFocalPoint(cx, cy, cz)
-        dirs = {
-            "+X": ((cx + r, cy, cz), (0, 0, 1)),
-            "-X": ((cx - r, cy, cz), (0, 0, 1)),
-            "+Y": ((cx, cy + r, cz), (0, 0, 1)),
-            "-Y": ((cx, cy - r, cz), (0, 0, 1)),
-            "+Z": ((cx, cy, cz + r), (0, 1, 0)),
-            "-Z": ((cx, cy, cz - r), (0, -1, 0)),
-        }
-        pos, up = dirs.get(face, ((cx, cy - r, cz), (0, 0, 1)))
-        cam.SetPosition(*pos)
-        cam.SetViewUp(*up)
+        if not apply_camera_face_preset(cam, face, center=(0.0, 0.0, 0.0), radius=500.0):
+            return
         self.view_3d_renderer.ResetCameraClippingRange()
         self.view_3d_widget.GetRenderWindow().Render()
 
@@ -1972,6 +1828,12 @@ class Volume3dMixin:
         if not self.is_3d_volume_render_enabled():
             self._teardown_3d_volume_actors()
             self._show_3d_disabled_placeholder()
+            # Keep 3D crosshair when volume GPU is off (lines do not need VRAM volume)
+            if getattr(self, "crosshair_enabled", False) and hasattr(self, "update_3d_crosshair"):
+                try:
+                    self.update_3d_crosshair()
+                except Exception:
+                    pass
             return
 
         self._hide_3d_disabled_placeholder()
@@ -1990,11 +1852,13 @@ class Volume3dMixin:
 
         if self.volume_actor:
             self.view_3d_renderer.RemoveVolume(self.volume_actor)
+        from inno3d.features.viewer.seg_mask_3d import remove_mask_overlay_from_renderer
+
         if getattr(self, 'c1_actor_3d', None):
-            self.view_3d_renderer.RemoveVolume(self.c1_actor_3d)
+            remove_mask_overlay_from_renderer(self.view_3d_renderer, self.c1_actor_3d)
             self.c1_actor_3d = None
         if getattr(self, 'c2_actor_3d', None):
-            self.view_3d_renderer.RemoveVolume(self.c2_actor_3d)
+            remove_mask_overlay_from_renderer(self.view_3d_renderer, self.c2_actor_3d)
             self.c2_actor_3d = None
 
         z, y, x = self.volume_data.shape
@@ -2124,54 +1988,50 @@ class Volume3dMixin:
 
         self.view_3d_renderer.AddVolume(self.volume_actor)
 
-        # --- Add Segmentation Overlays as separate Volume Actors ---
-        def create_mask_volume(mask_data, color_val, base_opacity):
-            vz, vy, vx = mask_data.shape
-            vtk_mask = vtk.vtkImageData()
-            vtk_mask.SetDimensions(vx, vy, vz)
-            s = self.custom_spacing if getattr(self, 'custom_spacing', None) is not None else self.spacing
-            vtk_mask.SetSpacing(s[0], s[1], s[2])
+        # --- Segmentation overlays: medical glass shells (surface mesh) ---
+        # Lighter than multi-volume ray-cast; CT remains readable under translucent mask.
+        from inno3d.features.viewer.seg_mask_3d import (
+            create_mask_surface_actor,
+            add_mask_overlay_to_renderer,
+        )
 
-            mask_fortran = np.transpose(mask_data, (2, 1, 0))
-            flat_mask = np.ascontiguousarray(mask_fortran.flatten('F'))
-            vtk_m_array = numpy_support.numpy_to_vtk(flat_mask, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
-            vtk_mask.GetPointData().SetScalars(vtk_m_array)
+        sp = (
+            self.custom_spacing
+            if getattr(self, "custom_spacing", None) is not None
+            else self.spacing
+        )
+        # Prefer user opacity slider when present (else glass defaults)
+        try:
+            og = getattr(self, "view_3d_overlay_group", None)
+            slider_op = (
+                float(og.opacity_slider.value()) / 100.0
+                if og is not None and hasattr(og, "opacity_slider")
+                else None
+            )
+        except Exception:
+            slider_op = None
 
-            m_mapper = vtk.vtkGPUVolumeRayCastMapper()
-            m_mapper.SetInputData(vtk_mask)
-            m_mapper.SetBlendModeToComposite()
-
-            m_prop = vtk.vtkVolumeProperty()
-            color_tf = vtk.vtkColorTransferFunction()
-            color_tf.AddRGBPoint(0, 0, 0, 0)
-            color_tf.AddRGBPoint(1, color_val[0], color_val[1], color_val[2])
-            color_tf.AddRGBPoint(255, color_val[0], color_val[1], color_val[2])
-            m_prop.SetColor(color_tf)
-
-            opacity_tf = vtk.vtkPiecewiseFunction()
-            opacity_tf.AddPoint(0, 0.0)
-            opacity_tf.AddPoint(1, base_opacity)
-            opacity_tf.AddPoint(255, base_opacity)
-            m_prop.SetScalarOpacity(opacity_tf)
-
-            m_prop.ShadeOn()
-            m_prop.SetAmbient(0.3)
-            m_prop.SetDiffuse(0.7)
-
-            m_actor = vtk.vtkVolume()
-            m_actor.SetMapper(m_mapper)
-            m_actor.SetProperty(m_prop)
-            return m_actor
-
-        if getattr(self, 'class1_data', None) is not None:
+        if getattr(self, "class1_data", None) is not None:
             c1_color = self.seg_colors.get(128, [0.0, 1.0, 0.0])
-            self.c1_actor_3d = create_mask_volume(self.class1_data, c1_color, 0.4)
-            self.view_3d_renderer.AddVolume(self.c1_actor_3d)
+            c1_op = float(slider_op) if slider_op is not None else 0.35
+            self.c1_actor_3d = create_mask_surface_actor(
+                self.class1_data, sp, c1_color, base_opacity=c1_op, smooth=True
+            )
+            if self.c1_actor_3d is not None:
+                add_mask_overlay_to_renderer(self.view_3d_renderer, self.c1_actor_3d)
 
-        if getattr(self, 'class2_data', None) is not None:
+        if getattr(self, "class2_data", None) is not None:
             c2_color = self.seg_colors.get(255, [1.0, 0.0, 0.0])
-            self.c2_actor_3d = create_mask_volume(self.class2_data, c2_color, 0.8)
-            self.view_3d_renderer.AddVolume(self.c2_actor_3d)
+            # Void slightly more opaque than bump so it reads inside shells
+            if slider_op is not None:
+                c2_op = min(1.0, float(slider_op) * 1.15)
+            else:
+                c2_op = 0.48
+            self.c2_actor_3d = create_mask_surface_actor(
+                self.class2_data, sp, c2_color, base_opacity=c2_op, smooth=True
+            )
+            if self.c2_actor_3d is not None:
+                add_mask_overlay_to_renderer(self.view_3d_renderer, self.c2_actor_3d)
 
         # Sync clip planes to ALL actors (volume + c1 + c2) in one pass
         self._sync_all_clip_planes()

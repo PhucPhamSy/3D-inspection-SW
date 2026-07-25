@@ -698,73 +698,69 @@ class CrosshairMixin:
 
 
     def update_3d_crosshair(self):
+        """Draw RGB crosshair axes in the 3D pane.
+
+        Independent of the volume-render toggle: lines are plain polydata and
+        must still appear when 3D GPU volume is OFF (Online default).
+        Geometry/actors via shared ``Crosshair3DOverlay`` (Teaching parity).
+        """
         if not hasattr(self, 'view_3d_renderer') or self.volume_data is None:
             return
-            
-        if not hasattr(self, 'crosshair_3d_actors'):
-            self.crosshair_3d_actors = {'x': vtk.vtkLineSource(), 'y': vtk.vtkLineSource(), 'z': vtk.vtkLineSource()}
-            self.crosshair_3d_actor_objs = []
-            colors = {'x': (1.0, 0.192, 0.192), 'y': (0.223, 1.0, 0.078), 'z': (0.121, 0.317, 1.0)}
-            for axis in ['x', 'y', 'z']:
-                mapper = vtk.vtkPolyDataMapper()
-                mapper.SetInputConnection(self.crosshair_3d_actors[axis].GetOutputPort())
-                actor = vtk.vtkActor()
-                actor.SetMapper(mapper)
-                actor.GetProperty().SetColor(*colors[axis])
-                actor.GetProperty().SetLineWidth(1)
-                actor.SetPickable(False)
-                self.crosshair_3d_actor_objs.append(actor)
-        
-        for actor in self.crosshair_3d_actor_objs:
-            if self.crosshair_enabled:
-                if not self.view_3d_renderer.HasViewProp(actor):
-                    self.view_3d_renderer.AddActor(actor)
+        if getattr(self, 'view_3d_widget', None) is None:
+            return
+
+        if not hasattr(self, '_crosshair_3d_overlay') or self._crosshair_3d_overlay is None:
+            from inno3d.features.shared.crosshair_3d import Crosshair3DOverlay
+            self._crosshair_3d_overlay = Crosshair3DOverlay()
+
+        # Keep legacy attribute names for any external introspection
+        if self._crosshair_3d_overlay.line_sources is None:
+            self._crosshair_3d_overlay._ensure_actors()
+        self.crosshair_3d_actors = self._crosshair_3d_overlay.line_sources
+        self.crosshair_3d_actor_objs = self._crosshair_3d_overlay.actors
+
+        sp = self.custom_spacing if getattr(self, 'custom_spacing', None) is not None else self.spacing
+        spx, spy, spz = float(sp[0]), float(sp[1]), float(sp[2])
+        R = self.get_oblique_R() if hasattr(self, 'get_oblique_R') else None
+
+        visible = self._crosshair_3d_overlay.update(
+            self.view_3d_renderer,
+            self.view_3d_widget,
+            bool(self.crosshair_enabled),
+            self.crosshair_position,
+            self.volume_data.shape,
+            (spx, spy, spz),
+            R=R,
+            render=False,
+        )
+
+        if visible:
+            # Volume render OFF never runs render_3d camera setup — frame the
+            # volume AABB so the RGB axes are visible without GPU volume.
+            if not getattr(self, '_camera_initialized', False):
+                try:
+                    cam = self.view_3d_renderer.GetActiveCamera()
+                    pmode = str(getattr(self, 'projection_mode', 'perspective')).split('#')[0].strip().lower()
+                    if pmode == 'perspective':
+                        cam.ParallelProjectionOff()
+                        cam.SetViewAngle(40.0)
+                    else:
+                        cam.ParallelProjectionOn()
+                    if hasattr(self, 'set_camera_preset'):
+                        self.set_camera_preset("Top")
+                    self._camera_initialized = True
+                except Exception:
+                    pass
             else:
-                self.view_3d_renderer.RemoveActor(actor)
-                
-        if self.crosshair_enabled:
-            z, y, x = self.volume_data.shape
-            cx, cy, cz = self.crosshair_position
-            spx, spy, spz = self.spacing
-            
-            # Center of crosshair in physical coordinates
-            pc = np.array([cx * spx, cy * spy, cz * spz])
-            
-            # Get 3D rotation matrix
-            R = self.get_oblique_R()
-            
-            # Rotated axes (columns of R)
-            rx = R[:, 0]
-            ry = R[:, 1]
-            rz = R[:, 2]
-            
-            lx = (x - 1) * spx
-            ly = (y - 1) * spy
-            lz = (z - 1) * spz
-            max_len = max(lx, ly, lz) * 2.0
-            
-            p1_x = pc - max_len * rx
-            p2_x = pc + max_len * rx
-            
-            p1_y = pc - max_len * ry
-            p2_y = pc + max_len * ry
-            
-            p1_z = pc - max_len * rz
-            p2_z = pc + max_len * rz
-            
-            # X line (Sagittal - Red)
-            self.crosshair_3d_actors['x'].SetPoint1(p1_x[0], p1_x[1], p1_x[2])
-            self.crosshair_3d_actors['x'].SetPoint2(p2_x[0], p2_x[1], p2_x[2])
-            
-            # Y line (Coronal - Green)
-            self.crosshair_3d_actors['y'].SetPoint1(p1_y[0], p1_y[1], p1_y[2])
-            self.crosshair_3d_actors['y'].SetPoint2(p2_y[0], p2_y[1], p2_y[2])
-            
-            # Z line (Axial - Blue)
-            self.crosshair_3d_actors['z'].SetPoint1(p1_z[0], p1_z[1], p1_z[2])
-            self.crosshair_3d_actors['z'].SetPoint2(p2_z[0], p2_z[1], p2_z[2])
-            
-        self.view_3d_widget.GetRenderWindow().Render()
+                try:
+                    self.view_3d_renderer.ResetCameraClippingRange()
+                except Exception:
+                    pass
+
+        try:
+            self.view_3d_widget.GetRenderWindow().Render()
+        except Exception:
+            pass
 
     def on_crosshair_slider_changed(self, axis_idx, value):
         """Update crosshair position from toolbar slider and re-render all views.

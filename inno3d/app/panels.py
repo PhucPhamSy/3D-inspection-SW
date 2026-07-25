@@ -276,6 +276,8 @@ class PanelsMixin:
         self.multiplanar_tab.load_volume_folder_btn = b_load_folder
         self.multiplanar_tab.load_class1_btn = b_c1
         self.multiplanar_tab.load_class2_btn = b_c2
+        self.multiplanar_tab.color_c1_btn = b_c1_clr
+        self.multiplanar_tab.color_c2_btn = b_c2_clr
         self.multiplanar_tab.clear_masks_btn = b_clear
         self.multiplanar_tab.crosshair_check = self.cross_btn
         

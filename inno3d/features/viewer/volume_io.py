@@ -879,38 +879,69 @@ class VolumeIOMixin:
 
 
     def update_pixel_value(self, orientation, pos):
+        """Show volume XYZ + intensity under cursor (match Teaching MPR readout).
+
+        Previous Viewer text only showed 2D image (px,py) — missing Z / full
+        voxel address. Coordinates follow ``render_slice`` orientation mapping.
+        """
         try:
-            widget = getattr(self, f'{orientation}_widget')
-            renderer = getattr(self, f'{orientation}_renderer')
-            
+            if self.volume_data is None:
+                return
+            widget = getattr(self, f"{orientation}_widget")
+            renderer = getattr(self, f"{orientation}_renderer")
+            label = getattr(self, f"{orientation}_pixel_label", None)
+            if label is None:
+                return
+
             x, y = pos.x(), pos.y()
             size = widget.GetRenderWindow().GetSize()
             vtk_y = size[1] - y
-            
+
             picker = vtk.vtkWorldPointPicker()
             picker.Pick(x, vtk_y, 0, renderer)
             world_pos = picker.GetPickPosition()
-            
-            px, py = int(world_pos[0]), int(world_pos[1])
+
             slice_idx = self.current_slices[orientation]
-            
-            if orientation == 'axial':
-                slice_data = self.volume_data[slice_idx, :, :]
-            elif orientation == 'coronal':
-                slice_data = self.volume_data[:, slice_idx, :]
+            vol_z, vol_y, vol_x = self.volume_data.shape
+            value = None
+            coord_str = ""
+
+            if orientation == "axial":
+                # XY: display X=X, Y=Y; slice = Z
+                px = int(round(world_pos[0]))
+                py = int(round(world_pos[1]))
+                if 0 <= px < vol_x and 0 <= py < vol_y:
+                    actual_z = (
+                        (vol_z - 1 - slice_idx)
+                        if getattr(self, "reverse_z", False)
+                        else slice_idx
+                    )
+                    value = self.volume_data[actual_z, py, px]
+                    coord_str = f"X:{px} Y:{py} Z:{actual_z}"
+            elif orientation == "coronal":
+                # XZ flipud: VTK Y runs bottom→top along flipped Z index
+                # (same mapping as render_slice + Teaching readout)
+                px = int(round(world_pos[0]))
+                pz_disp = int(round(world_pos[1]))
+                if 0 <= px < vol_x and 0 <= pz_disp < vol_z:
+                    # flipud → display row 0 is high Z in array feed; VTK Y from
+                    # bottom matches flipped index when ViewUp=(0,1,0)
+                    pz = pz_disp
+                    value = self.volume_data[pz, slice_idx, px]
+                    coord_str = f"X:{px} Y:{slice_idx} Z:{pz}"
             else:
-                slice_data = np.rot90(self.volume_data[:, :, slice_idx])
-            
-            h, w = slice_data.shape
-            
-            if 0 <= px < w and 0 <= py < h:
-                pixel_value = slice_data[py, px]
-                label = getattr(self, f'{orientation}_pixel_label')
-                label.setText(f"Pixel ({px},{py}): {pixel_value}")
+                # Sagittal: transpose → VTK X=Z, VTK Y=Y
+                pz = int(round(world_pos[0]))
+                py = int(round(world_pos[1]))
+                if 0 <= pz < vol_z and 0 <= py < vol_y:
+                    value = self.volume_data[pz, py, slice_idx]
+                    coord_str = f"X:{slice_idx} Y:{py} Z:{pz}"
+
+            if value is not None:
+                label.setText(f"{coord_str} | Pixel: {value}")
             else:
-                label = getattr(self, f'{orientation}_pixel_label')
                 label.setText("Pixel: --")
-        except:
+        except Exception:
             pass
     
     def load_segmentation(self):
@@ -1105,6 +1136,75 @@ class VolumeIOMixin:
             radius=self._volume_world_radius(),
             bounds=self._volume_world_bounds(),
         )
+
+    def _force_3d_render_window_size(self):
+        """Push Qt widget pixel size into VTK (needed after fullscreen / sidebar).
+
+        If VTK keeps a stale size, arcball center/radius and pick coords drift
+        so Track orbit feels off-axis only in the large pane.
+        """
+        widget = getattr(self, "view_3d_widget", None)
+        if widget is None:
+            return
+        try:
+            rw = widget.GetRenderWindow()
+            if rw is None:
+                return
+            # Prefer device-pixel size when available (HiDPI)
+            try:
+                dpr = float(widget.devicePixelRatioF())
+            except Exception:
+                try:
+                    dpr = float(widget.devicePixelRatio())
+                except Exception:
+                    dpr = 1.0
+            dpr = max(dpr, 1.0)
+            w = max(int(round(widget.width() * dpr)), 1)
+            h = max(int(round(widget.height() * dpr)), 1)
+            cur = rw.GetSize()
+            if int(cur[0]) != w or int(cur[1]) != h:
+                rw.SetSize(w, h)
+        except Exception:
+            pass
+
+    def _reframe_3d_after_viewport_change(self):
+        """Keep orbit direction + zoom; re-center volume after layout change.
+
+        Called on enter/exit 3D in-grid fullscreen (sidebar shows/hides and
+        aspect ratio jumps). Without this, FP/volume center is no longer at
+        the visual center of the new viewport and Track pivot feels “wrong”.
+        """
+        ren = getattr(self, "view_3d_renderer", None)
+        widget = getattr(self, "view_3d_widget", None)
+        if ren is None or widget is None or self.volume_data is None:
+            return
+        try:
+            self._force_3d_render_window_size()
+            cam = ren.GetActiveCamera()
+            if cam is None:
+                return
+            cx, cy, cz = self._volume_world_center()
+            pos = list(cam.GetPosition())
+            fp = list(cam.GetFocalPoint())
+            dx, dy, dz = pos[0] - fp[0], pos[1] - fp[1], pos[2] - fp[2]
+            dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+            if dist < 1e-9:
+                # Degenerate — place camera along +Z from volume center
+                dist = max(float(self._volume_world_radius()) * 3.0, 1.0)
+                dx, dy, dz = 0.0, 0.0, 1.0
+            else:
+                inv = 1.0 / dist
+                dx, dy, dz = dx * inv, dy * inv, dz * inv
+            # Re-anchor look-at on volume center (orbit pivot); keep distance
+            cam.SetFocalPoint(cx, cy, cz)
+            cam.SetPosition(cx + dx * dist, cy + dy * dist, cz + dz * dist)
+            self._sync_3d_orbit_pivot()
+            ren.ResetCameraClippingRange()
+            rw = widget.GetRenderWindow()
+            if rw is not None:
+                rw.Render()
+        except Exception as e:
+            print(f"[VIEWER] 3D viewport reframe skipped: {e}")
 
     def _dragonfly_3d_zoom(self, zoom_in=True, strength=1.0, display_xy=None):
         """ORS Dragonfly object zoom — dolly about orbit pivot (pre-P1 behaviour).
@@ -1398,24 +1498,21 @@ class VolumeIOMixin:
         if orientation == '3d':
             if not self.is_3d_volume_render_enabled():
                 return
+            from inno3d.features.viewer.seg_mask_3d import set_mask_overlay_opacity
+
             c1_show = self.view_3d_overlay_group.c1_btn.isChecked() if hasattr(self.view_3d_overlay_group, 'c1_btn') else False
             c2_show = self.view_3d_overlay_group.c2_btn.isChecked() if hasattr(self.view_3d_overlay_group, 'c2_btn') else False
             op_val = self.view_3d_overlay_group.opacity_slider.value() / 100.0 if hasattr(self.view_3d_overlay_group, 'opacity_slider') else 0.5
-            
+
             if getattr(self, 'c1_actor_3d', None):
                 self.c1_actor_3d.SetVisibility(c1_show)
-                self.c1_actor_3d.GetProperty().GetScalarOpacity().RemoveAllPoints()
-                self.c1_actor_3d.GetProperty().GetScalarOpacity().AddPoint(0, 0.0)
-                self.c1_actor_3d.GetProperty().GetScalarOpacity().AddPoint(1, op_val)
-                self.c1_actor_3d.GetProperty().GetScalarOpacity().AddPoint(255, op_val)
-                
+                set_mask_overlay_opacity(self.c1_actor_3d, op_val)
+
             if getattr(self, 'c2_actor_3d', None):
                 self.c2_actor_3d.SetVisibility(c2_show)
-                self.c2_actor_3d.GetProperty().GetScalarOpacity().RemoveAllPoints()
-                self.c2_actor_3d.GetProperty().GetScalarOpacity().AddPoint(0, 0.0)
-                self.c2_actor_3d.GetProperty().GetScalarOpacity().AddPoint(1, op_val)
-                self.c2_actor_3d.GetProperty().GetScalarOpacity().AddPoint(255, op_val)
-            
+                # Void slightly stronger so it reads inside bump shells
+                set_mask_overlay_opacity(self.c2_actor_3d, min(1.0, float(op_val) * 1.15))
+
             self.view_3d_widget.GetRenderWindow().Render()
             return
 
@@ -1672,25 +1769,85 @@ class VolumeIOMixin:
             )
             renderer.AddActor(caption)
 
+    def _apply_3d_mask_overlay_colors(self):
+        """Push current ``seg_colors`` into existing 3D C1/C2 mask actors.
+
+        Works for medical surface shells and legacy volume actors.
+        Avoids a full ``render_3d()`` rebuild when only the colour changes.
+        """
+        if not hasattr(self, "is_3d_volume_render_enabled"):
+            return
+        if not self.is_3d_volume_render_enabled():
+            return
+
+        from inno3d.features.viewer.seg_mask_3d import set_mask_overlay_color
+
+        updated = False
+        for key, actor_name in ((128, "c1_actor_3d"), (255, "c2_actor_3d")):
+            actor = getattr(self, actor_name, None)
+            if actor is None:
+                continue
+            try:
+                rgb = self.seg_colors.get(
+                    key, [0.0, 1.0, 0.0] if key == 128 else [1.0, 0.0, 0.0]
+                )
+                set_mask_overlay_color(actor, rgb)
+                updated = True
+            except Exception as e:
+                print(f"[VIEWER] 3D mask color update failed ({actor_name}): {e}")
+
+        if updated:
+            widget = getattr(self, "view_3d_widget", None)
+            if widget is not None:
+                try:
+                    widget.GetRenderWindow().Render()
+                except Exception:
+                    pass
+
     def choose_overlay_color(self, class_num):
-        """Open color dialog to pick class overlay color"""
+        """Open color dialog to pick class overlay color (MPR + 3D volume)."""
         from PyQt5.QtWidgets import QColorDialog
 
         key = 128 if class_num == 1 else 255
         current = self.seg_colors.get(key, [0.0, 1.0, 0.0])
         init_color = QColor(int(current[0]*255), int(current[1]*255), int(current[2]*255))
         color = QColorDialog.getColor(init_color, self, f"Choose Class {class_num} Color")
-        if color.isValid():
-            self.seg_colors[key] = [color.redF(), color.greenF(), color.blueF()]
-            # Update button color as preview
-            btn = self.color_c1_btn if class_num == 1 else self.color_c2_btn
-            btn.setStyleSheet(
-                f"background-color: {color.name()}; "
-                f"color: {'black' if color.lightness() > 128 else 'white'};"
-            )
-            # Re-render all slices
-            for ori in ['axial', 'coronal', 'sagittal']:
-                self.render_slice(ori, preserve_camera=True)
+        if not color.isValid():
+            return
+
+        self.seg_colors[key] = [color.redF(), color.greenF(), color.blueF()]
+
+        # Preview on sidebar color button (optional — may be icon-only)
+        btn = getattr(self, "color_c1_btn" if class_num == 1 else "color_c2_btn", None)
+        if btn is not None:
+            try:
+                btn.setStyleSheet(
+                    f"background-color: {color.name()}; "
+                    f"color: {'black' if color.lightness() > 128 else 'white'};"
+                )
+            except Exception:
+                pass
+
+        # Invalidate MPR actor cache so baked RGB overlays are rebuilt
+        if hasattr(self, "_cached_slice_actors") and self._cached_slice_actors:
+            try:
+                self._cached_slice_actors.clear()
+            except Exception:
+                self._cached_slice_actors = {}
+
+        # Re-render MPR (uses updated seg_colors in _compose_mpr_overlay_rgb)
+        if self.volume_data is not None:
+            for ori in ("axial", "coronal", "sagittal"):
+                try:
+                    self.render_slice(ori, preserve_camera=True)
+                except Exception as e:
+                    print(f"[VIEWER] render_slice after color change ({ori}): {e}")
+
+        # Live-update 3D mask volumes if present
+        try:
+            self._apply_3d_mask_overlay_colors()
+        except Exception as e:
+            print(f"[VIEWER] 3D color apply after pick: {e}")
 
     def choose_ruler_color(self):
         """Pick ruler color"""
@@ -2024,19 +2181,53 @@ class VolumeIOMixin:
             self.segmentation_data[self.class2_data > 0] = 255
             
     def clear_masks(self):
+        """Clear C1/C2 segmentation masks from MPR + 3D volume overlays."""
         self.class1_data = None
         self.class2_data = None
         self.segmentation_data = None
         self.labeled_class1_data = None
+        if hasattr(self, 'labeled_class2_data'):
+            self.labeled_class2_data = None
         self.object_stats = []
         if hasattr(self, 'selected_highlight_objects'):
             self.selected_highlight_objects = []
         if hasattr(self, '_refresh_stats_table'):
             self._refresh_stats_table()
-        
+
+        # Remove mask shells / volumes from the 3D pane (MPR re-render alone leaves them).
+        from inno3d.features.viewer.seg_mask_3d import remove_mask_overlay_from_renderer
+        ren = getattr(self, 'view_3d_renderer', None)
+        for name in ('c1_actor_3d', 'c2_actor_3d'):
+            act = getattr(self, name, None)
+            if act is not None and ren is not None:
+                remove_mask_overlay_from_renderer(ren, act)
+            setattr(self, name, None)
+
+        # Mask-dependent 3D overlays (MES pick surfaces / B2B gaps)
+        if hasattr(self, '_clear_mes_3d_highlight'):
+            try:
+                self._clear_mes_3d_highlight(render=False)
+            except Exception:
+                pass
+        if hasattr(self, '_clear_b2b_gap_actors'):
+            try:
+                self._clear_b2b_gap_actors()
+            except Exception:
+                pass
+
         if self.volume_data is not None:
             for orientation in ['axial', 'coronal', 'sagittal']:
                 self.render_slice(orientation)
+
+        widget = getattr(self, 'view_3d_widget', None)
+        if widget is not None:
+            try:
+                if ren is not None:
+                    ren.ResetCameraClippingRange()
+                widget.GetRenderWindow().Render()
+            except Exception:
+                pass
+
         self.update_info_label()
 
     def clear_all_views(self):
@@ -2048,11 +2239,12 @@ class VolumeIOMixin:
         if getattr(self, 'volume_actor', None):
             self.view_3d_renderer.RemoveVolume(self.volume_actor)
             self.volume_actor = None
+        from inno3d.features.viewer.seg_mask_3d import remove_mask_overlay_from_renderer
         if getattr(self, 'c1_actor_3d', None):
-            self.view_3d_renderer.RemoveVolume(self.c1_actor_3d)
+            remove_mask_overlay_from_renderer(self.view_3d_renderer, self.c1_actor_3d)
             self.c1_actor_3d = None
         if getattr(self, 'c2_actor_3d', None):
-            self.view_3d_renderer.RemoveVolume(self.c2_actor_3d)
+            remove_mask_overlay_from_renderer(self.view_3d_renderer, self.c2_actor_3d)
             self.c2_actor_3d = None
             
         # Clear 2D actors

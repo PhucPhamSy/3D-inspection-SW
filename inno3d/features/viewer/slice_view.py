@@ -125,6 +125,11 @@ class SliceViewMixin:
         except Exception:
             pass
         rw.GetInteractor().SetInteractorStyle(style)
+        # Default: pixel-probe cross (VTK Image style otherwise shows open-hand)
+        try:
+            vtk_widget.setCursor(Qt.CrossCursor)
+        except Exception:
+            pass
         self.setup_vtk_observers(vtk_widget, orientation)
         vtk_widget.installEventFilter(self)
         
@@ -274,20 +279,25 @@ class SliceViewMixin:
             overlay.set_fullscreen(True)
             QTimer.singleShot(50, overlay.update_position)
 
-        # After the widget has resized, re-sync 3D orbit pivot + clipping
-        # so rotation/zoom feel identical to the normal (non-fullscreen) layout.
+        # After layout settles (sidebar + grid span), reframe 3D so Track pivot
+        # and arcball match the new viewport — same feel as non-fullscreen.
         if orientation == 'view_3d':
             def _post_fullscreen_3d_sync():
                 try:
-                    self._sync_3d_orbit_pivot()
-                    ren = getattr(self, 'view_3d_renderer', None)
-                    widget = getattr(self, 'view_3d_widget', None)
-                    if ren and widget:
-                        ren.ResetCameraClippingRange()
-                        widget.GetRenderWindow().Render()
+                    if hasattr(self, '_reframe_3d_after_viewport_change'):
+                        self._reframe_3d_after_viewport_change()
+                    else:
+                        self._sync_3d_orbit_pivot()
+                        ren = getattr(self, 'view_3d_renderer', None)
+                        widget = getattr(self, 'view_3d_widget', None)
+                        if ren and widget:
+                            ren.ResetCameraClippingRange()
+                            widget.GetRenderWindow().Render()
                 except Exception:
                     pass
-            QTimer.singleShot(100, _post_fullscreen_3d_sync)
+            # Two passes: Qt may still be applying sidebar min-width on first tick
+            QTimer.singleShot(50, _post_fullscreen_3d_sync)
+            QTimer.singleShot(180, _post_fullscreen_3d_sync)
         else:
             # MPR panes: reset camera to fit new viewport
             QTimer.singleShot(80, lambda ori=orientation: self.reset_view(ori))
@@ -331,8 +341,13 @@ class SliceViewMixin:
             overlay.set_fullscreen(False)
             QTimer.singleShot(50, overlay.update_position)
 
+        was_3d = orientation == 'view_3d'
         self._fullscreen_view = None
         QTimer.singleShot(40, self._refresh_layout_viewports)
+        # Exit FS also changes aspect — reframe orbit pivot like enter
+        if was_3d and hasattr(self, '_reframe_3d_after_viewport_change'):
+            QTimer.singleShot(80, self._reframe_3d_after_viewport_change)
+            QTimer.singleShot(200, self._reframe_3d_after_viewport_change)
 
     def set_projection(self, mode):
         self.projection_mode = str(mode).split('#')[0].strip().lower()
@@ -359,46 +374,61 @@ class SliceViewMixin:
             self.view_3d_widget.GetRenderWindow().Render()
 
     def update_pixel_value(self, orientation, pos):
+        """Delegate to VolumeIOMixin implementation (full X/Y/Z + intensity).
+
+        Kept for MRO safety if mixin order changes; real logic lives in
+        ``VolumeIOMixin.update_pixel_value``.
+        """
+        # Prefer the VolumeIOMixin method if available via MRO (usual case is
+        # this body is never reached). Fallback: same XYZ format as Teaching.
         try:
-            widget = getattr(self, f'{orientation}_widget')
-            renderer = getattr(self, f'{orientation}_renderer')
-            
+            if self.volume_data is None:
+                return
+            widget = getattr(self, f"{orientation}_widget")
+            renderer = getattr(self, f"{orientation}_renderer")
+            label = getattr(self, f"{orientation}_pixel_label", None)
+            if label is None:
+                return
+
             x, y = pos.x(), pos.y()
             size = widget.GetRenderWindow().GetSize()
             vtk_y = size[1] - y
-            
+
             picker = vtk.vtkWorldPointPicker()
             picker.Pick(x, vtk_y, 0, renderer)
             world_pos = picker.GetPickPosition()
-            
+
             slice_idx = self.current_slices[orientation]
-            
-            # Bounds check
             vol_z, vol_y, vol_x = self.volume_data.shape
             value = None
-            
-            if orientation == 'axial':
-                # XY plane: VTK X=X, VTK Y=Y
-                px = int(world_pos[0])
-                py = int(world_pos[1])
-                if 0 <= px < vol_x and 0 <= py < vol_y:
-                    value = self.volume_data[slice_idx, py, px]
-            elif orientation == 'coronal':
-                # XZ plane: VTK X=X, VTK Y=Z
-                px = int(world_pos[0])
-                pz = int(world_pos[1])
-                if 0 <= px < vol_x and 0 <= pz < vol_z:
-                     value = self.volume_data[pz, slice_idx, px]
-            else: # sagittal (YZ plane, flipud+rot90)
-                 # After flipud(rot90(M)): VTK X = Z, VTK Y = Y (direct)
-                 pz = int(world_pos[0])
-                 py = int(world_pos[1])
-                 if 0 <= pz < vol_z and 0 <= py < vol_y:
-                     value = self.volume_data[pz, py, slice_idx]
+            coord_str = ""
 
-            label = getattr(self, f'{orientation}_pixel_label')
+            if orientation == "axial":
+                px = int(round(world_pos[0]))
+                py = int(round(world_pos[1]))
+                if 0 <= px < vol_x and 0 <= py < vol_y:
+                    actual_z = (
+                        (vol_z - 1 - slice_idx)
+                        if getattr(self, "reverse_z", False)
+                        else slice_idx
+                    )
+                    value = self.volume_data[actual_z, py, px]
+                    coord_str = f"X:{px} Y:{py} Z:{actual_z}"
+            elif orientation == "coronal":
+                px = int(round(world_pos[0]))
+                pz = int(round(world_pos[1]))
+                if 0 <= px < vol_x and 0 <= pz < vol_z:
+                    value = self.volume_data[pz, slice_idx, px]
+                    coord_str = f"X:{px} Y:{slice_idx} Z:{pz}"
+            else:
+                pz = int(round(world_pos[0]))
+                py = int(round(world_pos[1]))
+                if 0 <= pz < vol_z and 0 <= py < vol_y:
+                    value = self.volume_data[pz, py, slice_idx]
+                    coord_str = f"X:{slice_idx} Y:{py} Z:{pz}"
+
             if value is not None:
-                label.setText(f"Pixel: {value}")
+                label.setText(f"{coord_str} | Pixel: {value}")
             else:
                 label.setText("Pixel: --")
         except Exception:

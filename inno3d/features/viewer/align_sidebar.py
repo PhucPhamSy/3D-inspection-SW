@@ -16,16 +16,62 @@ from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QToolButton, QSlider, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QFrame, QScrollArea, QAbstractSpinBox,
+    QCheckBox, QFrame, QScrollArea, QAbstractSpinBox, QSizePolicy,
 )
 
 from inno3d.core.styles import SemiconductorTheme
 from inno3d.core.tf_widgets import HistogramWLWidget
-from inno3d.features.viewer.shared_widgets import _ui_icon
+from inno3d.features.viewer.shared_widgets import _ui_icon, _tinted_ui_icon
+
+
+def _style_compact_reset_button(btn):
+    """Style a compact «Reset» QPushButton without clipping hover border.
+
+    Global theme uses min-height 30px + padding 6×14. Shorter fixedHeight
+    clips the bottom border on hover. Full override (normal/hover/pressed)
+    keeps a complete 1px border inside the widget box.
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QSizePolicy
+
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setMinimumWidth(68)
+    # Match global min-height so border is not clipped by fixed short height
+    btn.setMinimumHeight(30)
+    btn.setMaximumHeight(32)
+    btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+    # Leave room for 1px border top+bottom inside the layout cell
+    btn.setContentsMargins(0, 0, 0, 0)
+    t = SemiconductorTheme
+    btn.setStyleSheet(f"""
+        QPushButton {{
+            background-color: {t.BG_LIGHT};
+            border: 1px solid {t.BORDER_DEFAULT};
+            color: {t.TEXT_PRIMARY};
+            border-radius: 4px;
+            padding: 4px 12px;
+            font-weight: 600;
+            font-size: 9pt;
+            min-width: 64px;
+            min-height: 28px;
+        }}
+        QPushButton:hover {{
+            background-color: {t.BG_PANEL};
+            border: 1px solid {t.BORDER_HOVER};
+            color: {t.TEXT_PRIMARY};
+        }}
+        QPushButton:pressed {{
+            background-color: {t.BG_MEDIUM};
+            border: 1px solid {t.BORDER_ACTIVE};
+        }}
+    """)
 
 
 class AlignSidebarMixin:
     """Mixin providing the right VIEW TOOLS sidebar UI for MultiPlanarView."""
+
+    # Re-export for other mixins on MultiPlanarView (e.g. Volume3dMixin)
+    _style_compact_reset_button = staticmethod(_style_compact_reset_button)
 
     def _create_align_tools_host(self):
         """Host for VIEW TOOLS: full sidebar (expanded) or thin reopen rail (collapsed)."""
@@ -382,7 +428,8 @@ class AlignSidebarMixin:
         wl_lay.addLayout(mpr_wl_row)
 
         mpr_wl_info_row = QHBoxLayout()
-        mpr_wl_info_row.setContentsMargins(0, 0, 0, 0)
+        # 1px vertical slack so hover border is not clipped by tight layout
+        mpr_wl_info_row.setContentsMargins(0, 1, 0, 2)
         mpr_wl_info_row.setSpacing(4)
         self.mpr_wl_info_label = QLabel("W: 65535   L: 32767.5")
         self.mpr_wl_info_label.setStyleSheet(
@@ -392,9 +439,8 @@ class AlignSidebarMixin:
         mpr_wl_info_row.addWidget(self.mpr_wl_info_label, 1)
 
         self.btn_mpr_wl_reset = QPushButton("Reset")
-        self.btn_mpr_wl_reset.setFixedWidth(52)
-        self.btn_mpr_wl_reset.setFixedHeight(22)
-        self.btn_mpr_wl_reset.setCursor(Qt.PointingHandCursor)
+        # Compact Reset — full border on hover (no clipped bottom edge)
+        self._style_compact_reset_button(self.btn_mpr_wl_reset)
         self.btn_mpr_wl_reset.setToolTip("Reset MPR window/level to full data range")
         self.btn_mpr_wl_reset.clicked.connect(self._reset_mpr_wl_to_data_range)
         mpr_wl_info_row.addWidget(self.btn_mpr_wl_reset)
@@ -431,7 +477,20 @@ class AlignSidebarMixin:
 
         self.btn_df_clip_reset = QPushButton()
         self.btn_df_clip_reset.setProperty("class", "icon-button")
-        self.btn_df_clip_reset.setIcon(_ui_icon("refresh.svg", self.btn_df_clip_reset))
+        # Theme-tint refresh glyph — raw SVG stroke (#DDE7F2) blends into light
+        # icon-button backgrounds; TEXT_PRIMARY keeps contrast in both themes.
+        self.btn_df_clip_reset.setProperty("theme_icon", True)
+        self.btn_df_clip_reset.setProperty("icon_name", "refresh.svg")
+        self.btn_df_clip_reset.setProperty("icon_size_w", 14)
+        self.btn_df_clip_reset.setProperty("icon_size_h", 14)
+        self.btn_df_clip_reset.setIcon(
+            _tinted_ui_icon(
+                "refresh.svg",
+                color=SemiconductorTheme.TEXT_PRIMARY,
+                size=14,
+                widget=self.btn_df_clip_reset,
+            )
+        )
         self.btn_df_clip_reset.setIconSize(QSize(14, 14))
         self.btn_df_clip_reset.setFixedSize(28, 26)
         self.btn_df_clip_reset.setCursor(Qt.PointingHandCursor)

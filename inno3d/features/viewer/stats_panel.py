@@ -10,6 +10,7 @@ import csv
 import math
 import os
 import re
+import time
 from pathlib import Path as _Path
 from typing import List, Optional
 
@@ -18,7 +19,7 @@ import vtk
 from vtk.util import numpy_support
 from skimage import measure
 
-from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QItemSelection, QItemSelectionModel
 from PyQt5.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QPen, QBrush
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
@@ -31,6 +32,22 @@ from PyQt5.QtWidgets import (
 )
 
 from inno3d.core.styles import SemiconductorTheme
+from inno3d.features.shared.b2b_gap_3d import (
+    B2BGapOverlay,
+    format_gap_label as _shared_format_gap_label,
+    layer_z_offset as _shared_layer_z_offset,
+    world_spacing as _shared_world_spacing,
+)
+from inno3d.features.shared.mes_highlight_3d import MESHighlightOverlay
+from inno3d.features.shared.mes_mapping import (
+    MesPickDebounce,
+    centroid_nav_xyz as _shared_centroid_nav_xyz,
+    label_at_stat_centroid as _shared_label_at_stat_centroid,
+    label_at_volume_xyz as _shared_label_at_volume_xyz,
+    mes_bbox_for_labels as _shared_mes_bbox_for_labels,
+    resolve_stat_label as _shared_resolve_stat_label,
+    stats_index_for_label as _shared_stats_index_for_label,
+)
 
 
 def _viewer_shared():
@@ -210,6 +227,39 @@ class StatsPanelMixin:
         self.stats_filter_input.textChanged.connect(self.on_stats_filter_changed)
         filter_row.addWidget(self.stats_filter_input, 1, Qt.AlignVCenter)
 
+        # Multi-select toggle (MES rows + MPR/3D bump highlight set)
+        self.mes_multi_select_check = QCheckBox("Multi")
+        self.mes_multi_select_check.setObjectName("mesMultiSelectToggle")
+        self.mes_multi_select_check.setToolTip(
+            "Multi-select bumps (MES table ↔ MPR/3D) — sticky both ways:\n"
+            "· OFF: click 1 MES row or Ctrl+click MPR/3D → sticky single (kept after release)\n"
+            "· ON: click rows / Ctrl+click MPR/3D → multi highlight set (all kept)\n"
+            "· Clear (X) to deselect all"
+        )
+        self.mes_multi_select_check.setChecked(False)
+        self.mes_multi_select_check.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.mes_multi_select_check.setStyleSheet(f"""
+            QCheckBox#mesMultiSelectToggle {{
+                color: {SemiconductorTheme.TEXT_SECONDARY};
+                font-size: 8pt;
+                font-weight: 700;
+                spacing: 4px;
+                background: transparent;
+                border: none;
+                padding: 0 4px;
+            }}
+            QCheckBox#mesMultiSelectToggle:checked {{
+                color: {SemiconductorTheme.ACCENT_PRIMARY};
+            }}
+            QCheckBox#mesMultiSelectToggle::indicator {{
+                width: 14px;
+                height: 14px;
+            }}
+        """)
+        self._mes_multi_select = False
+        self.mes_multi_select_check.toggled.connect(self._on_mes_multi_select_toggled)
+        filter_row.addWidget(self.mes_multi_select_check, 0, Qt.AlignVCenter)
+
         panel_layout.addWidget(filter_zone)
 
         # ── Zone 3: Tabs MES | B2B ─────────────────────────────────────
@@ -302,7 +352,8 @@ class StatsPanelMixin:
         self.object_stats_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.object_stats_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.object_stats_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.object_stats_table.setSelectionMode(QTableWidget.MultiSelection)
+        # Default single-select; toggle "Multi" next to Filter enables ExtendedSelection
+        self.object_stats_table.setSelectionMode(QAbstractItemView.SingleSelection)
         # Off: full-row OK/NG tint must not fight alternate-row stylesheet
         self.object_stats_table.setAlternatingRowColors(False)
         self.object_stats_table.setShowGrid(True)
@@ -318,6 +369,12 @@ class StatsPanelMixin:
         # Freeze first 3 cols (#, Layer, Bump ID) — body-only overlay under shared header
         self.object_stats_table.set_frozen_columns(3)
         self.object_stats_table.setup_frozen()
+        self.object_stats_table.setToolTip(
+            "MES object stats (synced with MPR/3D Ctrl+click):\n"
+            "  · Multi OFF: click 1 row or Ctrl+click MPR/3D = sticky single\n"
+            "  · Multi ON: click rows / Ctrl+click MPR/3D = multi sticky set\n"
+            "  · Clear (X) to deselect"
+        )
         mes_layout.addWidget(self.object_stats_table, 1)
         self.stats_tabs.addTab(mes_page, "MES · Object Stats")
 
@@ -366,10 +423,10 @@ class StatsPanelMixin:
         self.b2b_table.setToolTip(
             "B2B gap on 3D Volume:\n"
             "  · Click row = show · click same row again = hide\n"
-            "  · Wireframe cube = exact surface voxel (Z,Y,X)\n"
-            "  · Cyan/yellow tint = local object surface at contact\n"
-            "  · Tube cyan→yellow + red arrow = gap direction\n"
-            "  · Callout = distance + surface voxel coordinates"
+            "  · Cyan = SRC (source) · Amber = DST (destination)\n"
+            "  · Tags SRC/DST on voxels + caption lists SRC/DST bump IDs\n"
+            "  · Tube cyan→amber + red arrow = gap direction SRC→DST\n"
+            "  · Caption = distance · direction · SRC/DST IDs"
         )
         b2b_layout.addWidget(self.b2b_table, 1)
         self.stats_tabs.addTab(b2b_page, "B2B · Boundary")
@@ -1030,7 +1087,15 @@ class StatsPanelMixin:
         else:
             self.set_stats_info(f"B2B: {len(rows)} gaps · {n_layers} layers")
 
-    # ── B2B gap → 3D Volume (spatial distance; not MPR) ──────────────────
+    # ── B2B gap → 3D Volume (shared module; spatial distance, not MPR) ───
+
+    def _get_b2b_gap_overlay(self) -> B2BGapOverlay:
+        """Lazy shared B2B gap actor stack (Viewer + Teaching parity)."""
+        ov = getattr(self, "_b2b_gap_overlay", None)
+        if ov is None:
+            ov = B2BGapOverlay()
+            self._b2b_gap_overlay = ov
+        return ov
 
     def _b2b_stats_index_from_visual_row(self, visual_row):
         if visual_row is None or visual_row < 0:
@@ -1051,629 +1116,168 @@ class StatsPanelMixin:
         return idx
 
     def _b2b_layer_z_offset(self, row_dict):
-        """Local B2B layer Z → full-volume Z."""
-        if not row_dict:
-            return 0
-        for key in ("z_start", "Z_start", "layer_z_start"):
-            if key in row_dict and row_dict[key] not in (None, ""):
-                try:
-                    return int(row_dict[key])
-                except (TypeError, ValueError):
-                    pass
-        ln = str(row_dict.get("Layer", "") or "")
-        mw = self.window()
+        """Local B2B layer Z → full-volume Z (shared helper)."""
         bands = None
-        if hasattr(mw, "_online_layer_bands"):
-            try:
+        try:
+            mw = self.window()
+            if hasattr(mw, "_online_layer_bands"):
                 bands = mw._online_layer_bands()
-            except Exception:
-                bands = None
-        if bands:
-            key = ln.replace(" ", "_").lower()
-            for L in bands:
-                name = str(L.get("name", ""))
-                if name == ln or name.replace(" ", "_").lower() == key:
-                    return int(L.get("z_start", 0) or 0)
-        return 0
+        except Exception:
+            bands = None
+        return _shared_layer_z_offset(row_dict, layer_bands=bands, fallback=0)
 
     def _get_3d_world_spacing(self):
-        spacing = getattr(self, "custom_spacing", None)
-        if spacing is None:
-            spacing = getattr(self, "spacing", [1.0, 1.0, 1.0])
-        try:
-            return (float(spacing[0]), float(spacing[1]), float(spacing[2]))
-        except Exception:
-            return (1.0, 1.0, 1.0)
+        return _shared_world_spacing(
+            getattr(self, "custom_spacing", None),
+            getattr(self, "spacing", [1.0, 1.0, 1.0]),
+        )
 
-    def _clear_b2b_gap_actors(self):
+    def _clear_b2b_gap_actors(self, restore_context=True):
         ren = getattr(self, "view_3d_renderer", None)
-        actors = getattr(self, "_b2b_gap_actors", None) or []
-        if ren is not None:
-            for actor in actors:
-                try:
-                    ren.RemoveActor(actor)
-                except Exception:
-                    pass
-                try:
-                    ren.RemoveActor2D(actor)
-                except Exception:
-                    pass
-        self._b2b_gap_actors = []
-        self._b2b_active_stats_idx = None
         widget = getattr(self, "view_3d_widget", None)
-        if widget is not None and ren is not None:
-            try:
-                widget.GetRenderWindow().Render()
-            except Exception:
-                pass
+        ov = self._get_b2b_gap_overlay()
 
-    def _b2b_add_gap_actor(self, ren, actor, is_2d=False):
-        """Track + add a B2B overlay actor (3D or 2D caption)."""
-        if is_2d:
-            ren.AddActor2D(actor)
-        else:
-            ren.AddActor(actor)
-        self._b2b_gap_actors.append(actor)
+        def _restore():
+            if restore_context and hasattr(self, "_set_mes_3d_context_dim"):
+                try:
+                    self._set_mes_3d_context_dim(False)
+                except Exception:
+                    pass
 
-    def _b2b_add_surface_voxel_marker(self, ren, z, y, x, sx, sy, sz, color,
-                                     label_tag=""):
-        """Mark the **exact discrete surface voxel** (not a floating ball).
+        ov.clear(
+            ren,
+            widget,
+            render=True,
+            on_restore_context=_restore if restore_context else None,
+        )
+        # Legacy attrs kept in sync for any external readers
+        self._b2b_gap_actors = ov.actors
+        self._b2b_active_stats_idx = ov.active_stats_idx
 
-        · Wireframe cube = 1 voxel cell centered on sample (Z,Y,X)
-        · Filled translucent cube (same cell)
-        · Tiny solid sphere at voxel sample center
-        """
-        # Cell bounds around sample point (index * spacing)
-        x0, x1 = (float(x) - 0.5) * sx, (float(x) + 0.5) * sx
-        y0, y1 = (float(y) - 0.5) * sy, (float(y) + 0.5) * sy
-        z0, z1 = (float(z) - 0.5) * sz, (float(z) + 0.5) * sz
-        cx, cy, cz = float(x) * sx, float(y) * sy, float(z) * sz
-        min_sp = max(1e-6, min(sx, sy, sz))
+    @staticmethod
+    def _b2b_format_gap_label(layer, eucl, src_rc, dst_rc, direction,
+                              src_zyx=None, dst_zyx=None):
+        return _shared_format_gap_label(
+            layer, eucl, src_rc, dst_rc, direction, src_zyx, dst_zyx
+        )
 
-        # Filled voxel cell
-        cube = vtk.vtkCubeSource()
-        cube.SetBounds(x0, x1, y0, y1, z0, z1)
-        cube.Update()
-        fill_m = vtk.vtkPolyDataMapper()
-        fill_m.SetInputConnection(cube.GetOutputPort())
-        fill_a = vtk.vtkActor()
-        fill_a.SetMapper(fill_m)
-        fill_a.GetProperty().SetColor(*color)
-        fill_a.GetProperty().SetOpacity(0.55)
-        fill_a.GetProperty().SetLighting(False)
-        fill_a.GetProperty().SetAmbient(1.0)
-        fill_a.GetProperty().SetDiffuse(0.0)
-        self._b2b_add_gap_actor(ren, fill_a)
-
-        # Wireframe outline (exact cell edges)
-        wire_m = vtk.vtkPolyDataMapper()
-        wire_m.SetInputConnection(cube.GetOutputPort())
-        wire_a = vtk.vtkActor()
-        wire_a.SetMapper(wire_m)
-        wire_a.GetProperty().SetRepresentationToWireframe()
-        wire_a.GetProperty().SetColor(1.0, 1.0, 1.0)
-        wire_a.GetProperty().SetLineWidth(2.0)
-        wire_a.GetProperty().SetOpacity(1.0)
-        wire_a.GetProperty().SetLighting(False)
-        wire_a.GetProperty().SetAmbient(1.0)
-        self._b2b_add_gap_actor(ren, wire_a)
-
-        # Sample-center bead (true voxel coordinate used by DLL)
-        bead_r = max(0.35, min_sp * 0.35)
-        sph = vtk.vtkSphereSource()
-        sph.SetCenter(cx, cy, cz)
-        sph.SetRadius(bead_r)
-        sph.SetPhiResolution(14)
-        sph.SetThetaResolution(14)
-        sm = vtk.vtkPolyDataMapper()
-        sm.SetInputConnection(sph.GetOutputPort())
-        sa = vtk.vtkActor()
-        sa.SetMapper(sm)
-        sa.GetProperty().SetColor(*color)
-        sa.GetProperty().SetOpacity(1.0)
-        sa.GetProperty().SetLighting(False)
-        sa.GetProperty().SetAmbient(1.0)
-        self._b2b_add_gap_actor(ren, sa)
-
-        if label_tag:
-            try:
-                tag = vtk.vtkBillboardTextActor3D()
-                tag.SetInput(str(label_tag))
-                tag.SetPosition(cx, cy, cz + max(sz, min_sp) * 1.2)
-                tp = tag.GetTextProperty()
-                tp.SetFontSize(11)
-                tp.SetColor(*color)
-                tp.BoldOn()
-                tp.SetBackgroundColor(0.0, 0.0, 0.0)
-                tp.SetBackgroundOpacity(0.7)
-                tp.SetJustificationToCentered()
-                self._b2b_add_gap_actor(ren, tag)
-            except Exception:
-                pass
-
-    def _b2b_add_local_object_surface(self, ren, z, y, x, sx, sy, sz, color,
-                                     pad=10):
-        """Show local isosurface of the object that owns this surface voxel.
-
-        Makes it obvious the marker sits on the **bump surface**, not mid-air.
-        Uses labeled_class1_data (or binary class1) around the voxel.
-        """
-        labeled = getattr(self, "labeled_class1_data", None)
-        c1 = getattr(self, "class1_data", None)
-        if labeled is None and c1 is None:
-            return
-        try:
-            if labeled is not None:
-                Z, Y, X = labeled.shape
-            else:
-                Z, Y, X = c1.shape
-            z = int(z)
-            y = int(y)
-            x = int(x)
-            if not (0 <= z < Z and 0 <= y < Y and 0 <= x < X):
-                return
-
-            lab = 0
-            if labeled is not None:
-                lab = int(labeled[z, y, x])
-            # Crop around contact voxel
-            z0, z1 = max(0, z - pad), min(Z, z + pad + 1)
-            y0, y1 = max(0, y - pad), min(Y, y + pad + 1)
-            x0, x1 = max(0, x - pad), min(X, x + pad + 1)
-
-            if labeled is not None and lab > 0:
-                crop = labeled[z0:z1, y0:y1, x0:x1]
-                mask = (crop == lab)
-            else:
-                # Binary bump fallback
-                src = c1 if c1 is not None else labeled
-                crop = src[z0:z1, y0:y1, x0:x1]
-                mask = crop > 0
-            if not np.any(mask):
-                return
-
-            mask_u8 = np.ascontiguousarray(mask.astype(np.uint8))
-            vtk_img = vtk.vtkImageData()
-            dz, dy, dx = mask_u8.shape
-            vtk_img.SetDimensions(dx, dy, dz)
-            vtk_img.SetSpacing(float(sx), float(sy), float(sz))
-            # Origin at crop corner (same convention as MES highlight)
-            vtk_img.SetOrigin(float(x0) * sx, float(y0) * sy, float(z0) * sz)
-            flat = np.ascontiguousarray(
-                np.transpose(mask_u8, (2, 1, 0)).ravel(order="F")
-            )
-            vtk_arr = numpy_support.numpy_to_vtk(
-                flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
-            )
-            vtk_img.GetPointData().SetScalars(vtk_arr)
-
-            try:
-                contour = vtk.vtkFlyingEdges3D()
-            except Exception:
-                contour = vtk.vtkMarchingCubes()
-            contour.SetInputData(vtk_img)
-            contour.SetValue(0, 0.5)
-            contour.ComputeNormalsOn()
-            try:
-                contour.ComputeScalarsOff()
-            except Exception:
-                pass
-            contour.Update()
-
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputConnection(contour.GetOutputPort())
-            mapper.ScalarVisibilityOff()
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-            prop = actor.GetProperty()
-            prop.SetColor(*color)
-            prop.SetOpacity(0.38)
-            prop.SetAmbient(0.45)
-            prop.SetDiffuse(0.55)
-            prop.EdgeVisibilityOff()
-            self._b2b_add_gap_actor(ren, actor)
-        except Exception as e:
-            print(f"[B2B] local surface patch skipped: {e}")
-
-    def _world_to_normalized_viewport(self, ren, wx, wy, wz):
-        """Project world point → normalized viewport [0..1]² (origin bottom-left).
-
-        Returns (nx, ny) or None if projection fails / off-renderer.
-        """
-        if ren is None:
-            return None
-        try:
-            coord = vtk.vtkCoordinate()
-            coord.SetCoordinateSystemToWorld()
-            coord.SetValue(float(wx), float(wy), float(wz))
-            # Display pixels relative to the full render window
-            dx, dy = coord.GetComputedDisplayValue(ren)
-            # Convert display → viewport-normalized for this renderer
-            origin = ren.GetOrigin()  # (ox, oy) bottom-left of viewport in display px
-            size = ren.GetSize()      # (w, h)
-            w = float(size[0]) if size and size[0] else 0.0
-            h = float(size[1]) if size and size[1] else 0.0
-            if w <= 1.0 or h <= 1.0:
-                return None
-            nx = (float(dx) - float(origin[0])) / w
-            ny = (float(dy) - float(origin[1])) / h
-            return (nx, ny)
-        except Exception:
-            return None
-
-    def _b2b_caption_viewport_pos(self, ren, mid_x, mid_y, mid_z,
-                                  box_w=0.30, box_h=0.08):
-        """Place callout box near the gap in screen space (short leader).
-
-        Prefer a small offset from the projected midpoint so the leader is short
-        even on multi-layer stacks (avoids fixed top-of-viewport placement).
-        """
-        proj = self._world_to_normalized_viewport(ren, mid_x, mid_y, mid_z)
-        if proj is None:
-            # Safe default: mid-right of viewport
-            return (0.55, 0.50)
-
-        nx, ny = proj
-        # If point is behind camera / wildly off-screen, park mid-right
-        if nx < -0.15 or nx > 1.15 or ny < -0.15 or ny > 1.15:
-            return (0.55, 0.50)
-
-        # Offset box so it doesn't cover the gap itself (right + slightly up)
-        # Position is bottom-left of caption box.
-        cap_x = nx + 0.06
-        cap_y = ny + 0.04
-
-        # If that would go off the right edge, flip to the left of the point
-        if cap_x + box_w > 0.98:
-            cap_x = nx - box_w - 0.04
-        # If off the top, place below
-        if cap_y + box_h > 0.96:
-            cap_y = ny - box_h - 0.04
-        # Clamp into viewport with a small margin
-        cap_x = max(0.02, min(cap_x, 0.98 - box_w))
-        cap_y = max(0.02, min(cap_y, 0.96 - box_h))
-        return (cap_x, cap_y)
-
-    def _draw_b2b_gap_line(self, src_voxel, dst_voxel, label_text=""):
-        """Draw Src→Dst gap on 3D Volume — exact surface voxels + callout.
-
-        Visual design:
-          · Local isosurface patches of the two objects at contact (context)
-          · **1-voxel wireframe cubes** at DLL boundary indices (true surface voxels)
-          · Thin gradient tube cyan→yellow + red arrow (gap direction)
-          · Screen-space caption near gap with distance + (Z,Y,X)
-
-        Args:
-            src_voxel / dst_voxel: (z, y, x) in **global volume** voxel indices
-        """
+    def _draw_b2b_gap_line(self, src_voxel, dst_voxel, label_text="", stats_idx=None):
+        """Draw Src→Dst gap on 3D Volume via shared B2BGapOverlay (Viewer SoT)."""
         ren = getattr(self, "view_3d_renderer", None)
         widget = getattr(self, "view_3d_widget", None)
         if ren is None or self.volume_data is None:
             print("[B2B] 3D gap skipped: no renderer/volume")
             return
 
-        # Auto-enable 3D if user is reviewing B2B while render is OFF
         if not self.ensure_3d_volume_render_for_overlay(reason="b2b_gap"):
             print("[B2B] 3D gap skipped: could not enable 3D volume")
             return
 
-        self._clear_b2b_gap_actors()
-
-        sx, sy, sz = self._get_3d_world_spacing()
-        # VTK volume world = index * spacing (origin 0)
-        src_x = float(src_voxel[2]) * sx
-        src_y = float(src_voxel[1]) * sy
-        src_z = float(src_voxel[0]) * sz
-        dst_x = float(dst_voxel[2]) * sx
-        dst_y = float(dst_voxel[1]) * sy
-        dst_z = float(dst_voxel[0]) * sz
-        mid_x = 0.5 * (src_x + dst_x)
-        mid_y = 0.5 * (src_y + dst_y)
-        mid_z = 0.5 * (src_z + dst_z)
-
-        dx = dst_x - src_x
-        dy = dst_y - src_y
-        dz = dst_z - src_z
-        gap_len = float(np.sqrt(dx * dx + dy * dy + dz * dz))
-        if gap_len < 1e-9:
-            gap_len = 1e-9
-            dx, dy, dz = gap_len, 0.0, 0.0
-        ux, uy, uz = dx / gap_len, dy / gap_len, dz / gap_len
-
-        min_sp = max(1e-6, min(sx, sy, sz))
-        # Thin gap tube + modest arrow (markers are exact 1-voxel cubes)
-        tube_r = max(0.35, min_sp * 0.9)
-        arrow_h = max(min_sp * 2.5, tube_r * 4.0)
-        arrow_r = max(tube_r * 1.8, min_sp * 1.4)
-
-        src_z_i, src_y_i, src_x_i = (
-            int(src_voxel[0]), int(src_voxel[1]), int(src_voxel[2])
-        )
-        dst_z_i, dst_y_i, dst_x_i = (
-            int(dst_voxel[0]), int(dst_voxel[1]), int(dst_voxel[2])
-        )
-        col_src = (0.0, 0.92, 1.0)   # cyan
-        col_dst = (1.0, 0.88, 0.15)  # yellow
-
-        # ── 0) Local object surfaces at SRC/DST (context: on bump surface) ─
-        self._b2b_add_local_object_surface(
-            ren, src_z_i, src_y_i, src_x_i, sx, sy, sz, col_src, pad=12
-        )
-        self._b2b_add_local_object_surface(
-            ren, dst_z_i, dst_y_i, dst_x_i, sx, sy, sz, col_dst, pad=12
-        )
-
-        # ── 1) Directional gradient tube (cyan SRC → yellow DST) ──────────
-        pts = vtk.vtkPoints()
-        pts.InsertNextPoint(src_x, src_y, src_z)
-        pts.InsertNextPoint(dst_x, dst_y, dst_z)
-        lines = vtk.vtkCellArray()
-        lines.InsertNextCell(2)
-        lines.InsertCellPoint(0)
-        lines.InsertCellPoint(1)
-        colors = vtk.vtkUnsignedCharArray()
-        colors.SetNumberOfComponents(3)
-        colors.SetName("Colors")
-        colors.InsertNextTuple3(0, 230, 255)    # SRC cyan
-        colors.InsertNextTuple3(255, 220, 40)   # DST yellow
-        poly = vtk.vtkPolyData()
-        poly.SetPoints(pts)
-        poly.SetLines(lines)
-        poly.GetPointData().SetScalars(colors)
-
-        tube = vtk.vtkTubeFilter()
-        tube.SetInputData(poly)
-        tube.SetRadius(tube_r)
-        tube.SetNumberOfSides(16)
-        tube.CappingOn()
-        tube.SetVaryRadiusToVaryRadiusOff()
-        tube.Update()
-
-        line_mapper = vtk.vtkPolyDataMapper()
-        line_mapper.SetInputConnection(tube.GetOutputPort())
-        line_mapper.SetScalarModeToUsePointData()
-        line_mapper.ScalarVisibilityOn()
-        line_actor = vtk.vtkActor()
-        line_actor.SetMapper(line_mapper)
-        line_actor.GetProperty().SetOpacity(1.0)
-        line_actor.GetProperty().SetLighting(False)
-        line_actor.GetProperty().SetAmbient(1.0)
-        line_actor.GetProperty().SetDiffuse(0.0)
-        self._b2b_add_gap_actor(ren, line_actor)
-
-        # ── 2) Exact surface-voxel cells (1×1×1 wireframe cubes) ──────────
-        # These ARE the DLL boundary voxels on each object surface.
-        self._b2b_add_surface_voxel_marker(
-            ren, src_z_i, src_y_i, src_x_i, sx, sy, sz, col_src,
-            label_tag=f"SRC Z{src_z_i},Y{src_y_i},X{src_x_i}",
-        )
-        self._b2b_add_surface_voxel_marker(
-            ren, dst_z_i, dst_y_i, dst_x_i, sx, sy, sz, col_dst,
-            label_tag=f"DST Z{dst_z_i},Y{dst_y_i},X{dst_x_i}",
-        )
-
-        # ── 3) Arrow head at DST (direction Src→Dst) ─────────────────────
-        try:
-            cone = vtk.vtkConeSource()
-            cone.SetRadius(arrow_r)
-            cone.SetHeight(arrow_h)
-            cone.SetResolution(20)
-            cone.SetDirection(ux, uy, uz)
-            # Tip near DST sample; keep cone mostly on the gap segment
-            back = min(arrow_h * 0.55, gap_len * 0.35)
-            cone.SetCenter(
-                dst_x - ux * back,
-                dst_y - uy * back,
-                dst_z - uz * back,
-            )
-            cone.Update()
-            cone_mapper = vtk.vtkPolyDataMapper()
-            cone_mapper.SetInputConnection(cone.GetOutputPort())
-            cone_actor = vtk.vtkActor()
-            cone_actor.SetMapper(cone_mapper)
-            cone_actor.GetProperty().SetColor(1.0, 0.25, 0.12)
-            cone_actor.GetProperty().SetOpacity(1.0)
-            cone_actor.GetProperty().SetLighting(False)
-            cone_actor.GetProperty().SetAmbient(1.0)
-            cone_actor.GetProperty().SetDiffuse(0.0)
-            self._b2b_add_gap_actor(ren, cone_actor)
-        except Exception as _arr_e:
-            print(f"[B2B] DST arrow skipped: {_arr_e}")
-
-        # ── 5) Screen-space callout NEAR the gap (short leader, not top-of-view) ─
-        if label_text:
-            caption_ok = False
+        if hasattr(self, "_clear_mes_3d_highlight"):
             try:
-                # Two-line caption (distance + surface voxel coords) needs more height
-                box_w, box_h = 0.38, 0.11
-                # Project gap midpoint → place box a few % away (short leader line)
-                cap_x, cap_y = self._b2b_caption_viewport_pos(
-                    ren, mid_x, mid_y, mid_z, box_w=box_w, box_h=box_h
-                )
-
-                caption = vtk.vtkCaptionActor2D()
-                caption.SetCaption(str(label_text))
-                caption.SetAttachmentPoint(mid_x, mid_y, mid_z)
-                caption.BorderOn()
-                caption.LeaderOn()
-                # 2D leader tracks attachment while orbiting; stays short because
-                # box is next to the projected midpoint (not fixed top-left).
-                try:
-                    caption.ThreeDimensionalLeaderOff()
-                except Exception:
-                    pass
-                try:
-                    caption.SetPadding(3)
-                except Exception:
-                    pass
-
-                caption.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
-                caption.SetPosition(float(cap_x), float(cap_y))
-                caption.GetPosition2Coordinate().SetCoordinateSystemToNormalizedViewport()
-                caption.SetWidth(box_w)
-                caption.SetHeight(box_h)
-
-                cprop = caption.GetCaptionTextProperty()
-                cprop.SetFontSize(13)
-                cprop.SetBold(1)
-                cprop.SetColor(1.0, 1.0, 1.0)
-                cprop.SetBackgroundColor(0.05, 0.08, 0.12)
-                cprop.SetBackgroundOpacity(0.88)
-                cprop.ShadowOn()
-                cprop.SetJustificationToLeft()
-                cprop.SetVerticalJustificationToCentered()
-
-                caption.GetProperty().SetColor(1.0, 0.45, 0.25)
-                caption.GetProperty().SetLineWidth(2.0)
-                try:
-                    caption.GetAttachmentPointCoordinate().SetCoordinateSystemToWorld()
-                except Exception:
-                    pass
-
-                self._b2b_add_gap_actor(ren, caption, is_2d=True)
-                caption_ok = True
-                print(
-                    f"[B2B] caption viewport pos=({cap_x:.3f},{cap_y:.3f}) "
-                    f"attach=({mid_x:.1f},{mid_y:.1f},{mid_z:.1f})"
-                )
-            except Exception as _cap_e:
-                print(f"[B2B] CaptionActor2D failed ({_cap_e}); fallback billboard")
-
-            if not caption_ok:
-                # Fallback: short 3D leader offset ~few voxels beside the gap (not AABB corner)
-                try:
-                    # Offset perpendicular-ish to gap, short distance
-                    off = max(sphere_r * 6.0, min_sp * 12.0)
-                    # Prefer camera right direction if available; else +X world
-                    ox, oy, oz = off, 0.0, off * 0.35
-                    try:
-                        cam = ren.GetActiveCamera()
-                        if cam is not None:
-                            # Camera view-up × view-plane-normal ≈ camera right
-                            vpn = list(cam.GetViewPlaneNormal())
-                            vup = list(cam.GetViewUp())
-                            rx = vup[1] * vpn[2] - vup[2] * vpn[1]
-                            ry = vup[2] * vpn[0] - vup[0] * vpn[2]
-                            rz = vup[0] * vpn[1] - vup[1] * vpn[0]
-                            rl = float(np.sqrt(rx * rx + ry * ry + rz * rz)) or 1.0
-                            ox, oy, oz = off * rx / rl, off * ry / rl, off * rz / rl
-                    except Exception:
-                        pass
-                    label_x = mid_x + ox
-                    label_y = mid_y + oy
-                    label_z = mid_z + oz
-
-                    lead_pts = vtk.vtkPoints()
-                    lead_pts.InsertNextPoint(mid_x, mid_y, mid_z)
-                    lead_pts.InsertNextPoint(label_x, label_y, label_z)
-                    lead_lines = vtk.vtkCellArray()
-                    lead_lines.InsertNextCell(2)
-                    lead_lines.InsertCellPoint(0)
-                    lead_lines.InsertCellPoint(1)
-                    lead_pd = vtk.vtkPolyData()
-                    lead_pd.SetPoints(lead_pts)
-                    lead_pd.SetLines(lead_lines)
-                    lead_tube = vtk.vtkTubeFilter()
-                    lead_tube.SetInputData(lead_pd)
-                    lead_tube.SetRadius(max(0.3, tube_r * 0.4))
-                    lead_tube.SetNumberOfSides(8)
-                    lead_tube.Update()
-                    lead_map = vtk.vtkPolyDataMapper()
-                    lead_map.SetInputConnection(lead_tube.GetOutputPort())
-                    lead_act = vtk.vtkActor()
-                    lead_act.SetMapper(lead_map)
-                    lead_act.GetProperty().SetColor(1.0, 0.5, 0.25)
-                    lead_act.GetProperty().SetOpacity(0.85)
-                    lead_act.GetProperty().SetLighting(False)
-                    self._b2b_add_gap_actor(ren, lead_act)
-
-                    text_actor = vtk.vtkBillboardTextActor3D()
-                    text_actor.SetInput(str(label_text))
-                    text_actor.SetPosition(label_x, label_y, label_z)
-                    tp = text_actor.GetTextProperty()
-                    tp.SetFontSize(14)
-                    tp.SetColor(1.0, 1.0, 1.0)
-                    tp.BoldOn()
-                    tp.SetBackgroundColor(0.05, 0.08, 0.12)
-                    tp.SetBackgroundOpacity(0.85)
-                    self._b2b_add_gap_actor(ren, text_actor)
-                except Exception as _fb_e:
-                    print(f"[B2B] label fallback failed: {_fb_e}")
-
-        if widget is not None:
-            try:
-                ren.ResetCameraClippingRange()
-                widget.GetRenderWindow().Render()
+                self._clear_mes_3d_highlight(render=False, restore_context=False)
             except Exception:
                 pass
-        print(
-            f"[B2B] 3D gap drawn: {label_text}  "
-            f"src={src_voxel} dst={dst_voxel} spacing=({sx:.3f},{sy:.3f},{sz:.3f}) "
-            f"len={gap_len:.3f}"
+
+        ov = self._get_b2b_gap_overlay()
+        spacing = self._get_3d_world_spacing()
+        try:
+            R = float(self._volume_world_radius())
+        except Exception:
+            R = 100.0
+
+        def _dim():
+            if hasattr(self, "_set_mes_3d_context_dim"):
+                self._set_mes_3d_context_dim(True)
+
+        def _pivot():
+            if hasattr(self, "_sync_3d_orbit_pivot"):
+                self._sync_3d_orbit_pivot()
+
+        ok = ov.draw(
+            ren,
+            widget,
+            src_voxel,
+            dst_voxel,
+            spacing,
+            label_text=label_text,
+            labeled=getattr(self, "labeled_class1_data", None),
+            class1_binary=getattr(self, "class1_data", None),
+            on_dim_context=_dim,
+            volume_world_radius=R,
+            sync_orbit_pivot=_pivot,
+            frame_camera=True,
+            stats_idx=stats_idx,
         )
+        self._b2b_gap_actors = ov.actors
+        self._b2b_active_stats_idx = ov.active_stats_idx if ok else None
 
-    # ── MES object highlight on 3D Volume (bbox-cropped surface) ─────────
+    # ── MES object highlight on 3D Volume (shared MESHighlightOverlay) ───
 
-    def _clear_mes_3d_highlight(self, render=True):
-        """Remove MES selection surfaces from the 3D renderer."""
+    def _get_mes_highlight_overlay(self) -> MESHighlightOverlay:
+        ov = getattr(self, "_mes_highlight_overlay", None)
+        if ov is None:
+            ov = MESHighlightOverlay()
+            self._mes_highlight_overlay = ov
+        return ov
+
+    def _clear_mes_3d_highlight(self, render=True, restore_context=True):
+        """Remove MES selection surfaces from the 3D renderer (shared overlay)."""
         ren = getattr(self, "view_3d_renderer", None)
-        actors = getattr(self, "_mes_3d_highlight_actors", None) or []
-        if ren is not None:
-            for actor in actors:
+        widget = getattr(self, "view_3d_widget", None)
+        ov = self._get_mes_highlight_overlay()
+
+        def _restore():
+            if restore_context:
+                self._set_mes_3d_context_dim(False)
+
+        ov.clear(
+            ren,
+            widget,
+            render=render,
+            on_restore_context=_restore if restore_context else None,
+        )
+        self._mes_3d_highlight_actors = ov.actors
+        self._mes_3d_hl_cache_key = ov.cache_key
+
+    def _set_mes_3d_context_dim(self, dim):
+        """Dim global C1/C2 shells so the selected MES object pops on 3D."""
+        from inno3d.features.viewer.seg_mask_3d import set_mask_overlay_opacity
+
+        if not dim:
+            if hasattr(self, "update_overlay_visibility"):
                 try:
-                    ren.RemoveActor(actor)
+                    self.update_overlay_visibility("3d")
                 except Exception:
                     pass
-        self._mes_3d_highlight_actors = []
-        self._mes_3d_hl_cache_key = None
-        if render:
-            widget = getattr(self, "view_3d_widget", None)
-            if widget is not None and ren is not None:
-                try:
-                    widget.GetRenderWindow().Render()
-                except Exception:
-                    pass
+            return
+
+        try:
+            og = getattr(self, "view_3d_overlay_group", None)
+            base = (
+                float(og.opacity_slider.value()) / 100.0
+                if og is not None and hasattr(og, "opacity_slider")
+                else 0.35
+            )
+        except Exception:
+            base = 0.35
+        c1 = getattr(self, "c1_actor_3d", None)
+        c2 = getattr(self, "c2_actor_3d", None)
+        if c1 is not None:
+            set_mask_overlay_opacity(c1, max(0.04, base * 0.12))
+        if c2 is not None:
+            set_mask_overlay_opacity(c2, max(0.05, base * 0.18))
 
     def _mes_3d_bbox_for_labels(self, label_set):
-        """Union bbox of selected labels from object_stats (fast — no full-volume scan).
-
-        Returns (z0,z1,y0,y1,x0,x1) inclusive in labeled-volume indices, or None.
-        """
-        if not label_set or not getattr(self, "object_stats", None):
-            return None
-        _z_off = int(getattr(self, "_measurement_start_slice", 0) or 0)
-        z0 = y0 = x0 = 10 ** 9
-        z1 = y1 = x1 = -1
-        hit = False
-        for st in self.object_stats:
-            try:
-                lab = int(st.get("label", 0))
-            except (TypeError, ValueError):
-                continue
-            if lab not in label_set:
-                continue
-            try:
-                z0 = min(z0, int(st["z_min"]) + _z_off)
-                z1 = max(z1, int(st["z_max"]) + _z_off)
-                y0 = min(y0, int(st["y_min"]))
-                y1 = max(y1, int(st["y_max"]))
-                x0 = min(x0, int(st["x_min"]))
-                x1 = max(x1, int(st["x_max"]))
-                hit = True
-            except (KeyError, TypeError, ValueError):
-                continue
-        if not hit:
-            return None
-        return z0, z1, y0, y1, x0, x1
+        """Union bbox of selected labels — shared mes_mapping helper."""
+        return _shared_mes_bbox_for_labels(
+            getattr(self, "object_stats", None),
+            label_set,
+            z_offset=int(getattr(self, "_measurement_start_slice", 0) or 0),
+        )
 
     def _update_mes_3d_highlight(self):
-        """Show selected MES bump(s) on 3D volume as a cyan surface.
-
-        Optimized path:
-          · Only the **bbox crop** of labeled_class1 is contoured (not full volume)
-          · Rebuild skipped when label set + bbox unchanged
-          · vtkFlyingEdges3D (fallback MarchingCubes) on uint8 mask
-        """
+        """Show selected MES bump(s) on 3D via shared MESHighlightOverlay."""
         ren = getattr(self, "view_3d_renderer", None)
         widget = getattr(self, "view_3d_widget", None)
         labeled = getattr(self, "labeled_class1_data", None)
@@ -1689,170 +1293,29 @@ class StatsPanelMixin:
                 continue
             if lab > 0:
                 label_set.add(lab)
-
         if not label_set:
             self._clear_mes_3d_highlight(render=True)
             return
 
-        # Need 3D volume present for surface placement (auto-on if user picks MES)
         if not self.is_3d_volume_render_enabled() or getattr(self, "volume_actor", None) is None:
             if not self.ensure_3d_volume_render_for_overlay(reason="mes_pick"):
                 return
 
-        bbox = self._mes_3d_bbox_for_labels(label_set)
-        if bbox is None:
-            # No stats bbox (edge case) — skip heavy full-volume path
-            self._clear_mes_3d_highlight(render=True)
-            return
-
-        z0, z1, y0, y1, x0, x1 = bbox
-        Z, Y, X = labeled.shape
-        pad = 2
-        z0 = max(0, z0 - pad)
-        y0 = max(0, y0 - pad)
-        x0 = max(0, x0 - pad)
-        z1 = min(Z - 1, z1 + pad)
-        y1 = min(Y - 1, y1 + pad)
-        x1 = min(X - 1, x1 + pad)
-        if z1 < z0 or y1 < y0 or x1 < x0:
-            self._clear_mes_3d_highlight(render=True)
-            return
-
-        cache_key = (frozenset(label_set), z0, z1, y0, y1, x0, x1)
-        if (
-            cache_key == getattr(self, "_mes_3d_hl_cache_key", None)
-            and getattr(self, "_mes_3d_highlight_actors", None)
-        ):
-            # Already showing the same selection — just re-render
-            if widget is not None:
-                try:
-                    widget.GetRenderWindow().Render()
-                except Exception:
-                    pass
-            return
-
-        crop = labeled[z0 : z1 + 1, y0 : y1 + 1, x0 : x1 + 1]
-        if len(label_set) == 1:
-            lab0 = next(iter(label_set))
-            mask = (crop == lab0)
-        else:
-            mask = np.isin(crop, list(label_set))
-        if not np.any(mask):
-            self._clear_mes_3d_highlight(render=True)
-            return
-
-        # Binary uint8 for isosurface (0/1) — small crop only
-        mask_u8 = np.ascontiguousarray(mask.astype(np.uint8))
-
-        # Clear previous actors (no intermediate render)
-        self._clear_mes_3d_highlight(render=False)
-
-        sx, sy, sz = self._get_3d_world_spacing()
-        # VTK image: dims (x,y,z), Fortran order scalars, origin at crop corner
-        vtk_img = vtk.vtkImageData()
-        dz, dy, dx = mask_u8.shape
-        vtk_img.SetDimensions(dx, dy, dz)
-        vtk_img.SetSpacing(float(sx), float(sy), float(sz))
-        vtk_img.SetOrigin(float(x0) * sx, float(y0) * sy, float(z0) * sz)
-        # (z,y,x) → VTK (x,y,z) Fortran
-        flat = np.ascontiguousarray(np.transpose(mask_u8, (2, 1, 0)).ravel(order="F"))
-        vtk_arr = numpy_support.numpy_to_vtk(
-            flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
+        ov = self._get_mes_highlight_overlay()
+        ov.update(
+            ren,
+            widget,
+            labeled,
+            getattr(self, "object_stats", None),
+            self.selected_highlight_objects,
+            self._get_3d_world_spacing(),
+            z_offset=int(getattr(self, "_measurement_start_slice", 0) or 0),
+            highlight_color=getattr(self, "highlight_color", None),
+            on_dim_context=lambda: self._set_mes_3d_context_dim(True),
+            on_restore_context=lambda: self._set_mes_3d_context_dim(False),
         )
-        vtk_arr.SetNumberOfComponents(1)
-        vtk_img.GetPointData().SetScalars(vtk_arr)
-
-        # Isosurface at 0.5
-        try:
-            contour = vtk.vtkFlyingEdges3D()
-        except Exception:
-            contour = vtk.vtkMarchingCubes()
-        contour.SetInputData(vtk_img)
-        contour.SetValue(0, 0.5)
-        contour.ComputeNormalsOn()
-        try:
-            contour.ComputeScalarsOff()
-        except Exception:
-            pass
-
-        # Light smooth for nicer edges (cheap on small polydata)
-        smoother = vtk.vtkWindowedSincPolyDataFilter()
-        smoother.SetInputConnection(contour.GetOutputPort())
-        smoother.SetNumberOfIterations(8)
-        smoother.BoundarySmoothingOff()
-        smoother.FeatureEdgeSmoothingOff()
-        smoother.SetPassBand(0.1)
-        smoother.NonManifoldSmoothingOn()
-        smoother.NormalizeCoordinatesOn()
-        smoother.Update()
-
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(smoother.GetOutputPort())
-        mapper.ScalarVisibilityOff()
-        mapper.SetResolveCoincidentTopologyToPolygonOffset()
-
-        hl = self.highlight_color or [0.0, 1.0, 1.0]
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        prop = actor.GetProperty()
-        prop.SetColor(float(hl[0]), float(hl[1]), float(hl[2]))
-        prop.SetOpacity(0.42)
-        prop.SetSpecular(0.35)
-        prop.SetSpecularPower(20.0)
-        prop.SetAmbient(0.35)
-        prop.SetDiffuse(0.75)
-        prop.EdgeVisibilityOn()
-        prop.SetEdgeColor(1.0, 1.0, 1.0)
-        prop.SetLineWidth(1.0)
-
-        ren.AddActor(actor)
-        self._mes_3d_highlight_actors = [actor]
-        self._mes_3d_hl_cache_key = cache_key
-
-        # Centroid marker (one sphere) for quick depth cue
-        try:
-            # Prefer primary target centroid from first matching stat
-            cx = cy = cz = None
-            for st in self.object_stats or []:
-                try:
-                    lab = int(st.get("label", 0))
-                except (TypeError, ValueError):
-                    continue
-                if lab not in label_set:
-                    continue
-                _z_off = int(getattr(self, "_measurement_start_slice", 0) or 0)
-                cz = (float(st.get("centroid_z", 0)) + _z_off) * sz
-                cy = float(st.get("centroid_y", 0)) * sy
-                cx = float(st.get("centroid_x", 0)) * sx
-                break
-            if cx is not None:
-                min_sp = max(1e-6, min(sx, sy, sz))
-                sph = vtk.vtkSphereSource()
-                sph.SetCenter(cx, cy, cz)
-                sph.SetRadius(max(1.0, min_sp * 3.0))
-                sph.SetPhiResolution(12)
-                sph.SetThetaResolution(12)
-                sm = vtk.vtkPolyDataMapper()
-                sm.SetInputConnection(sph.GetOutputPort())
-                sa = vtk.vtkActor()
-                sa.SetMapper(sm)
-                sa.GetProperty().SetColor(1.0, 1.0, 0.2)
-                sa.GetProperty().SetOpacity(0.95)
-                sa.GetProperty().SetLighting(False)
-                ren.AddActor(sa)
-                self._mes_3d_highlight_actors.append(sa)
-        except Exception:
-            pass
-
-        try:
-            ren.ResetCameraClippingRange()
-        except Exception:
-            pass
-        if widget is not None:
-            try:
-                widget.GetRenderWindow().Render()
-            except Exception:
-                pass
+        self._mes_3d_highlight_actors = ov.actors
+        self._mes_3d_hl_cache_key = ov.cache_key
 
     def _on_b2b_row_clicked(self, row, col):
         """Click B2B row → draw/toggle 3D surface-voxel gap on Volume (not MPR).
@@ -1869,6 +1332,10 @@ class StatsPanelMixin:
 
         # Toggle OFF if the same gap is already shown
         active = getattr(self, "_b2b_active_stats_idx", None)
+        if active is None:
+            ov = getattr(self, "_b2b_gap_overlay", None)
+            if ov is not None:
+                active = ov.active_stats_idx
         if active is not None and int(active) == int(idx):
             self._clear_b2b_gap_actors()
             if hasattr(self, "b2b_info_label"):
@@ -1904,21 +1371,15 @@ class StatsPanelMixin:
             src_rc = f"R{r.get('Src_row', '?')}C{r.get('Src_col', '?')}"
             dst_rc = f"R{r.get('Dst_row', '?')}C{r.get('Dst_col', '?')}"
             layer = str(r.get("Layer", "") or "")
-            # Caption: grid + exact surface voxels (DLL boundary indices)
-            label = (
-                f"{layer}  SRC {src_rc}→DST {dst_rc} ({direction})  {eucl} µm\n"
-                f"surface voxels  "
-                f"SRC(Z,Y,X)=({src[0]},{src[1]},{src[2]})  "
-                f"DST(Z,Y,X)=({dst[0]},{dst[1]},{dst[2]})"
-            ).strip()
+            label = self._b2b_format_gap_label(
+                layer, eucl, src_rc, dst_rc, direction, src, dst
+            )
             try:
-                self._draw_b2b_gap_line(src, dst, label_text=label)
-                self._b2b_active_stats_idx = int(idx)
+                self._draw_b2b_gap_line(src, dst, label_text=label, stats_idx=int(idx))
                 if hasattr(self, "b2b_info_label"):
                     self.b2b_info_label.setText(
-                        f"3D gap ON · {layer} {src_rc}→{dst_rc} ({direction}) "
-                        f"{eucl}µm · wireframe cube = surface voxel · "
-                        f"click same row to hide"
+                        f"3D gap ON · SRC {src_rc} → DST {dst_rc} ({direction}) "
+                        f"{eucl}µm · cyan=SRC · amber=DST · click row again to hide"
                     )
             except Exception as e:
                 import traceback
@@ -1940,8 +1401,9 @@ class StatsPanelMixin:
             f"surface voxel (Z,Y,X)=({vz},{vy},{vx})"
         ).strip()
         try:
-            self._draw_b2b_gap_line((vz, vy, vx), (vz, vy, vx + 1), label_text=label)
-            self._b2b_active_stats_idx = int(idx)
+            self._draw_b2b_gap_line(
+                (vz, vy, vx), (vz, vy, vx + 1), label_text=label, stats_idx=int(idx)
+            )
             if hasattr(self, "b2b_info_label"):
                 self.b2b_info_label.setText(
                     f"3D gap ON · min-gap {eucl}µm @ ({vz},{vy},{vx}) · "
@@ -2145,66 +1607,683 @@ class StatsPanelMixin:
         return stats_idx
 
     def _label_at_stat_centroid(self, stat) -> int:
-        """Look up labeled_class1 id at MES object centroid (or bbox center)."""
-        labeled = getattr(self, "labeled_class1_data", None)
-        if labeled is None or stat is None:
-            return 0
-        import numpy as np
-
-        Z, Y, X = labeled.shape
-        _z_off = int(getattr(self, "_measurement_start_slice", 0) or 0)
-
-        def _at(z, y, x):
-            z = int(round(float(z))) + _z_off
-            y = int(round(float(y)))
-            x = int(round(float(x)))
-            if 0 <= z < Z and 0 <= y < Y and 0 <= x < X:
-                return int(labeled[z, y, x])
-            return 0
-
-        lab = _at(
-            stat.get("centroid_z", 0),
-            stat.get("centroid_y", 0),
-            stat.get("centroid_x", 0),
+        """Look up labeled_class1 id at MES object centroid (shared helper)."""
+        return _shared_label_at_stat_centroid(
+            getattr(self, "labeled_class1_data", None),
+            stat,
+            z_offset=int(getattr(self, "_measurement_start_slice", 0) or 0),
         )
-        if lab > 0:
-            return lab
-        lab = _at(
-            (float(stat.get("z_min", 0)) + float(stat.get("z_max", 0))) * 0.5,
-            (float(stat.get("y_min", 0)) + float(stat.get("y_max", 0))) * 0.5,
-            (float(stat.get("x_min", 0)) + float(stat.get("x_max", 0))) * 0.5,
-        )
-        if lab > 0:
-            return lab
-        # Neighborhood mode on centroid Z
-        z0 = int(round(float(stat.get("centroid_z", 0)))) + _z_off
-        y0 = int(round(float(stat.get("centroid_y", 0))))
-        x0 = int(round(float(stat.get("centroid_x", 0))))
-        if not (0 <= z0 < Z):
-            return 0
-        for rad in (2, 5, 10):
-            y1, y2 = max(0, y0 - rad), min(Y, y0 + rad + 1)
-            x1, x2 = max(0, x0 - rad), min(X, x0 + rad + 1)
-            patch = labeled[z0, y1:y2, x1:x2]
-            vals = patch[patch > 0]
-            if vals.size:
-                return int(np.bincount(vals.ravel()).argmax())
-        return 0
 
     def _navigate_to_object_stat(self, stat):
-        """Jump MPR sliders + 3D crosshair to object centroid (volume coordinates).
-
-        Online MES uses absolute Z (and sets ``_measurement_start_slice = 0`` after
-        restore). Python subset measurement stores local Z and relies on the offset.
-        """
+        """Jump MPR sliders + 3D crosshair to object centroid (shared coords)."""
         if stat is None or self.volume_data is None:
             return
-        _z_offset = int(getattr(self, "_measurement_start_slice", 0) or 0)
-        cz = int(round(float(stat.get("centroid_z", 0)))) + _z_offset
-        cy = int(round(float(stat.get("centroid_y", 0))))
-        cx = int(round(float(stat.get("centroid_x", 0))))
+        xyz = _shared_centroid_nav_xyz(
+            stat,
+            z_offset=int(getattr(self, "_measurement_start_slice", 0) or 0),
+        )
+        if xyz is None:
+            return
+        cx, cy, cz = xyz
         # updatePoint expects (X, Y, Z) and syncs MPR + 3D crosshair
         self.updatePoint(cx, cy, cz)
+
+    def _mpr_pick_volume_xyz(self, orientation, pos):
+        """Map Qt pos on an MPR pane → volume voxel (X, Y, Z).
+
+        In-plane axes follow crosshair place (``_pick_voxel``); the fixed axis
+        is taken from the pane's current slice so pick matches the image shown.
+        """
+        if self.volume_data is None or not hasattr(self, "_pick_voxel"):
+            return None
+        vol_z, vol_y, vol_x = self.volume_data.shape
+        x, y, z = self._pick_voxel(orientation, pos, mode="place")
+        slices = getattr(self, "current_slices", None) or {}
+        if orientation == "axial":
+            z = int(slices.get("axial", z))
+            # Slider Z is display index; labeled mask is storage order
+            if getattr(self, "reverse_z", False):
+                z = vol_z - 1 - z
+        elif orientation == "coronal":
+            y = int(slices.get("coronal", y))
+        else:
+            x = int(slices.get("sagittal", x))
+        x = max(0, min(int(x), vol_x - 1))
+        y = max(0, min(int(y), vol_y - 1))
+        z = max(0, min(int(z), vol_z - 1))
+        return x, y, z
+
+    def _label_at_volume_xyz(self, x, y, z, search_rad=3):
+        """Read labeled_class1 at (x,y,z); neighborhood fallback (shared)."""
+        return _shared_label_at_volume_xyz(
+            getattr(self, "labeled_class1_data", None),
+            x, y, z,
+            search_rad=search_rad,
+        )
+
+    def _visual_row_for_stats_index(self, stats_idx):
+        """Find current visual table row for a ``object_stats`` index (sort-safe)."""
+        table = getattr(self, "object_stats_table", None)
+        if table is None or stats_idx is None:
+            return None
+        for row in range(table.rowCount()):
+            if table.isRowHidden(row):
+                continue
+            item = table.item(row, 0)
+            if item is None:
+                continue
+            try:
+                if int(item.data(Qt.UserRole)) == int(stats_idx):
+                    return row
+            except (TypeError, ValueError):
+                if row == int(stats_idx):
+                    return row
+        return None
+
+    def _stats_index_for_label(self, label):
+        """Map labeled_class1 id → index in ``object_stats`` (shared)."""
+        return _shared_stats_index_for_label(
+            getattr(self, "object_stats", None),
+            label,
+            labeled=getattr(self, "labeled_class1_data", None),
+            z_offset=int(getattr(self, "_measurement_start_slice", 0) or 0),
+        )
+
+    def is_mes_multi_select(self):
+        """True when Multi toggle is on (many MES rows / MPR bumps)."""
+        # Prefer live checkbox state (source of truth for UI)
+        cb = getattr(self, "mes_multi_select_check", None)
+        if cb is not None:
+            try:
+                return bool(cb.isChecked())
+            except Exception:
+                pass
+        return bool(getattr(self, "_mes_multi_select", False))
+
+    def _set_mes_table_selection_mode(self, multi):
+        """Apply Single vs MultiSelection on main + frozen MES table.
+
+        Only changes mode when needed — re-applying can clear multi selection
+        on some Qt builds and must not run on every Ctrl+pick.
+        """
+        table = getattr(self, "object_stats_table", None)
+        if table is None:
+            return
+        # MultiSelection: plain click toggles rows (MES table → MPR/3D parity).
+        # ExtendedSelection needs Ctrl for multi — felt “broken” vs single.
+        mode = (
+            QAbstractItemView.MultiSelection
+            if multi
+            else QAbstractItemView.SingleSelection
+        )
+        if table.selectionMode() != mode:
+            table.setSelectionMode(mode)
+        frozen = getattr(table, "frozenTableView", None)
+        if frozen is not None:
+            try:
+                if frozen.selectionMode() != mode:
+                    frozen.setSelectionMode(mode)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _mes_row_is_selected(table, visual_row):
+        """True if visual row is in the current selection (row-based)."""
+        if table is None or visual_row is None or visual_row < 0:
+            return False
+        sm = table.selectionModel()
+        if sm is None:
+            return False
+        try:
+            return any(int(idx.row()) == int(visual_row) for idx in sm.selectedRows())
+        except Exception:
+            try:
+                model = table.model()
+                if model is None:
+                    return False
+                return sm.isSelected(model.index(int(visual_row), 0))
+            except Exception:
+                return False
+
+    def _on_mes_multi_select_toggled(self, checked):
+        """Filter-bar Multi toggle → table selection mode + MPR pick policy."""
+        self._mes_multi_select = bool(checked)
+        table = getattr(self, "object_stats_table", None)
+        if table is None:
+            return
+
+        multi = self._mes_multi_select
+        self._set_mes_table_selection_mode(multi)
+
+        # Leaving multi → keep only current row (parity with single mode)
+        if not multi:
+            current = table.currentRow()
+            table.blockSignals(True)
+            try:
+                table.clearSelection()
+                if current >= 0:
+                    self._select_mes_visual_row(current)
+            finally:
+                table.blockSignals(False)
+
+        # Rebuild cyan highlights from current table selection
+        self._sync_mes_highlights_from_table(navigate=True)
+
+        n = self._mes_selected_visual_row_count()
+        if hasattr(self, "set_stats_info"):
+            try:
+                if multi:
+                    self.set_stats_info(
+                        f"Multi ON · {n} selected · "
+                        f"table click / Ctrl+click MPR/3D toggle (sticky)"
+                    )
+                else:
+                    self.set_stats_info(
+                        "Multi OFF · sticky single · "
+                        "table click or Ctrl+click MPR/3D (kept after release)"
+                    )
+            except Exception:
+                pass
+
+    def _mes_selected_visual_rows(self):
+        """Sorted unique visual rows currently selected (Multi-safe)."""
+        table = getattr(self, "object_stats_table", None)
+        if table is None:
+            return []
+        sm = table.selectionModel()
+        try:
+            if sm is not None:
+                rows = sorted({int(idx.row()) for idx in sm.selectedRows()})
+                if rows:
+                    return rows
+        except Exception:
+            pass
+        # Fallback: cell indexes (still works for SingleSelection)
+        try:
+            return sorted({int(i.row()) for i in table.selectedIndexes()})
+        except Exception:
+            return []
+
+    def _mes_selected_visual_row_count(self):
+        return len(self._mes_selected_visual_rows())
+
+    def _sync_mes_highlights_from_table(self, navigate=True, navigate_stat=None):
+        """Rebuild ``selected_highlight_objects`` from MES table selection.
+
+        Same path for single + multi so Multi feels identical (just more labels).
+        Multi ON reference: every selected MES row → cyan on MPR + 3D surfaces.
+        """
+        table = getattr(self, "object_stats_table", None)
+        if table is None:
+            return
+
+        selected_visual = self._mes_selected_visual_rows()
+        self.selected_highlight_objects = []
+        target_stat = None
+        current_item = table.currentItem()
+        target_visual = current_item.row() if current_item is not None else -1
+
+        for visual_row in selected_visual:
+            stats_idx = self._stats_index_from_visual_row(visual_row)
+            if stats_idx is None:
+                continue
+            if stats_idx < 0 or stats_idx >= len(self.object_stats or []):
+                continue
+            stat = self.object_stats[stats_idx]
+            try:
+                label = int(stat.get("label", 0))
+            except (TypeError, ValueError):
+                label = 0
+            if label <= 0 and getattr(self, "labeled_class1_data", None) is not None:
+                try:
+                    lab = self._label_at_stat_centroid(stat)
+                    if lab > 0:
+                        label = lab
+                        stat["label"] = lab
+                except Exception:
+                    pass
+            if label > 0:
+                self.selected_highlight_objects.append((1, label))
+            # Prefer current row for camera jump; else first selected
+            if visual_row == target_visual or target_stat is None:
+                target_stat = stat
+
+        # Explicit navigate target (e.g. last MPR multi-pick)
+        if navigate_stat is not None:
+            target_stat = navigate_stat
+
+        if navigate and target_stat is not None:
+            self._navigate_to_object_stat(target_stat)
+
+        if self.volume_data is not None:
+            for ori in ["axial", "coronal", "sagittal"]:
+                try:
+                    self.render_slice(ori, preserve_camera=True)
+                except Exception:
+                    pass
+            try:
+                self._update_mes_3d_highlight()
+            except Exception:
+                pass
+        elif not self.selected_highlight_objects:
+            if hasattr(self, "_clear_mes_3d_highlight"):
+                try:
+                    self._clear_mes_3d_highlight(render=True)
+                except Exception:
+                    pass
+
+    def _mes_pick_is_duplicate(self, lab):
+        """True if same label was picked very recently (shared debounce)."""
+        deb = getattr(self, "_mes_pick_debounce_obj", None)
+        if deb is None:
+            deb = MesPickDebounce(0.12)
+            self._mes_pick_debounce_obj = deb
+        return deb.is_duplicate(lab)
+
+    def _3d_pick_volume_xyz(self, qt_pos):
+        """Ctrl+click on 3D volume → first labeled voxel along camera ray.
+
+        World space matches VTK image: origin (0,0,0), spacing (sx,sy,sz).
+        Returns (x, y, z) voxel indices or None.
+        """
+        labeled = getattr(self, "labeled_class1_data", None)
+        if labeled is None or self.volume_data is None:
+            return None
+        if not hasattr(self, "_df_clip_3d_qt_to_display") or not hasattr(
+            self, "_df_clip_3d_display_ray"
+        ):
+            return None
+        disp = self._df_clip_3d_qt_to_display(qt_pos)
+        if disp is None:
+            return None
+        ray = self._df_clip_3d_display_ray(disp[0], disp[1])
+        if ray is None:
+            return None
+        origin, direction = ray
+        sp = (
+            self.custom_spacing
+            if getattr(self, "custom_spacing", None) is not None
+            else getattr(self, "spacing", (1.0, 1.0, 1.0))
+        )
+        try:
+            sx, sy, sz = float(sp[0]), float(sp[1]), float(sp[2])
+        except (TypeError, ValueError, IndexError):
+            sx = sy = sz = 1.0
+        sx = sx if abs(sx) > 1e-12 else 1.0
+        sy = sy if abs(sy) > 1e-12 else 1.0
+        sz = sz if abs(sz) > 1e-12 else 1.0
+
+        Z, Y, X = labeled.shape
+        # March in world units; step ~ half min spacing for thin masks
+        step = max(min(sx, sy, sz) * 0.5, 0.25)
+        # Bounds in world (inclusive voxel centers span)
+        x_max_w = max((X - 1) * sx, 0.0)
+        y_max_w = max((Y - 1) * sy, 0.0)
+        z_max_w = max((Z - 1) * sz, 0.0)
+        # Rough ray length through AABB diagonal
+        diag = (x_max_w ** 2 + y_max_w ** 2 + z_max_w ** 2) ** 0.5 + step
+        n_steps = int(min(max(diag / step, 8), 4000))
+
+        ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
+        dx, dy, dz = float(direction[0]), float(direction[1]), float(direction[2])
+
+        best = None
+        for i in range(n_steps + 1):
+            t = i * step
+            wx = ox + t * dx
+            wy = oy + t * dy
+            wz = oz + t * dz
+            # Outside expanded AABB → keep going (ray may enter later)
+            if (
+                wx < -sx or wx > x_max_w + sx
+                or wy < -sy or wy > y_max_w + sy
+                or wz < -sz or wz > z_max_w + sz
+            ):
+                if best is not None:
+                    break
+                continue
+            ix = int(round(wx / sx))
+            iy = int(round(wy / sy))
+            iz = int(round(wz / sz))
+            if not (0 <= iz < Z and 0 <= iy < Y and 0 <= ix < X):
+                continue
+            lab = int(labeled[iz, iy, ix])
+            if lab > 0:
+                return ix, iy, iz
+        return None
+
+    def _apply_mes_pick_label(self, lab, xyz=None, source="mpr"):
+        """Apply sticky MES table + MPR/3D highlight for a labeled bump.
+
+        Rules:
+          · Multi OFF: replace with this one bump — kept after mouse release
+          · Multi ON: toggle this bump in/out of the multi set — all kept
+
+        Returns True if selection changed / hit a table row.
+        """
+        try:
+            lab = int(lab)
+        except (TypeError, ValueError):
+            return False
+        if lab <= 0:
+            return False
+
+        # Debounce dual Qt+VTK (and accidental double events)
+        if self._mes_pick_is_duplicate(lab):
+            return True
+
+        if not getattr(self, "object_stats", None):
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info("No MES objects — run measurement first")
+                except Exception:
+                    pass
+            return False
+
+        stats_idx = self._stats_index_for_label(lab)
+        xyz_s = ""
+        if xyz is not None:
+            try:
+                x, y, z = int(xyz[0]), int(xyz[1]), int(xyz[2])
+                xyz_s = f" @ X{x} Y{y} Z{z}"
+            except (TypeError, ValueError, IndexError):
+                xyz_s = ""
+
+        if stats_idx is None:
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info(
+                        f"Ctrl+click label={lab}{xyz_s}: not in MES table"
+                    )
+                except Exception:
+                    pass
+            print(f"[MES pick] label={lab} not in object_stats source={source}")
+            return False
+
+        visual_row = self._visual_row_for_stats_index(stats_idx)
+        if visual_row is None:
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info(
+                        f"MES object label={lab} is filtered/hidden in table"
+                    )
+                except Exception:
+                    pass
+            return False
+
+        if hasattr(self, "stats_tabs"):
+            try:
+                self.stats_tabs.setCurrentIndex(0)
+            except Exception:
+                pass
+
+        multi = self.is_mes_multi_select()
+        table = self.object_stats_table
+        st = self.object_stats[stats_idx]
+        bump = st.get("bump_id", st.get("Bump ID", lab))
+
+        # Never clear on mouse-up — sticky both Multi ON and OFF
+        self._mes_ctrl_pick_active = False
+        self._mes_ctrl_pick_armed = False
+        self._mes_selection_lock = False
+
+        model = table.model()
+        sm = table.selectionModel()
+        if model is None or sm is None:
+            return False
+        left = model.index(int(visual_row), 0)
+        right = model.index(int(visual_row), max(0, table.columnCount() - 1))
+        if not left.isValid():
+            return False
+        sel = QItemSelection(left, right)
+
+        # Match MES table Multi ON: MultiSelection row toggle accumulates
+        # cyan highlights (see multi-on reference: many rows + many MPR/3D).
+        # Critical: never call setCurrentCell in multi mode — Qt treats that as
+        # ClearAndSelect and wipes the multi set down to one row.
+        table.blockSignals(True)
+        try:
+            if multi:
+                self._set_mes_table_selection_mode(True)
+                already = self._mes_row_is_selected(table, visual_row)
+                sm.select(
+                    sel,
+                    QItemSelectionModel.Toggle | QItemSelectionModel.Rows,
+                )
+                # Pin current without changing selection set (NoUpdate)
+                sm.setCurrentIndex(left, QItemSelectionModel.NoUpdate)
+                try:
+                    # scroll only — do not setCurrentCell (clears multi)
+                    table.scrollTo(left, QAbstractItemView.PositionAtCenter)
+                except Exception:
+                    pass
+                action = "removed" if already else "added"
+            else:
+                # Single sticky: replace selection (same as table click)
+                self._set_mes_table_selection_mode(False)
+                sm.select(
+                    sel,
+                    QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                )
+                sm.setCurrentIndex(left, QItemSelectionModel.NoUpdate)
+                try:
+                    table.setCurrentCell(int(visual_row), 0)
+                except Exception:
+                    pass
+                try:
+                    table.scrollTo(left, QAbstractItemView.PositionAtCenter)
+                except Exception:
+                    pass
+                action = "selected"
+        finally:
+            table.blockSignals(False)
+
+        self._repaint_mes_table(table)
+        # Rebuild multi cyan set from full table selection (parity MES→MPR)
+        self._sync_mes_highlights_from_table(
+            navigate=True,
+            navigate_stat=st if action != "removed" else None,
+        )
+
+        n = self._mes_selected_visual_row_count()
+        if hasattr(self, "set_stats_info"):
+            try:
+                src = str(source or "pick").upper()
+                if multi:
+                    self.set_stats_info(
+                        f"Multi {action} Bump {bump}  label={lab}"
+                        f"{xyz_s}  · {n} selected (sticky · {src})"
+                    )
+                else:
+                    self.set_stats_info(
+                        f"{src} pick → MES #{stats_idx + 1}  Bump {bump}  "
+                        f"label={lab}{xyz_s}  (sticky)"
+                    )
+            except Exception:
+                pass
+        print(
+            f"[MES pick] source={source} multi={multi} {action} "
+            f"stats_idx={stats_idx} visual_row={visual_row} label={lab} "
+            f"bump={bump} xyz={xyz} n={n} sticky"
+        )
+        return True
+
+    def select_mes_object_from_mpr(self, orientation, pos):
+        """Ctrl+click on MPR → MES row + highlight (sticky both ways).
+
+        Rules (synced with table click):
+          · Multi OFF: replace selection with this one bump — **kept after release**
+          · Multi ON: toggle this bump in/out of the multi set — **all kept**
+
+        Returns True if a MES object was hit, False on miss / no data.
+        """
+        if self.volume_data is None:
+            return False
+        if not getattr(self, "object_stats", None):
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info("No MES objects — run measurement first")
+                except Exception:
+                    pass
+            return False
+        if getattr(self, "labeled_class1_data", None) is None:
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info("No labeled mask — cannot pick MES from MPR")
+                except Exception:
+                    pass
+            return False
+
+        xyz = self._mpr_pick_volume_xyz(orientation, pos)
+        if xyz is None:
+            return False
+        x, y, z = xyz
+        lab = self._label_at_volume_xyz(x, y, z)
+        if lab <= 0:
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info(
+                        f"Ctrl+click @ X{x} Y{y} Z{z}: no bump label"
+                    )
+                except Exception:
+                    pass
+            print(f"[MES pick] MPR miss at ({x},{y},{z})")
+            return False
+        return self._apply_mes_pick_label(lab, xyz=(x, y, z), source="mpr")
+
+    def select_mes_object_from_3d(self, qt_pos):
+        """Ctrl+click on 3D volume → MES row + highlight (same sticky rules as MPR)."""
+        if self.volume_data is None:
+            return False
+        if not getattr(self, "object_stats", None):
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info("No MES objects — run measurement first")
+                except Exception:
+                    pass
+            return False
+        if getattr(self, "labeled_class1_data", None) is None:
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info("No labeled mask — cannot pick MES from 3D")
+                except Exception:
+                    pass
+            return False
+
+        xyz = self._3d_pick_volume_xyz(qt_pos)
+        if xyz is None:
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info("Ctrl+click 3D: no bump along ray")
+                except Exception:
+                    pass
+            print("[MES pick] 3D ray miss")
+            return False
+        x, y, z = xyz
+        lab = self._label_at_volume_xyz(x, y, z)
+        if lab <= 0:
+            if hasattr(self, "set_stats_info"):
+                try:
+                    self.set_stats_info(
+                        f"Ctrl+click 3D @ X{x} Y{y} Z{z}: no bump label"
+                    )
+                except Exception:
+                    pass
+            return False
+        return self._apply_mes_pick_label(lab, xyz=(x, y, z), source="3d")
+
+    def release_mes_ctrl_pick(self):
+        """Mouse-up after Ctrl+pick — selection is always sticky (no clear).
+
+        Kept for call-site compatibility; only clears arm flags.
+        """
+        self._mes_ctrl_pick_armed = False
+        self._mes_ctrl_pick_active = False
+        self._mes_selection_lock = False
+
+    def _select_mes_visual_row(self, visual_row):
+        """Select one MES table row so both main + frozen panes show highlight."""
+        table = getattr(self, "object_stats_table", None)
+        if table is None or visual_row is None or visual_row < 0:
+            return
+        if visual_row >= table.rowCount():
+            return
+
+        model = table.model()
+        sm = table.selectionModel()
+        if model is None or sm is None:
+            return
+
+        ncols = max(1, table.columnCount())
+        left = model.index(int(visual_row), 0)
+        right = model.index(int(visual_row), ncols - 1)
+        if not left.isValid():
+            return
+
+        table.setFocus(Qt.OtherFocusReason)
+        sel = QItemSelection(left, right)
+        sm.select(
+            sel,
+            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+        )
+        table.setCurrentIndex(left)
+        try:
+            table.setCurrentCell(int(visual_row), 0)
+        except Exception:
+            pass
+        table.scrollTo(left, QAbstractItemView.PositionAtCenter)
+        self._repaint_mes_table(table)
+
+    @staticmethod
+    def _repaint_mes_table(table):
+        if table is None:
+            return
+        try:
+            table.viewport().update()
+            frozen = getattr(table, "frozenTableView", None)
+            if frozen is not None:
+                frozen.viewport().update()
+        except Exception:
+            pass
+
+    def _apply_mes_selection_from_stats_idx(self, stats_idx):
+        """Set sticky highlight + navigate — same end state as clicking a MES row."""
+        if stats_idx is None or not getattr(self, "object_stats", None):
+            return
+        try:
+            stats_idx = int(stats_idx)
+        except (TypeError, ValueError):
+            return
+        if stats_idx < 0 or stats_idx >= len(self.object_stats):
+            return
+
+        stat = self.object_stats[stats_idx]
+        try:
+            label = int(stat.get("label", 0))
+        except (TypeError, ValueError):
+            label = 0
+        if label <= 0 and getattr(self, "labeled_class1_data", None) is not None:
+            try:
+                label = self._label_at_stat_centroid(stat)
+                if label > 0:
+                    stat["label"] = label
+            except Exception:
+                pass
+
+        # Highlight for current pick (MES row stays; Ctrl+pick clears on release)
+        self.selected_highlight_objects = [(1, label)] if label > 0 else []
+        self._navigate_to_object_stat(stat)
+
+        if self.volume_data is not None:
+            for ori in ["axial", "coronal", "sagittal"]:
+                try:
+                    self.render_slice(ori, preserve_camera=True)
+                except Exception:
+                    pass
+            try:
+                self._update_mes_3d_highlight()
+            except Exception:
+                pass
 
     # ── Excel Filter Support ──────────────────────────
     def _apply_excel_filters(self, col_index):
@@ -2225,59 +2304,26 @@ class StatsPanelMixin:
             table.refresh_frozen()
             
     def on_object_selection_changed(self):
-        """Handle MES table selection → highlight + navigate MPR/3D to that object."""
-        selected_visual = sorted(
-            set(index.row() for index in self.object_stats_table.selectedIndexes())
-        )
+        """Handle MES table selection → highlight + navigate MPR/3D.
 
-        self.selected_highlight_objects = []
-        target_stat = None
+        Sticky policy (same both directions):
+          · Multi OFF: one row → one cyan highlight on MPR/3D (kept until change)
+          · Multi ON: all selected rows → multi highlight set (kept until toggle/Clear)
+        """
+        selected_visual = self._mes_selected_visual_rows()
 
-        # Prefer the current item's row for navigation (matches user click)
-        current_item = self.object_stats_table.currentItem()
-        target_visual = current_item.row() if current_item is not None else -1
-
-        for visual_row in selected_visual:
-            stats_idx = self._stats_index_from_visual_row(visual_row)
-            if stats_idx is None:
-                continue
-            stat = self.object_stats[stats_idx]
-            # All measured bumps are Class-1 labels
-            try:
-                label = int(stat.get("label", 0))
-            except (TypeError, ValueError):
-                label = 0
-            # Batch-replay fallback: resolve label from labeled mask at centroid
-            if label <= 0 and getattr(self, "labeled_class1_data", None) is not None:
-                try:
-                    lab = self._label_at_stat_centroid(stat)
-                    if lab > 0:
-                        label = lab
-                        stat["label"] = lab
-                except Exception:
-                    pass
-            if label > 0:
-                self.selected_highlight_objects.append((1, label))
-            if visual_row == target_visual or target_stat is None:
-                target_stat = stat
-
-        if target_stat is not None:
-            self._navigate_to_object_stat(target_stat)
-        elif self.volume_data is not None:
-            # Clear-only path: refresh highlights off current slices + 3D
-            for ori in ["axial", "coronal", "sagittal"]:
-                self.render_slice(ori, preserve_camera=True)
-            self._update_mes_3d_highlight()
+        # During Ctrl+pick hold (single mode), ignore empty flicker from focus steal
+        if not selected_visual and getattr(self, "_mes_selection_lock", False):
             return
 
-        # Re-render MPR highlight overlay + 3D surface for selected labels
-        if self.volume_data is not None:
-            for ori in ["axial", "coronal", "sagittal"]:
-                self.render_slice(ori, preserve_camera=True)
-            self._update_mes_3d_highlight()
+        self._sync_mes_highlights_from_table(navigate=True)
     
     def clear_object_selection(self):
         """Clear MES selection/highlights and B2B 3D gap overlay."""
+        self._mes_selection_lock = False
+        self._mes_ctrl_pick_active = False
+        self._mes_sticky_stats_idx = None
+        self._mes_sticky_visual_row = None
         self.object_stats_table.blockSignals(True)
         self.object_stats_table.clearSelection()
         self.object_stats_table.blockSignals(False)

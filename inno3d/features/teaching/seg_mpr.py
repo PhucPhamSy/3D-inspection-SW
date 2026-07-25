@@ -106,6 +106,15 @@ class SegmentationMPRMixin:
                         widget.unsetCursor()
 
             elif event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                # Ctrl+LMB → sticky multi MES pick (shared with Viewer Multi ON)
+                if event.modifiers() & Qt.ControlModifier:
+                    if hasattr(self, "select_mes_object_from_mpr"):
+                        try:
+                            self.select_mes_object_from_mpr(orientation, event.pos())
+                        except Exception as e:
+                            print(f"[MES pick] Teaching Ctrl+click failed: {e}")
+                        return True
+
                 if self.crosshair_enabled:
                     ch_hit = self._get_crosshair_hit(event.pos(), orientation)
                     if ch_hit is None:
@@ -243,6 +252,57 @@ class SegmentationMPRMixin:
                 self.update_plane_view(ori, preserve_camera=True)
             elif self.crosshair_enabled:
                 self.update_2d_crosshair(ori)
+
+        # RGB axes on Teaching 3D volume (Viewer parity)
+        self.update_3d_crosshair()
+
+    def update_3d_crosshair(self, render=True):
+        """Draw RGB crosshair axes in the Teaching 3D Volume pane.
+
+        Mirrors Viewer ``CrosshairMixin.update_3d_crosshair`` via shared
+        ``Crosshair3DOverlay``. No-op when 3D view is off or volume missing.
+        Teaching MPR is axis-aligned (no oblique R).
+        """
+        if not getattr(self, "_3d_view_active", False):
+            return
+        ren = getattr(self, "_3d_renderer", None)
+        widget = getattr(self, "_3d_vtk_widget", None)
+        if ren is None or widget is None or self.volume_data is None:
+            return
+
+        if not hasattr(self, "_crosshair_3d_overlay") or self._crosshair_3d_overlay is None:
+            from inno3d.features.shared.crosshair_3d import Crosshair3DOverlay
+            self._crosshair_3d_overlay = Crosshair3DOverlay()
+
+        # Prefer live 3D world spacing (synced from Viewer when available)
+        if hasattr(self, "_get_3d_world_spacing"):
+            try:
+                sp = self._get_3d_world_spacing()
+            except Exception:
+                sp = None
+        else:
+            sp = None
+        if sp is None:
+            sp = getattr(self, "custom_spacing", None) or getattr(
+                self, "spacing", (1.0, 1.0, 1.0)
+            )
+        spx, spy, spz = float(sp[0]), float(sp[1]), float(sp[2])
+
+        pos = getattr(self, "crosshair_position", None)
+        enabled = bool(getattr(self, "crosshair_enabled", False))
+        try:
+            self._crosshair_3d_overlay.update(
+                ren,
+                widget,
+                enabled,
+                pos,
+                self.volume_data.shape,
+                (spx, spy, spz),
+                R=None,  # Teaching: axis-aligned
+                render=bool(render),
+            )
+        except Exception as e:
+            print(f"[TEACHING 3D] crosshair update skipped: {e}")
 
     def _crosshair_display_geometry(self, orientation):
         """Project crosshair center into VTK display pixels (axis-aligned)."""
@@ -423,6 +483,51 @@ class SegmentationMPRMixin:
 
         widget.GetRenderWindow().Render()
 
+    def _mpr_pick_volume_xyz(self, orientation, pos):
+        """Map Qt pos on Teaching MPR pane → volume voxel (X, Y, Z).
+
+        Matches crosshair place axes; fixed axis from current slice/crosshair.
+        Used by Ctrl+click MES pick (shared label path).
+        """
+        if self.volume_data is None:
+            return None
+        try:
+            widget = getattr(self, f"{orientation}_widget")
+            renderer = getattr(self, f"{orientation}_renderer")
+            x, y = pos.x(), pos.y()
+            size = widget.GetRenderWindow().GetSize()
+            vtk_y = size[1] - y
+            picker = vtk.vtkWorldPointPicker()
+            picker.Pick(x, vtk_y, 0, renderer)
+            world_pos = picker.GetPickPosition()
+
+            vol_z, vol_y, vol_x = self.volume_data.shape
+            ch = list(getattr(self, "crosshair_position", [0, 0, 0]) or [0, 0, 0])
+            slices = getattr(self, "current_slices", None) or {}
+
+            if orientation == "axial":
+                px = int(round(world_pos[0]))
+                py = int(round(world_pos[1]))
+                pz = int(slices.get("axial", ch[2] if len(ch) > 2 else 0))
+                if getattr(self, "reverse_z", False):
+                    pz = vol_z - 1 - pz
+            elif orientation == "coronal":
+                px = int(round(world_pos[0]))
+                pz = (vol_z - 1) - int(round(world_pos[1]))
+                py = int(slices.get("coronal", ch[1] if len(ch) > 1 else 0))
+            else:  # sagittal
+                pz = int(round(world_pos[0]))
+                py = int(round(world_pos[1]))
+                px = int(slices.get("sagittal", ch[0] if len(ch) > 0 else 0))
+
+            px = max(0, min(int(px), vol_x - 1))
+            py = max(0, min(int(py), vol_y - 1))
+            pz = max(0, min(int(pz), vol_z - 1))
+            return px, py, pz
+        except Exception as e:
+            print(f"[MES pick] Teaching _mpr_pick_volume_xyz failed: {e}")
+            return None
+
     def handle_crosshair_click(self, orientation, pos, mode='center'):
         """Dragonfly grab modes: center / h / v (same as 3D Viewer)."""
         try:
@@ -476,6 +581,8 @@ class SegmentationMPRMixin:
         if self.volume_data is not None:
             for orientation in ['axial', 'coronal', 'sagittal']:
                 self.update_plane_view(orientation, preserve_camera=True)
+            # Show/hide RGB axes on Teaching 3D volume
+            self.update_3d_crosshair()
 
     def on_crosshair_slider_changed(self, axis_idx, value):
         if self.volume_data is None:

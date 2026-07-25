@@ -296,11 +296,8 @@ class MprNavMixin:
 
     def _mpr_pan_end(self, orientation):
         self._mpr_pan = None
-        # Restore hover cursor
-        if self.crosshair_enabled:
-            self._set_mpr_cursor(orientation, Qt.ArrowCursor)
-        else:
-            self._set_mpr_cursor(orientation, None)
+        # Back to pixel-probe cross (hand only while pan drag is active)
+        self._set_mpr_cursor(orientation, Qt.CrossCursor)
 
 
     def _mpr_pan_move(self, orientation, pos):
