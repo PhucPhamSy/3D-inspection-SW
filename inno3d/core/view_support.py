@@ -1135,13 +1135,22 @@ class LoadVolumeThread(QThread):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(object, object)
     
-    def __init__(self, file_path, downsample_factor=1, raw_shape=None, raw_dtype=None, raw_offset=0):
+    def __init__(
+        self,
+        file_path,
+        downsample_factor=1,
+        raw_shape=None,
+        raw_dtype=None,
+        raw_offset=0,
+        use_large_volume_engine=False,
+    ):
         super().__init__()
         self.file_path = file_path
         self.downsample_factor = downsample_factor
         self.raw_shape = raw_shape
         self.raw_dtype = raw_dtype
         self.raw_offset = raw_offset
+        self.use_large_volume_engine = bool(use_large_volume_engine)
         
     def run(self):
         try:
@@ -1168,6 +1177,32 @@ class LoadVolumeThread(QThread):
                 total_bytes = expected_size * dtype.itemsize
                 import time
                 t0 = time.perf_counter()
+
+                # large_volume_engine: open VolumeStore (memmap) — no 15 GB RAM copy
+                if self.use_large_volume_engine:
+                    from inno3d.core.volume_store import (
+                        large_volume_byte_threshold,
+                        open_raw_volume_store,
+                    )
+                    if total_bytes >= large_volume_byte_threshold() or self.use_large_volume_engine:
+                        self.progress.emit(
+                            10,
+                            f"Opening RAW via VolumeStore ({total_bytes / (1024**3):.1f} GB, no full copy)...",
+                        )
+                        store = open_raw_volume_store(
+                            path,
+                            tuple(self.raw_shape),
+                            dtype,
+                            offset=self.raw_offset,
+                            start_pyramid=True,
+                        )
+                        elapsed = time.perf_counter() - t0
+                        self.progress.emit(
+                            100,
+                            f"VolumeStore ready {store.shape} in {elapsed:.1f}s (out-of-core)",
+                        )
+                        self.finished.emit(store, None)
+                        return
                 
                 # Memory-mapped I/O: near-instant "loading" on 128GB RAM systems.
                 # The OS maps the file directly into virtual memory — no sequential 

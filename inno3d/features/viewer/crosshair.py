@@ -112,6 +112,8 @@ class CrosshairMixin:
             return
         x, y, z = self.crosshair_position
         self.updatePoint(x, y, z)
+        if hasattr(self, "mark_mpr_interaction_end"):
+            self.mark_mpr_interaction_end()
 
 
     def _crosshair_drag_update(self, orientation, pos, mode="center"):
@@ -122,6 +124,8 @@ class CrosshairMixin:
         updatePoint already avoids full rebuild when only the hair moves
         on an unchanged slice.
         """
+        if hasattr(self, "mark_mpr_interaction_start"):
+            self.mark_mpr_interaction_start()
         newX, newY, newZ = self._pick_voxel(orientation, pos, mode=mode)
         self.updatePoint(newX, newY, newZ)
 
@@ -301,6 +305,12 @@ class CrosshairMixin:
             and self.current_slices.get('axial') == newZ
         ):
             return
+
+        # Progressive MPR: treat continuous updatePoint as interaction
+        if hasattr(self, "mark_mpr_interaction_start") and getattr(
+            self, "_is_dragging_crosshair", False
+        ):
+            self.mark_mpr_interaction_start()
 
         self.crosshair_position = [newX, newY, newZ]
 

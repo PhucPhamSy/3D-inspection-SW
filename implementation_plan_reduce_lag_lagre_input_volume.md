@@ -1,5 +1,10 @@
 # Performance Optimization for Large Volumes (15GB+)
 
+> [!IMPORTANT]
+> This document is the **incremental optimization path** (slice copies, render throttling, selective 3D mitigations).
+> For the **architectural path** toward Dragonfly-like large-volume behavior (out-of-core brick cache + pyramid + progressive MPR/3D), use:
+> `docs/dragonfly_volume_engine_plan.md`.
+
 ## Problem Analysis
 
 Khi load volume ~15GB (ví dụ uint16, ~2700×2700×2700), mọi thao tác (click mapping → ảnh, kéo crosshair, slider) đều giật lag, dù cấu hình máy rất mạnh (Xeon W7-3465X, 512GB RAM, RTX 5090).

@@ -4,6 +4,7 @@ Contains:
   - ``render_slice`` — reslice + VTK actor update for one MPR pane
   - ``add_ruler_overlay`` — physical-unit ruler lines
   - ``reset_view`` — fit camera to slice
+  - Progressive MPR helpers (generation ID, preview mip, idle refine)
 
 Layer: features/viewer (imports Qt, VTK — not for domain/infra use).
 """
@@ -12,8 +13,9 @@ from __future__ import annotations
 import numpy as np
 import vtk
 from vtk.util import numpy_support
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 
+from inno3d.core.perf_timing import perf_phase
 from inno3d.features.shared.mes_mpr_highlight import (
     build_mes_selection_highlight_rgb,
     labeled_slice_for_orientation,
@@ -27,21 +29,160 @@ class MprRenderMixin:
     Do not instantiate directly.
     """
 
+    # ── Progressive MPR (large_volume_engine) ─────────────────────────────
+
+    def _mpr_lve_active(self) -> bool:
+        from inno3d.core.volume_store import large_volume_engine_enabled
+
+        return (
+            large_volume_engine_enabled(self)
+            and getattr(self, "volume_store", None) is not None
+        )
+
+    def _mpr_is_interacting(self) -> bool:
+        return bool(
+            getattr(self, "_mpr_interacting", False)
+            or getattr(self, "_is_dragging_crosshair", False)
+        )
+
+    def _mpr_preview_level(self) -> int:
+        """Coarse mip while dragging; level-0 when idle / refine."""
+        if not self._mpr_is_interacting():
+            return 0
+        # Prefer level 2 if available, else 1, else 0
+        store = getattr(self, "volume_store", None)
+        if store is None:
+            return 0
+        for cand in (2, 1):
+            if store._level_available(cand) or cand == 1:
+                # level 1 always available via stride fallback on memmap/dense
+                return cand
+        return 0
+
+    def _bump_mpr_generation(self, orientation: str) -> int:
+        gens = getattr(self, "_mpr_gen", None)
+        if gens is None:
+            self._mpr_gen = {"axial": 0, "coronal": 0, "sagittal": 0}
+            gens = self._mpr_gen
+        gens[orientation] = int(gens.get(orientation, 0)) + 1
+        return gens[orientation]
+
+    def _schedule_mpr_idle_refine(self, orientation: str, gen: int) -> None:
+        """After idle, re-render level-0 if generation is still current."""
+        if not self._mpr_lve_active():
+            return
+        timers = getattr(self, "_mpr_refine_timers", None)
+        if timers is None:
+            self._mpr_refine_timers = {}
+            timers = self._mpr_refine_timers
+        old = timers.get(orientation)
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(100)  # 80–120 ms idle window
+
+        def _refine():
+            if not self._mpr_lve_active():
+                return
+            if self._mpr_is_interacting():
+                # Still interacting — reschedule
+                self._schedule_mpr_idle_refine(orientation, gen)
+                return
+            current = getattr(self, "_mpr_gen", {}).get(orientation, -1)
+            if current != gen:
+                return  # stale
+            # Force level-0 refine
+            self._mpr_refine_level = getattr(self, "_mpr_refine_level", {})
+            self._mpr_refine_level[orientation] = 0
+            self.render_slice(orientation, preserve_camera=True, _mpr_force_level=0)
+
+        timer.timeout.connect(_refine)
+        timers[orientation] = timer
+        timer.start()
+
+    def mark_mpr_interaction_start(self) -> None:
+        self._mpr_interacting = True
+
+    def mark_mpr_interaction_end(self) -> None:
+        self._mpr_interacting = False
+        if not self._mpr_lve_active():
+            return
+        for ori in ("axial", "coronal", "sagittal"):
+            gen = getattr(self, "_mpr_gen", {}).get(ori, 0)
+            self._schedule_mpr_idle_refine(ori, gen)
+
+    def _extract_mpr_slice_from_store(self, orientation, slice_idx, level: int):
+        """Level-aware slice matching current render_slice orientation semantics."""
+        from inno3d.core.volume_store import upsample_slice_nearest
+        from inno3d.services.volume_pyramid import level_downsample_factor
+
+        store = self.volume_store
+        z, y, x = store.shape
+        factor = level_downsample_factor(level)
+
+        if orientation == "axial":
+            actual_z = slice_idx
+            if self.reverse_z:
+                actual_z = z - 1 - slice_idx
+            lvl_idx = actual_z // factor
+            target_hw = (y, x)
+            # After reverse_z, level-0 index maps into downsampled Z
+            slice_data = store.get_slice("axial", lvl_idx, level=level)
+            if level > 0:
+                slice_data = upsample_slice_nearest(slice_data, target_hw)
+            # Masks always from dense overlays at level-0 indices
+            seg_slice = self.segmentation_data[actual_z, :, :] if self.segmentation_data is not None else None
+            c1_slice = self.class1_data[actual_z, :, :] if self.class1_data is not None else None
+            c2_slice = self.class2_data[actual_z, :, :] if self.class2_data is not None else None
+            return slice_data, seg_slice, c1_slice, c2_slice
+
+        if orientation == "coronal":
+            lvl_idx = slice_idx // factor
+            slice_data = store.get_slice("coronal", lvl_idx, level=level)
+            if level > 0:
+                slice_data = upsample_slice_nearest(slice_data, (z, x))
+            seg_slice = np.flipud(self.segmentation_data[:, slice_idx, :]) if self.segmentation_data is not None else None
+            c1_slice = np.flipud(self.class1_data[:, slice_idx, :]) if self.class1_data is not None else None
+            c2_slice = np.flipud(self.class2_data[:, slice_idx, :]) if self.class2_data is not None else None
+            return slice_data, seg_slice, c1_slice, c2_slice
+
+        # sagittal
+        lvl_idx = slice_idx // factor
+        slice_data = store.get_slice("sagittal", lvl_idx, level=level)
+        if level > 0:
+            # get_slice already transposed → (Y, Z) wait — sagittal returns transpose of (Z,Y) = (Y,Z)
+            # level-0 target is (y, z) after transpose of volume[:,:,x] which is (Z,Y).T => (Y,Z)
+            slice_data = upsample_slice_nearest(slice_data, (y, z))
+        seg_slice = np.transpose(self.segmentation_data[:, :, slice_idx]) if self.segmentation_data is not None else None
+        c1_slice = np.transpose(self.class1_data[:, :, slice_idx]) if self.class1_data is not None else None
+        c2_slice = np.transpose(self.class2_data[:, :, slice_idx]) if self.class2_data is not None else None
+        return slice_data, seg_slice, c1_slice, c2_slice
+
     def reset_view(self, orientation):
         self.camera_state[orientation] = None
         self.render_slice(orientation, preserve_camera=False)
     
 
-    def render_slice(self, orientation, preserve_camera=False):
+    def render_slice(self, orientation, preserve_camera=False, _mpr_force_level=None):
         if self.volume_data is None:
             return
-        
+
+        with perf_phase("mpr.render_slice", detail=orientation):
+            self._render_slice_impl(orientation, preserve_camera, _mpr_force_level)
+
+    def _render_slice_impl(self, orientation, preserve_camera=False, _mpr_force_level=None):
         if preserve_camera:
             self.save_camera_state(orientation)
         
         renderer = getattr(self, f'{orientation}_renderer')
                 
         slice_idx = self.current_slices[orientation]
+        gen = self._bump_mpr_generation(orientation) if self._mpr_lve_active() else 0
         
         is_oblique = (abs(self.oblique_angles.get('axial', 0.0)) > 0.5 or 
                       abs(self.oblique_angles.get('coronal', 0.0)) > 0.5 or 
@@ -54,6 +195,21 @@ class MprRenderMixin:
         
         if is_oblique:
             slice_data, seg_slice, c1_slice, c2_slice = self._oblique_reslice_3d(orientation, slice_idx)
+        elif self._mpr_lve_active():
+            if _mpr_force_level is not None:
+                level = int(_mpr_force_level)
+            elif self._mpr_is_interacting():
+                level = self._mpr_preview_level()
+            else:
+                level = 0
+            # Use best available if preferred pyramid level not ready yet
+            store = self.volume_store
+            level = store.best_available_level(level) if level > 0 else 0
+            slice_data, seg_slice, c1_slice, c2_slice = self._extract_mpr_slice_from_store(
+                orientation, slice_idx, level
+            )
+            if level > 0:
+                self._schedule_mpr_idle_refine(orientation, gen)
         else:
             if orientation == 'axial':
                 # Axial (XY): X = horizontal, Y = vertical (so shape: Y, X)
@@ -78,6 +234,17 @@ class MprRenderMixin:
                 seg_slice = np.transpose(self.segmentation_data[:, :, slice_idx]) if self.segmentation_data is not None else None
                 c1_slice = np.transpose(self.class1_data[:, :, slice_idx]) if self.class1_data is not None else None
                 c2_slice = np.transpose(self.class2_data[:, :, slice_idx]) if self.class2_data is not None else None
+
+        # Stale cancel: if a newer generation started, skip VTK upload
+        if self._mpr_lve_active():
+            current = getattr(self, "_mpr_gen", {}).get(orientation, gen)
+            if current != gen:
+                return
+            applied = getattr(self, "_mpr_applied_gen", None)
+            if applied is None:
+                self._mpr_applied_gen = {"axial": 0, "coronal": 0, "sagittal": 0}
+                applied = self._mpr_applied_gen
+            applied[orientation] = gen
         
         h, w = slice_data.shape
         
