@@ -2,7 +2,7 @@
 # Recipe parameters only — INPUT/OUTPUT paths are set by the app at runtime.
 
 # === RECIPE META ===
-INPUT_MODE = single  # Options: test_1layer, single, multi_layer
+INPUT_MODE = single
 TEST_NAME = HBM_InspectionDLL
 
 # === BUMP DETECTION ===
@@ -13,6 +13,9 @@ BUMP_CLEAN_OPEN_RADIUS_Z = 4.0
 BUMP_BG_OPEN_RADIUS_X = 41.0
 BUMP_BG_OPEN_RADIUS_Y = 41.0
 BUMP_BG_OPEN_RADIUS_Z = 1.0
+BUMP_FILL_HOLE_CLOSE_RADIUS_X = 1.0
+BUMP_FILL_HOLE_CLOSE_RADIUS_Y = 1.0
+BUMP_FILL_HOLE_CLOSE_RADIUS_Z = 1.0
 
 # === VOID DETECTION ===
 VOID_THRESHOLD_WEIGHT = 0.5
@@ -36,7 +39,7 @@ BTM_AIR_START_SLICE_NUM = 0
 BTM_AIR_END_SLICE_NUM = 0
 
 # === OPTIONS ===
-SAVE_TGV_DEBUG_IMG = false
+SAVE_TGV_DEBUG_IMG = true
 SAVE_VOID_DEBUG_IMG = false
 SHOW_FLATTENED_TGV_VOID = false
 
@@ -46,32 +49,26 @@ CC3D_MIN_VOXELS = 0
 CC3D_USE_GPU = true
 
 # === MEASUREMENT ===
-VOXEL_SIZE_X = 0.309
-VOXEL_SIZE_Y = 0.3355
-VOXEL_SIZE_Z = 0.7335
+VOXEL_SIZE_X = 0.7284
+VOXEL_SIZE_Y = 0.7384
+VOXEL_SIZE_Z = 0.7334
 Z_STRETCHED_4X = true
-BUMP_MINIMUM_SIZE = 100
-BUMP_MAXIMUM_SIZE = 9999999
-VOID_MINIMUM_SIZE = 10
-VOID_MAXIMUM_SIZE = 9999999
+BUMP_MINIMUM_SIZE = 0x0x0
+BUMP_MAXIMUM_SIZE = 1000x1000x1000
+VOID_MINIMUM_SIZE = 0x0x0
+VOID_MAXIMUM_SIZE = 1000x1000x1000
 NG_THRESHOLD = 1.0
 
 # ── Enhancement (ONNX Model) ─────────────────
-# Path to the ONNX model file for volume enhancement (RestormerNano, etc.)
-# Leave empty to skip enhancement step.
-ENHANCEMENT_ENABLED = true
-ENHANCED_MODEL_PATH = "V2/restormer_nano_e9900_dynamic_ir9_fp16.onnx"
-# TensorRT engine cache folder (speeds up subsequent runs)
+ENHANCEMENT_ENABLED = false
+ENHANCED_MODEL_PATH = "E:\semiconductor\HBM_DEV_FOR_PROD\DEV\all_v2\V2\restormer_nano_e9900_dynamic_ir9_fp16.onnx"
 ENHANCED_TRT_CACHE_PATH = ./TRT_Cache
-# Use GPU for enhancement (true/false)
 ENHANCED_USE_GPU = true
-# GPU device ID (0 for first GPU)
 ENHANCED_GPU_DEVICE_ID = 0
-
-
 # Enhancement mode: full = all slices; layers = selected LAYER_* ranges only
 ENHANCEMENT_MODE = full
 ENHANCEMENT_SAVE_OUTPUT = true
+
 # === LAYER DEFINITIONS ===
 # Format: LAYER_N = name,z_start,z_end,selected
 NUM_LAYERS = 12

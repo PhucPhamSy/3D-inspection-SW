@@ -225,6 +225,8 @@ class InspectionDB:
                 CREATE INDEX IF NOT EXISTS idx_runs_lot ON fov_runs(lot_foup_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_finished ON fov_runs(finished_at);
                 CREATE INDEX IF NOT EXISTS idx_mes_run ON mes_objects(run_id);
+                CREATE INDEX IF NOT EXISTS idx_mes_layer_grid
+                  ON mes_objects(layer_name, grid_row, grid_col);
                 CREATE INDEX IF NOT EXISTS idx_art_run ON artifacts(run_id);
                 """
             )
@@ -799,6 +801,19 @@ class InspectionDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_lot_foup_parts(self) -> List[Dict[str, Any]]:
+        """``list_lots()`` rows with ``lot_id`` / ``foup_id`` split for UI filters."""
+        from inno3d.core.lot_foup import split_lot_foup
+
+        out: List[Dict[str, Any]] = []
+        for row in self.list_lots():
+            lot_id, foup_id = split_lot_foup(str(row.get("lot_foup_id") or ""))
+            d = dict(row)
+            d["lot_id"] = lot_id
+            d["foup_id"] = foup_id
+            out.append(d)
+        return out
+
     def list_wafers(
         self, date_folder: str = "", lot_foup_id: str = ""
     ) -> List[Dict[str, Any]]:
@@ -973,7 +988,14 @@ class InspectionDB:
         return [(lo + (i + 0.5) * width, counts[i]) for i in range(bins)]
 
     def global_kpis(self, wafer_key: str = "") -> Dict[str, Any]:
-        q = "SELECT COUNT(*) n, SUM(CASE WHEN judgment='OK' THEN 1 ELSE 0 END) nok, SUM(CASE WHEN judgment='NG' THEN 1 ELSE 0 END) nng, SUM(n_objects) nob FROM fov_runs WHERE 1=1"
+        q = (
+            "SELECT COUNT(*) n,"
+            " SUM(CASE WHEN judgment='OK' THEN 1 ELSE 0 END) nok,"
+            " SUM(CASE WHEN judgment='NG' THEN 1 ELSE 0 END) nng,"
+            " SUM(n_objects) nob,"
+            " SUM(n_ng) nbumpng"
+            " FROM fov_runs WHERE 1=1"
+        )
         args: List[Any] = []
         if wafer_key:
             q += " AND wafer_key=?"
@@ -987,6 +1009,7 @@ class InspectionDB:
             "n_ok": nok,
             "n_ng": int(r["nng"] or 0),
             "n_objects": int(r["nob"] or 0),
+            "n_bump_ng": int(r["nbumpng"] or 0),
             "yield_pct": (100.0 * nok / n) if n else 0.0,
         }
 

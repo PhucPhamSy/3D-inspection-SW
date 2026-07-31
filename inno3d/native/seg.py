@@ -17,6 +17,7 @@ from inno3d.core.bumpvoid import (
     PROGRESS_CALLBACK,
     # Load / version
     load_dll,
+    unload_dll,
     get_version,
     get_dll_name,
     get_dll_path,
@@ -66,6 +67,7 @@ __all__ = [
     "PROGRESS_CALLBACK",
     # Load / info
     "load_dll",
+    "unload_dll",
     "get_version",
     "get_dll_name",
     "get_dll_path",

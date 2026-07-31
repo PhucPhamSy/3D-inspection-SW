@@ -5233,13 +5233,32 @@ class AI3DTab(QWidget):
         self.t.start()
         
     def load_volume(self, from_folder=False):
-        if from_folder:
-            p = QFileDialog.getExistingDirectory(self, "Dir")
-        else:
-            p, _ = QFileDialog.getOpenFileName(self, "File", "", "Image Files (*.tif *.tiff *.raw *.bin)")
-            
-        if p:
-            self._handle_volume_load(p)
+        """Unified open: select a file or folder of stack images."""
+        dlg = QFileDialog(self, "Open File or Folder")
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        dlg.setNameFilter("Image Files (*.tif *.tiff *.raw *.bin)")
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.ShowDirsOnly, False)
+        from PyQt5.QtWidgets import QTreeView, QListView, QAbstractItemView
+        for view in dlg.findChildren((QTreeView, QListView)):
+            if isinstance(view, (QTreeView, QListView)):
+                view.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        _orig_accept = dlg.accept
+
+        def _custom_accept():
+            selected = dlg.selectedFiles()
+            if selected and os.path.isdir(selected[0]):
+                dlg.done(QFileDialog.Accepted)
+                return
+            _orig_accept()
+
+        dlg.accept = _custom_accept
+
+        if dlg.exec_() == QFileDialog.Accepted:
+            selected = dlg.selectedFiles()
+            if selected:
+                self._handle_volume_load(selected[0])
             
     def load_folder(self, **kwargs): self.load_volume(from_folder=True)
     def _done(self, d, e):

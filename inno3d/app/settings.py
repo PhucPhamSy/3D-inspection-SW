@@ -66,8 +66,31 @@ def get_dll_dir() -> str | None:
     """DLL override from ini; ``None`` → use ``default_dll_dir()`` fallback."""
     raw = _read_ini().get("DLL", "dir", fallback="").strip()
     if raw and Path(raw).is_dir():
-        return raw
+        return str(Path(raw).resolve())
     return None
+
+
+def set_dll_dir(dll_dir: str | None) -> None:
+    """Persist Teaching/Online native DLL folder to app_config.ini [DLL] dir."""
+    ini = app_config_ini_path()
+    cfg = configparser.ConfigParser()
+    if ini.exists():
+        try:
+            cfg.read(str(ini), encoding="utf-8")
+        except Exception:
+            pass
+    if "DLL" not in cfg:
+        cfg["DLL"] = {}
+    if dll_dir and Path(dll_dir).is_dir():
+        cfg["DLL"]["dir"] = str(Path(dll_dir).resolve())
+    else:
+        cfg["DLL"]["dir"] = ""
+    try:
+        ini.parent.mkdir(parents=True, exist_ok=True)
+        with open(ini, "w", encoding="utf-8") as f:
+            cfg.write(f)
+    except Exception as e:
+        print(f"[SETTINGS] Failed to save DLL dir: {e}")
 
 
 # ──────────────────────────────────────

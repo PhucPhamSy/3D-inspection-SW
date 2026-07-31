@@ -74,6 +74,22 @@ class SegmentationMPRMixin:
                 self.handle_roi_mouse_release(event.pos())
                 return True
 
+        # --- Layer Define Mode (priority over crosshair on sagittal widget) ---
+        if (getattr(self, 'layer_define_active', False)
+                and hasattr(self, 'sagittal_widget')
+                and obj == self.sagittal_widget
+                and self.volume_data is not None):
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._handle_layer_define_mouse_press(event.pos())
+                return True
+            elif event.type() == QEvent.MouseMove:
+                self._handle_layer_define_mouse_move(
+                    event.pos(), is_drag=bool(event.buttons() & Qt.LeftButton))
+                return True
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self._handle_layer_define_mouse_release(event.pos())
+                return True
+
         # Resolve which 2D orientation this widget belongs to
         orientation = None
         for ori in ['axial', 'coronal', 'sagittal']:
@@ -186,7 +202,9 @@ class SegmentationMPRMixin:
                     value = self.volume_data[actual_z, py, px]
                     coord_str = f"X:{px} Y:{py} Z:{actual_z}"
             elif orientation == 'coronal':
-                px, pz = int(world_pos[0]), int(world_pos[1])
+                px = int(world_pos[0])
+                # Un-flip: coronal rendering uses np.flipud so VTK Y is inverted Z
+                pz = (vol_z - 1) - int(world_pos[1])
                 if 0 <= px < vol_x and 0 <= pz < vol_z:
                      value = self.volume_data[pz, slice_idx, px]
                      coord_str = f"X:{px} Y:{slice_idx} Z:{pz}"
@@ -203,6 +221,34 @@ class SegmentationMPRMixin:
                 label.setText("Pixel: --")
         except:
             pass
+
+    # ── Adaptive 3D crosshair debounce (mirrors Viewer Phase 2a) ─────
+    def _schedule_3d_crosshair_update_teaching(self):
+        """Adaptively debounce 3D crosshair render for Teaching tab.
+
+        - < 4 GB  → immediate (no change from current behaviour)
+        - 4–8 GB  → 33 ms debounce
+        - > 8 GB  → 100 ms debounce
+        """
+        from PyQt5.QtCore import QTimer
+
+        data_gb = (self.volume_data.nbytes / (1024 ** 3)) if self.volume_data is not None else 0.0
+
+        if data_gb < 4.0:
+            self.update_3d_crosshair()
+            return
+
+        delay_ms = 33 if data_gb < 8.0 else 100
+
+        if not hasattr(self, '_3d_ch_debounce_timer_t'):
+            self._3d_ch_debounce_timer_t = QTimer(self)
+            self._3d_ch_debounce_timer_t.setSingleShot(True)
+            self._3d_ch_debounce_timer_t.timeout.connect(self.update_3d_crosshair)
+
+        self._3d_ch_debounce_timer_t.setInterval(delay_ms)
+        if self._3d_ch_debounce_timer_t.isActive():
+            self._3d_ch_debounce_timer_t.stop()
+        self._3d_ch_debounce_timer_t.start()
 
     def updatePoint(self, newX, newY, newZ):
         """Update crosshair + slices; only full re-render views whose slice changed."""
@@ -254,7 +300,8 @@ class SegmentationMPRMixin:
                 self.update_2d_crosshair(ori)
 
         # RGB axes on Teaching 3D volume (Viewer parity)
-        self.update_3d_crosshair()
+        # ── Adaptive debounce: skip expensive 3D render for large volumes ──
+        self._schedule_3d_crosshair_update_teaching()
 
     def update_3d_crosshair(self, render=True):
         """Draw RGB crosshair axes in the Teaching 3D Volume pane.

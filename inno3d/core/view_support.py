@@ -1215,37 +1215,66 @@ class LoadVolumeThread(QThread):
                         _read_fn = io.imread
                     
                     first = _read_fn(all_files[0])
-                    h, w = first.shape[:2]
-                    
-                    total_gb = n * h * w * first.itemsize / (1024**3)
-                    self.progress.emit(10, f"Allocating {total_gb:.1f} GB...")
-                    
-                    data = np.empty((n, h, w), dtype=first.dtype)
-                    data[0] = first
-                    
-                    # Parallel loading: use 16 workers to saturate NVMe + Xeon W7 cores.
-                    # tifffile.imread releases GIL during decompression → true parallelism.
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
-                    import os as _os
-                    
-                    num_workers = min(16, max(4, _os.cpu_count() or 8))
-                    progress_interval = max(1, n // 100)  # Update progress every 1%
-                    
-                    def _load_slice(idx):
-                        return idx, _read_fn(all_files[idx])
-                    
-                    loaded_count = 1  # first slice already loaded
-                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                        futures = {executor.submit(_load_slice, i): i for i in range(1, n)}
-                        for future in as_completed(futures):
-                            idx, slc = future.result()
-                            data[idx] = slc
-                            loaded_count += 1
-                            if loaded_count % progress_interval == 0 or loaded_count == n:
-                                elapsed = time.perf_counter() - t0
-                                speed = (loaded_count * h * w * first.itemsize) / (1024**3) / max(elapsed, 0.01)
-                                prog = 10 + int(75 * loaded_count / n)
-                                self.progress.emit(prog, f"Slice {loaded_count}/{n} | {speed:.1f} GB/s | {num_workers} threads")
+                    first_sq = np.squeeze(first)
+
+                    if first_sq.ndim == 3:
+                        # Files inside directory are already 3D volume stacks (e.g. 900x236x269)
+                        if n == 1:
+                            data = first_sq
+                        else:
+                            self.progress.emit(10, f"Loading {n} 3D volume files...")
+                            from concurrent.futures import ThreadPoolExecutor, as_completed
+                            import os as _os
+                            num_workers = min(16, max(4, _os.cpu_count() or 8))
+
+                            def _load_stack(idx):
+                                return idx, np.squeeze(_read_fn(all_files[idx]))
+
+                            results = {0: first_sq}
+                            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                                futures = {executor.submit(_load_stack, i): i for i in range(1, n)}
+                                for future in as_completed(futures):
+                                    idx, stk = future.result()
+                                    results[idx] = stk
+                            stacks = [results[i] for i in range(n)]
+                            data = np.concatenate(stacks, axis=0)
+                    else:
+                        # Single 2D slices
+                        h, w = first_sq.shape[:2]
+                        total_gb = n * h * w * first.itemsize / (1024**3)
+                        self.progress.emit(10, f"Allocating {total_gb:.1f} GB...")
+                        
+                        data = np.empty((n, h, w), dtype=first.dtype)
+                        data[0] = first_sq
+                        
+                        # Parallel loading: use 16 workers to saturate NVMe + Xeon W7 cores.
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        import os as _os
+                        
+                        num_workers = min(16, max(4, _os.cpu_count() or 8))
+                        progress_interval = max(1, n // 100)  # Update progress every 1%
+                        
+                        def _load_slice(idx):
+                            return idx, _read_fn(all_files[idx])
+                        
+                        loaded_count = 1  # first slice already loaded
+                        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                            futures = {executor.submit(_load_slice, i): i for i in range(1, n)}
+                            for future in as_completed(futures):
+                                idx, slc = future.result()
+                                slc_sq = np.squeeze(slc)
+                                if slc_sq.ndim == 3 and slc_sq.shape[1:] == (h, w):
+                                    slc_sq = slc_sq[0]
+                                if slc_sq.shape == (h, w):
+                                    data[idx] = slc_sq
+                                else:
+                                    print(f"[LoadVolumeThread] Warning: slice {idx} shape {slc_sq.shape} != ({h}, {w})")
+                                loaded_count += 1
+                                if loaded_count % progress_interval == 0 or loaded_count == n:
+                                    elapsed = time.perf_counter() - t0
+                                    speed = (loaded_count * h * w * first.itemsize) / (1024**3) / max(elapsed, 0.01)
+                                    prog = 10 + int(75 * loaded_count / n)
+                                    self.progress.emit(prog, f"Slice {loaded_count}/{n} | {speed:.1f} GB/s | {num_workers} threads")
                 else:
                     directory = path.parent
                     

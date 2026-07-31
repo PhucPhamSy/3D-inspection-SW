@@ -96,7 +96,7 @@ class AlignSidebarMixin:
         self.align_tools_rail.setVisible(False)
         self.align_sidebar.setVisible(True)
         host.setMinimumWidth(240)
-        host.setMaximumWidth(240)
+        host.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX — fully resizable
         return host
 
     def _create_align_tools_rail(self):
@@ -204,7 +204,7 @@ class AlignSidebarMixin:
 
         if expanded:
             self.align_tools_host.setMinimumWidth(240)
-            self.align_tools_host.setMaximumWidth(240)
+            self.align_tools_host.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX — freely resizable
         else:
             self.align_tools_host.setMinimumWidth(28)
             self.align_tools_host.setMaximumWidth(28)
@@ -298,7 +298,7 @@ class AlignSidebarMixin:
         """
         panel = QWidget()
         panel.setObjectName("AlignSidebar")
-        panel.setFixedWidth(240)
+        panel.setMinimumWidth(240)  # enough to show all content; no fixed max — resizable
         panel.setStyleSheet(f"""
             QWidget#AlignSidebar {{
                 background-color: {SemiconductorTheme.BG_MEDIUM};
@@ -601,12 +601,12 @@ class AlignSidebarMixin:
             clip_lay.addLayout(row)
             self._df_clip_bound_ctrls[axis] = {'lo': lo, 'hi': hi, 'pct': pct}
 
-        # ── Section: OBLIQUE MPR ──────────────────────────────
+        # ── Section: VIEWING ALIGNMENT (2D ROTATE) ──────────────────────────────
         _obl_body, obl_lay = self._make_sidebar_section(
-            "OBLIQUE MPR",
+            "VIEWING ALIGNMENT (2D ROTATE)",
             layout,
             expanded=True,
-            tooltip="Oblique MPR rotation controls. Click to collapse / expand.",
+            tooltip="Viewing alignment & 2D rotation controls. Click to collapse / expand.",
         )
 
         # ── Toggle: Rotation Handles (Dragonfly-style) ────────
@@ -671,9 +671,9 @@ class AlignSidebarMixin:
         )
         nav_lay.addWidget(nav_hint)
 
-        # ── Section: ALIGNMENT ───────────────────────────
+        # ── Section: VOLUME ALIGNMENT ───────────────────────────
         _align_body, align_lay = self._make_sidebar_section(
-            "ALIGNMENT",
+            "VOLUME ALIGNMENT",
             layout,
             expanded=True,
             tooltip="Auto / manual volume alignment. Click to collapse / expand.",

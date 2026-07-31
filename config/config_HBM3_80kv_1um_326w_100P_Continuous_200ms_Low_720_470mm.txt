@@ -6,13 +6,16 @@ INPUT_MODE = single  # Options: test_1layer, single, multi_layer
 TEST_NAME = HBM_InspectionDLL
 
 # === BUMP DETECTION ===
-BUMP_THRESHOLD_WEIGHT = 0.9
-BUMP_CLEAN_OPEN_RADIUS_X = 0.0
-BUMP_CLEAN_OPEN_RADIUS_Y = 0.0
-BUMP_CLEAN_OPEN_RADIUS_Z = 4.0
+BUMP_THRESHOLD_WEIGHT = 1.0
+BUMP_CLEAN_OPEN_RADIUS_X = 11.0
+BUMP_CLEAN_OPEN_RADIUS_Y = 11.0
+BUMP_CLEAN_OPEN_RADIUS_Z = 0.0
 BUMP_BG_OPEN_RADIUS_X = 41.0
 BUMP_BG_OPEN_RADIUS_Y = 41.0
 BUMP_BG_OPEN_RADIUS_Z = 1.0
+BUMP_FILL_HOLE_CLOSE_RADIUS_X = 5.0
+BUMP_FILL_HOLE_CLOSE_RADIUS_Y = 5.0
+BUMP_FILL_HOLE_CLOSE_RADIUS_Z = 5.0
 
 # === VOID DETECTION ===
 VOID_THRESHOLD_WEIGHT = 0.5
@@ -39,6 +42,8 @@ BTM_AIR_END_SLICE_NUM = 0
 SAVE_TGV_DEBUG_IMG = false
 SAVE_VOID_DEBUG_IMG = false
 SHOW_FLATTENED_TGV_VOID = false
+# DLL stage timing (IO / algo / H2D-D2H) → Inno3D_Logs + Success dialog; default false
+ENABLE_DLL_PROFILING = true
 
 # === CC3D Connected Component Labeling ===
 CC3D_CONNECTIVITY = 26
@@ -46,44 +51,39 @@ CC3D_MIN_VOXELS = 0
 CC3D_USE_GPU = true
 
 # === MEASUREMENT ===
-VOXEL_SIZE_X = 0.309
-VOXEL_SIZE_Y = 0.3355
-VOXEL_SIZE_Z = 0.7335
+VOXEL_SIZE_X = 0.7284
+VOXEL_SIZE_Y = 0.7384
+VOXEL_SIZE_Z = 0.7334
 Z_STRETCHED_4X = true
-BUMP_MINIMUM_SIZE = 100
-BUMP_MAXIMUM_SIZE = 9999999
-VOID_MINIMUM_SIZE = 10
-VOID_MAXIMUM_SIZE = 9999999
+BUMP_MINIMUM_SIZE = 0x0x0
+BUMP_MAXIMUM_SIZE = 1000x1000x1000
+VOID_MINIMUM_SIZE = 0x0x0
+VOID_MAXIMUM_SIZE = 1000x1000x1000
 NG_THRESHOLD = 1.0
 
 # ── Enhancement (ONNX Model) ─────────────────
-# Path to the ONNX model file for volume enhancement (RestormerNano, etc.)
-# Leave empty to skip enhancement step.
 ENHANCEMENT_ENABLED = true
-ENHANCED_MODEL_PATH = "V2/restormer_nano_e9900_dynamic_ir9_fp16.onnx"
-# TensorRT engine cache folder (speeds up subsequent runs)
+ENHANCED_MODEL_PATH = "E:\semiconductor\HBM_DEV_FOR_PROD\DEV\all_v2\V2\restormer_nano_e9900_dynamic_ir9_fp16.onnx"
 ENHANCED_TRT_CACHE_PATH = ./TRT_Cache
-# Use GPU for enhancement (true/false)
 ENHANCED_USE_GPU = true
-# GPU device ID (0 for first GPU)
 ENHANCED_GPU_DEVICE_ID = 0
-
-
 # Enhancement mode: full = all slices; layers = selected LAYER_* ranges only
 ENHANCEMENT_MODE = full
 ENHANCEMENT_SAVE_OUTPUT = true
+
 # === LAYER DEFINITIONS ===
 # Format: LAYER_N = name,z_start,z_end,selected
+
 NUM_LAYERS = 12
-LAYER_0 = Layer 1,20,70,true
-LAYER_1 = Layer 2,85,133,true
-LAYER_2 = Layer 3,160,210,true
-LAYER_3 = Layer 4,245,285,true
-LAYER_4 = Layer 5,314,360,true
-LAYER_5 = Layer 6,387,440,true
-LAYER_6 = Layer 7,457,509,true
-LAYER_7 = Layer 8,524,575,true
-LAYER_8 = Layer 9,606,654,true
-LAYER_9 = Layer 10,675,727,true
-LAYER_10 = Layer 11,754,803,true
-LAYER_11 = Layer 12,824,873,true
+LAYER_0 = Layer 1,580,644,true
+LAYER_1 = Layer 2,720,784,true
+LAYER_2 = Layer 3,860,924,true
+LAYER_3 = Layer 4,1000,1064,true
+LAYER_4 = Layer 5,1132,1200,true
+LAYER_5 = Layer 6,1272,1344,true
+LAYER_6 = Layer 7,1412,1476,true
+LAYER_7 = Layer 8,1548,1624,true
+LAYER_8 = Layer 9,1688,1760,true
+LAYER_9 = Layer 10,1828,1904,true
+LAYER_10 = Layer 11,1972,2044,true
+LAYER_11 = Layer 12,2116,2184,true

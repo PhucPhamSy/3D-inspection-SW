@@ -120,14 +120,13 @@ class HostVolumePathInfo:
 
 
 def _split_lot_foup(name: str) -> Tuple[str, str]:
-    """Split ``LotID_FoupID`` on the *last* underscore when possible."""
-    name = (name or "").strip()
-    if not name:
-        return "", ""
-    if "_" not in name:
-        return name, ""
-    lot, foup = name.rsplit("_", 1)
-    return lot.strip(), foup.strip()
+    """Split ``LotID_FoupID`` on the *last* underscore when possible.
+
+    Delegates to :func:`inno3d.core.lot_foup.split_lot_foup` (canonical).
+    """
+    from inno3d.core.lot_foup import split_lot_foup
+
+    return split_lot_foup(name)
 
 
 def _parse_chip_location(name: str) -> Tuple[int, int]:

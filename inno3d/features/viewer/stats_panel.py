@@ -636,7 +636,7 @@ class StatsPanelMixin:
             # --- Apply Automatic FAR (False Alarm Remover) ---
             self.apply_far(voxel_volume)
 
-            # Unified (0,0)=top-left XY indexing (same as Online MES / B2B)
+            # Unified (1,1)=top-left XY indexing (same as Online MES / B2B)
             try:
                 from inno3d.core.bumpvoid_mes import reindex_grid_top_left
                 self.object_stats = reindex_grid_top_left(

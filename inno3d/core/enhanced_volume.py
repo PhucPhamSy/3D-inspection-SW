@@ -163,6 +163,27 @@ def _setup_functions():
         _dll.EnhancedVolume_GetActiveProvider.argtypes = []
         _dll.EnhancedVolume_GetActiveProvider.restype = ctypes.c_char_p
 
+    try:
+        from inno3d.core.dll_profiling import _bind_optional
+        _bind_optional(
+            _dll,
+            "EnhancedVolume_SetProfiling",
+            "EnhancedVolume_GetProfiling",
+            "EnhancedVolume_GetLastTiming",
+        )
+    except Exception:
+        pass
+
+
+def set_profiling(enable: bool) -> bool:
+    from inno3d.core.dll_profiling import set_profiling as _sp
+    return _sp(_dll, enable, "EnhancedVolume_SetProfiling")
+
+
+def get_last_timing():
+    from inno3d.core.dll_profiling import get_last_timing as _gt
+    return _gt(_dll, "EnhancedVolume_GetLastTiming")
+
 
 # ============================================
 # PYTHON API

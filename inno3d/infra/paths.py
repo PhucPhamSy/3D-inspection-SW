@@ -39,19 +39,31 @@ def resource_path(relative_path: str) -> str:
 
 
 def default_dll_dir() -> str | None:
-    """Resolve portable V2/ native DLL folder for SEG / MES / B2B / ENH.
+    """Resolve native DLL folder for SEG / MES / B2B / ENH.
 
     Search order:
+      0. ``app_config.ini`` ``[DLL] dir`` (Teaching browse choice)
       1. <exe_or_project>/V2
       2. Parent-of-project shared all_v2/V2 (dev only)
-      3. Legacy absolute path used on the main dev machine (dev only)
+      3. Parent-of-project shared all_v2/V3 (dev only)
     """
+    try:
+        from inno3d.app.settings import get_dll_dir as settings_dll_dir
+
+        override = settings_dll_dir()
+        if override:
+            return override
+    except Exception:
+        pass
+
     candidates = [
         app_runtime_dir() / "V2",
     ]
     if not getattr(sys, "frozen", False):
-        # Dev monorepo layout: …/all_v2/HBM_frontend_backend_v12 and …/all_v2/V2
-        candidates.append(project_root().parent / "V2")
+        # Dev monorepo layout: …/all_v2/HBM_frontend_backend_v12 and …/all_v2/V2|V3
+        parent = project_root().parent
+        candidates.append(parent / "V2")
+        candidates.append(parent / "V3")
 
     for c in candidates:
         try:

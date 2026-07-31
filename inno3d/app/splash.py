@@ -191,7 +191,7 @@ class CustomTitleBar(QWidget):
         self.btn_seg = self._create_tab("3D TEACHING", 1)
         self.btn_ai = self._create_tab("3D AI", 2)
         self.btn_analysis = self._create_tab("3D ANALYSIS", 3)
-        self.btn_batch = self._create_tab("BATCH REVIEW", 4)
+        self.btn_batch = self._create_tab("LINE PULSE", 4)
         self.btn_help = self._create_tab("HELP", 5)
 
         self.tabs_layout.addWidget(self.btn_multi)

@@ -64,14 +64,14 @@ class MprRenderMixin:
                 seg_slice = self.segmentation_data[actual_z, :, :] if self.segmentation_data is not None else None
                 c1_slice = self.class1_data[actual_z, :, :] if self.class1_data is not None else None
                 c2_slice = self.class2_data[actual_z, :, :] if self.class2_data is not None else None
-                
+
             elif orientation == 'coronal':
                 # Coronal (XZ): X = horizontal, Z = vertical (Z increases downwards -> Z=0 at top)
                 slice_data = np.flipud(self.volume_data[:, slice_idx, :])
                 seg_slice = np.flipud(self.segmentation_data[:, slice_idx, :]) if self.segmentation_data is not None else None
                 c1_slice = np.flipud(self.class1_data[:, slice_idx, :]) if self.class1_data is not None else None
                 c2_slice = np.flipud(self.class2_data[:, slice_idx, :]) if self.class2_data is not None else None
-                
+
             else:
                 # Sagittal (YZ): Z = horizontal, Y = vertical (90 deg CCW of previous)
                 slice_data = np.transpose(self.volume_data[:, :, slice_idx])

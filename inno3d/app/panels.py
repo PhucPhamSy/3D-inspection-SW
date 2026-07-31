@@ -52,57 +52,34 @@ class PanelsMixin:
         # ═══════════════════════════════════════════════════════════
         add_section_title("INPUT DATA")
         
-        load_row = QGridLayout()
-        load_row.setContentsMargins(0, 0, 0, 0)
-        load_row.setSpacing(6)
-        load_row.setColumnStretch(0, 1)
-        load_row.setColumnStretch(1, 1)
-        
-        b_load = QPushButton("  FILE")
-        b_load.setProperty("class", "system-text-btn")
-        b_load.setProperty("theme_icon", True)
-        b_load.setProperty("icon_name", "file.svg")
-        b_load.setProperty("standard_icon", int(QStyle.SP_FileIcon))
-        b_load.setProperty("icon_size_w", 16)
-        b_load.setProperty("icon_size_h", 16)
-        b_load.setProperty("is_icon_only", False)
-        self._apply_themed_icon(b_load)
-        b_load.setCursor(Qt.PointingHandCursor)
-        b_load.setToolTip("Load single 3D file (.tif/.tiff/.raw)")
-        b_load.clicked.connect(lambda: self.multiplanar_tab.load_volume(from_folder=False))
-        load_row.addWidget(b_load, 0, 0)
-        self.viewer_btn_file = b_load
-        
-        b_load_folder = QPushButton("  FOLDER")
-        b_load_folder.setProperty("class", "system-text-btn")
-        b_load_folder.setProperty("theme_icon", True)
-        b_load_folder.setProperty("icon_name", "folder-open.svg")
-        b_load_folder.setProperty("standard_icon", int(QStyle.SP_DirIcon))
-        b_load_folder.setProperty("icon_size_w", 16)
-        b_load_folder.setProperty("icon_size_h", 16)
-        b_load_folder.setProperty("is_icon_only", False)
-        self._apply_themed_icon(b_load_folder)
-        b_load_folder.setCursor(Qt.PointingHandCursor)
-        b_load_folder.setToolTip("Load 3D stack from folder")
-        b_load_folder.clicked.connect(lambda: self.multiplanar_tab.load_volume(from_folder=True))
-        load_row.addWidget(b_load_folder, 0, 1)
-        self.viewer_btn_folder = b_load_folder
-        
-        layout.addLayout(load_row)
+        b_open = QPushButton("  OPEN")
+        b_open.setProperty("class", "system-text-btn")
+        b_open.setProperty("theme_icon", True)
+        b_open.setProperty("icon_name", "folder-open.svg")
+        b_open.setProperty("standard_icon", int(QStyle.SP_DirOpenIcon))
+        b_open.setProperty("icon_size_w", 16)
+        b_open.setProperty("icon_size_h", 16)
+        b_open.setProperty("is_icon_only", False)
+        self._apply_themed_icon(b_open)
+        b_open.setCursor(Qt.PointingHandCursor)
+        b_open.setToolTip("Open a 3D file or a folder of stack images")
+        b_open.clicked.connect(lambda: self.multiplanar_tab.load_volume())
+        layout.addWidget(b_open)
+        self.viewer_btn_open = b_open
 
-        # Online still disables FILE/FOLDER (see _set_online_input_locked); no banner text.
+        # Online still disables OPEN (see _set_online_input_locked); no banner text.
         self.online_input_lock_hint = None
 
         # ═══════════════════════════════════════════════════════════
-        # 2. ANALYSIS TOOLS  —  Bordered buttons with inline icons
+        # 2. SEG MASKS  —  Bordered buttons with inline icons
         # ═══════════════════════════════════════════════════════════
-        add_section_title("ANALYSIS TOOLS")
+        add_section_title("SEG MASKS")
         
-        # MASK C1 + color picker
+        # SINGLE LAYER C1 + color picker
         row1 = QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
         row1.setSpacing(6)
-        b_c1 = QPushButton("  MASK C1")
+        b_c1 = QPushButton("  SINGLE LAYER C1")
         b_c1.setProperty("class", "system-text-btn")
         b_c1.setProperty("theme_icon", True)
         b_c1.setProperty("icon_name", "mask.svg")
@@ -122,11 +99,11 @@ class PanelsMixin:
         row1.addWidget(b_c1_clr)
         layout.addLayout(row1)
         
-        # MASK C2 + color picker
+        # SINGLE LAYER C2 + color picker
         row2 = QHBoxLayout()
         row2.setContentsMargins(0, 0, 0, 0)
         row2.setSpacing(6)
-        b_c2 = QPushButton("  MASK C2")
+        b_c2 = QPushButton("  SINGLE LAYER C2")
         b_c2.setProperty("class", "system-text-btn")
         b_c2.setProperty("theme_icon", True)
         b_c2.setProperty("icon_name", "mask.svg")
@@ -146,8 +123,8 @@ class PanelsMixin:
         row2.addWidget(b_c2_clr)
         layout.addLayout(row2)
         
-        # MASK FOLDER (full width)
-        b_mask_folder = QPushButton("  MASK FOLDER")
+        # ALL LAYERS (full width)
+        b_mask_folder = QPushButton("  ALL LAYERS")
         b_mask_folder.setProperty("class", "system-text-btn")
         b_mask_folder.setProperty("theme_icon", True)
         b_mask_folder.setProperty("icon_name", "layers.svg")
@@ -159,6 +136,20 @@ class PanelsMixin:
         b_mask_folder.setToolTip("Load all per-layer masks (bump + void) from a sample output folder")
         b_mask_folder.clicked.connect(self.multiplanar_tab.load_mask_folder)
         layout.addWidget(b_mask_folder)
+
+        # CLEAR ALL (under SEG MASKS)
+        b_clear = QPushButton("  CLEAR ALL")
+        b_clear.setProperty("class", "clear-btn")
+        b_clear.setProperty("theme_icon", True)
+        b_clear.setProperty("icon_name", "eraser.svg")
+        b_clear.setProperty("standard_icon", "")
+        b_clear.setProperty("icon_size_w", 14)
+        b_clear.setProperty("icon_size_h", 14)
+        b_clear.setProperty("role", "danger")
+        self._apply_themed_icon(b_clear)
+        b_clear.setCursor(Qt.PointingHandCursor)
+        b_clear.clicked.connect(self.multiplanar_tab.clear_masks)
+        layout.addWidget(b_clear)
         
         # ═══════════════════════════════════════════════════════════
         # 3. SYSTEM  —  Carl Zeiss Industrial Design Language
@@ -249,31 +240,12 @@ class PanelsMixin:
         util_row.addWidget(b_rot_reset, 0, 3)
         layout.addLayout(util_row)
         
-        # (2D ROTATE + alignment controls consolidated in 3D viewer right panel)
-        
-        # ═══════════════════════════════════════════════════════════
-        # CLEAR ALL  —  danger zone, icon + text, full width
-        # ═══════════════════════════════════════════════════════════
-        layout.addSpacing(8)
-        b_clear = QPushButton("  CLEAR ALL")
-        b_clear.setProperty("class", "clear-btn")
-        b_clear.setProperty("theme_icon", True)
-        b_clear.setProperty("icon_name", "eraser.svg")
-        b_clear.setProperty("standard_icon", "")
-        b_clear.setProperty("icon_size_w", 14)
-        b_clear.setProperty("icon_size_h", 14)
-        b_clear.setProperty("role", "danger")
-        self._apply_themed_icon(b_clear)
-        b_clear.setCursor(Qt.PointingHandCursor)
-        b_clear.clicked.connect(self.multiplanar_tab.clear_masks)
-        layout.addWidget(b_clear)
-        
         # Bottom stretch to push everything UP
         layout.addStretch()
 
         # Map to tab
-        self.multiplanar_tab.load_volume_btn = b_load
-        self.multiplanar_tab.load_volume_folder_btn = b_load_folder
+        self.multiplanar_tab.load_volume_btn = b_open
+        self.multiplanar_tab.load_volume_folder_btn = b_open  # unified — same button
         self.multiplanar_tab.load_class1_btn = b_c1
         self.multiplanar_tab.load_class2_btn = b_c2
         self.multiplanar_tab.color_c1_btn = b_c1_clr
@@ -468,9 +440,12 @@ class PanelsMixin:
         seg.crosshair_check = self.seg_cross_check
         seg.info_label = self.seg_info_label
         
-        # Sync the text of the new inputs if the tab already loaded default paths during init
+        # Sync DLL path on both sidebar + Teaching toolbar
         if hasattr(seg, 'dll_path') and seg.dll_path:
-            seg.dll_path_input.setText(seg.dll_path)
+            if hasattr(seg, '_sync_dll_path_displays'):
+                seg._sync_dll_path_displays(seg.dll_path)
+            else:
+                seg.dll_path_input.setText(seg.dll_path)
         # Populate recipe list from config/ and select current path if already loaded
         seg.refresh_config_recipe_list(select_path=getattr(seg, "config_path", None))
         
@@ -484,15 +459,15 @@ class PanelsMixin:
         layout.setContentsMargins(15, 0, 15, 0)
         layout.setSpacing(8)
 
-        lbl = QLabel("BATCH REVIEW")
+        lbl = QLabel("LINE PULSE")
         lbl.setStyleSheet(SemiconductorTheme.sidebar_section_style())
         layout.addWidget(lbl)
 
         info = QLabel(
-            "Browse FOV runs stored in the local inspection database.\n\n"
+            "Live yield · FOV progress · open Viewer on demand.\n\n"
             "• Online mode appends each completed FOV\n"
             "• DB path: Inno3D_Data/inspection.db\n"
-            "• Use Seed demo if empty"
+            "• Use Seed demo if empty (advanced)"
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 8.5pt;")

@@ -215,15 +215,32 @@ class OnlineModeMixin:
             }
             
             self.online_config_folder = None
-            self.online_toggle.setText("ON")
             
-            # Check that DLL is already loaded
+            # Check that DLL is already loaded from Teaching (V2 / V3 / custom)
             if seg_tab.dll_path is None:
                 QMessageBox.warning(self, "Online Mode",
-                    "Please load the DLL folder in the 3D Segmentation tab first\n"
+                    "Please load the DLL folder in the 3D Teaching tab first\n"
+                    "(Browse → all_v2\\V2 or all_v2\\V3)\n"
                     "before turning on Online mode.")
                 self.online_toggle.setChecked(False)
-                self.online_toggle.setText("OFF")
+                self.online_config_folder = None
+                return
+
+            # Force Online to use the exact Teaching DLL package (not a stale default V2)
+            try:
+                ver = seg_tab.apply_dll_folder(
+                    seg_tab.dll_path, persist=True, force=True
+                )
+                self._online_dll_bind_note = (
+                    f"Teaching DLL bound for Online: {seg_tab.dll_path} (SEG v{ver})"
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "Online Mode",
+                    f"Failed to bind Teaching DLL folder for Online:\n{seg_tab.dll_path}\n\n{e}",
+                )
+                self.online_toggle.setChecked(False)
                 self.online_config_folder = None
                 return
             
@@ -235,7 +252,6 @@ class OnlineModeMixin:
                     "The loaded config will be used for ALL incoming files.\n"
                     "To change config: turn OFF Online -> edit/reload config -> turn ON again.")
                 self.online_toggle.setChecked(False)
-                self.online_toggle.setText("OFF")
                 return
             
             # Soft warning only when neither locked ROI nor layer bands exist
@@ -267,7 +283,6 @@ class OnlineModeMixin:
                 )
                 if reply == QMessageBox.No:
                     self.online_toggle.setChecked(False)
-                    self.online_toggle.setText("OFF")
                     return
 
             # Lock to tab 0 (3D Viewer) or tab 3 (3D Analysis)
@@ -292,7 +307,7 @@ class OnlineModeMixin:
             if hasattr(self.multiplanar_tab, "set_online_viewer_layout"):
                 self.multiplanar_tab.set_online_viewer_layout(True)
 
-            # Collapse left app menu (keep ONLINE toggle) → more room for MPR + CONTEXT
+            # Configure left app menu for Online mode (keep expanded by default, enable manual collapse button)
             if hasattr(self, "set_online_app_sidebar_layout"):
                 self.set_online_app_sidebar_layout(True)
             
@@ -311,6 +326,11 @@ class OnlineModeMixin:
                 self.multiplanar_tab.append_online_log(msg, color)
             
             self._online_append_log = _append_log
+
+            note = getattr(self, "_online_dll_bind_note", None)
+            if note:
+                _append_log(note, SemiconductorTheme.ACCENT_PRIMARY)
+                self._online_dll_bind_note = None
             
             # Start TCP server
             self.online_server = OnlineServerThread(port=8000)
@@ -470,6 +490,12 @@ class OnlineModeMixin:
             except Exception as e:
                 _append_log(f"[B2B] unavailable: {e}", SemiconductorTheme.ACCENT_WARNING)
 
+            # Re-apply after Online DLL loads (reload clears SetProfiling flag)
+            try:
+                self._online_apply_dll_profiling()
+            except Exception:
+                pass
+
             _append_log(f"Config: {seg_tab.config_path or 'default'}", SemiconductorTheme.TEXT_SECONDARY)
             if self._online_enhancement_enabled:
                 _mode = getattr(self, '_online_enhancement_mode', 'full')
@@ -497,8 +523,6 @@ class OnlineModeMixin:
             
         else:
             # --- Turn OFF ---
-            self.online_toggle.setText("OFF")
-            
             # Log shutdown
             if hasattr(self, '_online_append_log') and self._online_append_log:
                 self._online_append_log("Server stopping...", SemiconductorTheme.ACCENT_WARNING)
@@ -1147,6 +1171,8 @@ class OnlineModeMixin:
             return
         
         # ---- Step 2: Enhancement (if enabled) → then Segmentation ----
+        self._online_apply_dll_profiling()
+        self._online_reset_profiling_report()
         if getattr(self, '_online_enhancement_enabled', False) and self._online_enhancement_model:
             self._run_online_enhancement()
         else:
@@ -1364,6 +1390,11 @@ class OnlineModeMixin:
                 f"[ENHANCE DONE] Volume enhanced successfully ({enhance_time:.1f}s)",
                 SemiconductorTheme.ACCENT_SUCCESS,
             )
+            try:
+                from inno3d.core import enhanced_volume
+                self._online_log_dll_timing("ENH", enhanced_volume.get_last_timing)
+            except Exception:
+                pass
 
             enhanced_dir = self._online_enhanced_output
             try:
@@ -1447,6 +1478,146 @@ class OnlineModeMixin:
         # Proceed to segmentation regardless
         self._start_online_segmentation()
     
+    def _online_dll_profiling_enabled(self) -> bool:
+        """Read ENABLE_DLL_PROFILING from Teaching Params / config checkbox."""
+        seg_tab = getattr(self, "segmentation_tab", None)
+        if seg_tab is None:
+            return False
+        try:
+            if hasattr(seg_tab, "_is_dll_profiling_enabled"):
+                return bool(seg_tab._is_dll_profiling_enabled())
+        except Exception:
+            pass
+        return bool(getattr(seg_tab, "_enable_dll_profiling", False))
+
+    def _online_apply_dll_profiling(self) -> None:
+        """Re-push SetProfiling after Online DLL reload (flag resets on reload)."""
+        seg_tab = getattr(self, "segmentation_tab", None)
+        if seg_tab is not None and hasattr(seg_tab, "_apply_dll_profiling_flag"):
+            try:
+                seg_tab._apply_dll_profiling_flag()
+                return
+            except Exception:
+                pass
+        # Fallback: apply directly from checkbox state
+        enabled = self._online_dll_profiling_enabled()
+        import logging
+        applied = []
+        try:
+            from inno3d.core import bumpvoid
+            if bumpvoid.set_profiling(enabled):
+                applied.append("SEG")
+        except Exception:
+            pass
+        try:
+            from inno3d.core import bumpvoid_mes
+            if bumpvoid_mes.set_profiling(enabled):
+                applied.append("MES")
+        except Exception:
+            pass
+        try:
+            from inno3d.core import bumpvoid_b2b
+            if bumpvoid_b2b.set_profiling(enabled):
+                applied.append("B2B")
+        except Exception:
+            pass
+        msg = (
+            f"[DLL Profiling] ENABLED → {', '.join(applied)}"
+            if enabled
+            else "[DLL Profiling] disabled"
+        )
+        logging.getLogger("DLL_PROF").info(msg)
+        print(msg)
+
+    def _online_reset_profiling_report(self) -> None:
+        seg_tab = self.segmentation_tab
+        if seg_tab is None or not hasattr(seg_tab, "_reset_profiling_report"):
+            return
+        lines = []
+        host_info = getattr(self, "_online_host_path_info", None)
+        if host_info is not None and hasattr(host_info, "breadcrumb"):
+            try:
+                lines.append(f"Context: {host_info.breadcrumb()}")
+            except Exception:
+                pass
+        rd = getattr(self, "_online_results_dir", None)
+        if rd:
+            lines.append(f"Results: {rd}")
+        recipe = getattr(self, "_online_recipe", None) or {}
+        mode = recipe.get("input_mode", "test_1layer")
+        layers = recipe.get("layers") or []
+        lines.append(f"INPUT_MODE: {mode}")
+        if layers:
+            lines.append(f"Layers: {len(layers)}")
+        src = getattr(self, "_online_source_file", None) or getattr(self, "_online_runtime_input_file", None)
+        if src:
+            lines.append(f"Runtime input: {src}")
+
+        mpv = getattr(self, "multiplanar_tab", None)
+        vol = None
+        if mpv is not None:
+            vol = getattr(mpv, "volume_data", None)
+        if vol is None and seg_tab is not None:
+            vol = getattr(seg_tab, "volume_data", None)
+        if vol is not None and seg_tab is not None:
+            seg_tab.volume_data = vol
+
+        gpu_id = getattr(self, "_online_enhancement_gpu_id", 0)
+        if seg_tab is not None and hasattr(seg_tab, "enh_gpuid_spin") and seg_tab.enh_gpuid_spin is not None:
+            try:
+                gpu_id = int(seg_tab.enh_gpuid_spin.value())
+            except Exception:
+                pass
+
+        from inno3d.core.dll_profiling import build_profiling_context_lines
+
+        builder = seg_tab._get_profiling_report_builder()
+        builder.reset()
+        ctx = build_profiling_context_lines(
+            volume=vol,
+            spacing=seg_tab._profiling_voxel_spacing() if hasattr(seg_tab, "_profiling_voxel_spacing") else None,
+            gpu_device_id=int(gpu_id or 0),
+            extra_lines=lines,
+        )
+        builder.set_context(ctx, gpu_device_id=int(gpu_id or 0))
+
+    def _online_log_dll_timing(self, module: str, getter, note=None) -> None:
+        """Write stage timing into Inno3D_Logs + Online UI log."""
+        import logging
+        log = logging.getLogger("DLL_PROF")
+        if not self._online_dll_profiling_enabled():
+            return
+        try:
+            from inno3d.core.dll_profiling import format_timing_banner
+            info = getter()
+            seg_tab = self.segmentation_tab
+            if seg_tab is not None and hasattr(seg_tab, "_record_profiling_section"):
+                banner = seg_tab._record_profiling_section(module, info, note=note)
+            else:
+                banner = format_timing_banner(module, info)
+            for line in banner.splitlines():
+                log.info(line)
+            print(banner)
+            if hasattr(self, "_online_append_log") and self._online_append_log:
+                # One compact line in Online panel; full report in file log
+                if info and info.get("total_sec") is not None:
+                    self._online_append_log(
+                        f"[{module} PROF] total={info.get('total_sec', 0):.3f}s "
+                        f"load={info.get('load_io_sec', 0):.3f}s "
+                        f"algo={info.get('algo_sec', 0):.3f}s "
+                        f"save={info.get('save_io_sec', 0):.3f}s "
+                        f"h2d={info.get('h2d_sec', 0):.3f}s "
+                        f"d2h={info.get('d2h_sec', 0):.3f}s",
+                        "#80CBC4",
+                    )
+                else:
+                    self._online_append_log(
+                        f"[{module} PROF] (no timing detail — see Inno3D_Logs DLL_PROF)",
+                        SemiconductorTheme.ACCENT_WARNING,
+                    )
+        except Exception as e:
+            log.error("[%s] Online profiling read failed: %s", module, e)
+
     def _start_online_segmentation(self):
         """Start DLL segmentation in background (called after optional enhancement).
 
@@ -1454,6 +1625,7 @@ class OnlineModeMixin:
           - test_1layer  → layers=None (one DLL pass on full runtime volume)
           - single       → layers=runtime Z bands (split → stitch)
         """
+        self._online_apply_dll_profiling()
         seg_tab = self.segmentation_tab
         first_volume = (
             self._online_runtime_input_file
@@ -1513,6 +1685,15 @@ class OnlineModeMixin:
             self._close_online_progress(ok=False)
             self._online_cleanup()
             return
+
+        try:
+            from inno3d.core import bumpvoid
+            recipe = getattr(self, "_online_recipe", None) or {}
+            n_layers = len(recipe.get("layers") or [])
+            seg_note = "last layer only" if n_layers > 1 else None
+            self._online_log_dll_timing("SEG", bumpvoid.get_last_timing, note=seg_note)
+        except Exception:
+            pass
 
         # Move to measure stage (keep dialog open; still no algorithm detail)
         self._set_online_stage("measure", 10)
@@ -1765,6 +1946,33 @@ class OnlineModeMixin:
                         SemiconductorTheme.ACCENT_WARNING,
                     )
 
+            # Profiling-only text file in Results folder
+            try:
+                seg_tab = self.segmentation_tab
+                if seg_tab is not None and hasattr(seg_tab, "_flush_profiling_report"):
+                    footer = [
+                        f"Wall-clock summary: Bump={b_time:.1f}s "
+                        f"Void={v_time:.1f}s Total={t_time:.1f}s",
+                    ]
+                    if getattr(self, "_online_last_enhance_sec", 0) > 0:
+                        footer.append(
+                            f"Enhance wall time: {self._online_last_enhance_sec:.1f}s"
+                        )
+                    footer.append(
+                        "Note: SEG/B2B stage breakdown is from the last DLL "
+                        "layer pass when multi-layer."
+                    )
+                    prof_path = seg_tab._flush_profiling_report(
+                        results_dir, footer_lines=footer
+                    )
+                    if prof_path and hasattr(self, "_online_append_log") and self._online_append_log:
+                        self._online_append_log(
+                            f"[PROF] Report → {prof_path}",
+                            "#80CBC4",
+                        )
+            except Exception as prof_err:
+                print(f"[ONLINE] Profiling report save failed: {prof_err}")
+
             self._close_online_progress(ok=True)
             self.switch_tab(0)
 
@@ -1854,7 +2062,7 @@ class OnlineModeMixin:
         }
 
     def _ensure_mes_loaded(self):
-        """Load FAR-capable BumpVoidMes.dll (auto-fallback if shared V2 has old binary)."""
+        """Load BumpVoidMes.dll from Teaching DLL folder (same package as SEG)."""
         from inno3d.core import bumpvoid_mes
 
         seg = getattr(self, "segmentation_tab", None)
@@ -1863,18 +2071,27 @@ class OnlineModeMixin:
             from inno3d.core.resources import default_dll_dir
 
             dll_dir = default_dll_dir() or ""
-        # Always resolve via load_dll candidate search (skips pre-FAR 69KB DLL)
+        if not dll_dir:
+            raise RuntimeError("No DLL folder set in Teaching — browse V2 or V3 first")
+
+        force = True
         if bumpvoid_mes.is_loaded():
-            # If already loaded an old MES, force re-pick FAR build
             path = bumpvoid_mes.get_dll_path() or ""
             try:
+                cur_dir = os.path.dirname(path) if path else ""
+                same = (
+                    cur_dir
+                    and os.path.normcase(os.path.abspath(cur_dir))
+                    == os.path.normcase(os.path.abspath(dll_dir))
+                )
                 sz = os.path.getsize(path) if path and os.path.isfile(path) else 0
             except OSError:
-                sz = 0
-            if sz >= 75000:
+                same, sz = False, 0
+            if same and sz >= 75000:
                 return bumpvoid_mes
             bumpvoid_mes.unload_dll()
-        ver = bumpvoid_mes.load_dll(dll_dir, force=True)
+
+        ver = bumpvoid_mes.load_dll(dll_dir, force=force)
         mes_path = bumpvoid_mes.get_dll_path() or dll_dir
         print(f"[ONLINE MES] Loaded BumpVoidMes.dll version={ver} path={mes_path}")
         if hasattr(self, "_online_append_log") and self._online_append_log:
@@ -1910,6 +2127,7 @@ class OnlineModeMixin:
             # ── Primary: BumpVoidMes.dll ───────────────────────────────
             try:
                 bumpvoid_mes = self._ensure_mes_loaded()
+                self._online_apply_dll_profiling()
                 if mpv.class1_data is None:
                     raise RuntimeError("No class1 (bump) mask for measurement")
 
@@ -1970,6 +2188,10 @@ class OnlineModeMixin:
                 mes_elapsed = float(getattr(res, "elapsedSec", 0) or 0)
                 far_rm = int(getattr(res, "farRemovedBumps", 0) or 0)
                 far_cv = int(getattr(res, "farClearedVoids", 0) or 0)
+                try:
+                    self._online_log_dll_timing("MES", bumpvoid_mes.get_last_timing)
+                except Exception:
+                    pass
 
                 # Apply FAR-cleaned masks for visualization + B2B (before display)
                 if bump_clean is not None:
@@ -2017,7 +2239,7 @@ class OnlineModeMixin:
                             )
                             s["layer_name"] = best["name"]
 
-                # Unified indexing: (0,0) = top-left XY, per-layer (Teaching-style, 0-based)
+                # Unified indexing: (1,1) = top-left XY, per-layer (Teaching-style, 1-based)
                 mes_stats = bumpvoid_mes.reindex_grid_top_left(
                     mes_stats, voxel_x=vx, voxel_y=vy, per_layer=True
                 )
@@ -2137,15 +2359,26 @@ class OnlineModeMixin:
 
             dll_dir = default_dll_dir() or ""
 
-        force = False
-        if bumpvoid_b2b.is_loaded() and not bumpvoid_b2b.is_gap_capable():
-            print(
-                f"[ONLINE B2B] Reloading: current DLL is summary-only "
-                f"({bumpvoid_b2b.get_dll_path()})"
-            )
-            force = True
-        elif not bumpvoid_b2b.is_loaded():
-            force = False
+        force = True
+        if bumpvoid_b2b.is_loaded():
+            path = bumpvoid_b2b.get_dll_path() or ""
+            try:
+                cur_dir = os.path.dirname(path) if path else ""
+                same = (
+                    cur_dir
+                    and os.path.normcase(os.path.abspath(cur_dir))
+                    == os.path.normcase(os.path.abspath(dll_dir))
+                )
+            except Exception:
+                same = False
+            if same and bumpvoid_b2b.is_gap_capable():
+                force = False
+            elif not bumpvoid_b2b.is_gap_capable():
+                print(
+                    f"[ONLINE B2B] Reloading: current DLL is summary-only "
+                    f"({bumpvoid_b2b.get_dll_path()})"
+                )
+                force = True
 
         ver = bumpvoid_b2b.load_dll(dll_dir, force=force)
         path = bumpvoid_b2b.get_dll_path() or ""
@@ -2210,6 +2443,7 @@ class OnlineModeMixin:
             vz_eff = (vz / 4.0) if params["z4x"] else vz
 
             bumpvoid_b2b = self._ensure_b2b_loaded()
+            self._online_apply_dll_profiling()
             layers = self._online_layer_bands()
             if not layers:
                 # Full-volume single pass
@@ -2315,6 +2549,10 @@ class OnlineModeMixin:
             if rows:
                 combined_path = bumpvoid_b2b.write_combined_summary(combined_path, rows)
                 print(f"[STATS] B2B combined CSV: {combined_path} ({len(rows)} rows)")
+            try:
+                self._online_log_dll_timing("B2B", bumpvoid_b2b.get_last_timing)
+            except Exception:
+                pass
 
             if hasattr(mpv, "populate_b2b_table"):
                 mpv.populate_b2b_table(rows, source_label="B2B")
@@ -2552,7 +2790,12 @@ class OnlineModeMixin:
             )
         # Notify Batch Review tab if present
         br = getattr(self, "batch_review_tab", None)
-        if br is not None and hasattr(br, "refresh_all"):
+        if br is not None and hasattr(br, "on_run_catalogued"):
+            try:
+                br.on_run_catalogued(payload)
+            except Exception:
+                pass
+        elif br is not None and hasattr(br, "refresh_all"):
             try:
                 br.refresh_all()
             except Exception:

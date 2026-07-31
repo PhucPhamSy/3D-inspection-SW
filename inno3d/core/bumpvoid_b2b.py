@@ -192,6 +192,21 @@ def _setup():
     for name in ("B2B_GetProductName", "B2B_GetModuleCode"):
         if hasattr(_dll, name):
             getattr(_dll, name).restype = ctypes.c_char_p
+    try:
+        from inno3d.core.dll_profiling import _bind_optional
+        _bind_optional(_dll, "B2B_SetProfiling", "B2B_GetProfiling", "B2B_GetLastTiming")
+    except Exception:
+        pass
+
+
+def set_profiling(enable: bool) -> bool:
+    from inno3d.core.dll_profiling import set_profiling as _sp
+    return _sp(_dll, enable, "B2B_SetProfiling")
+
+
+def get_last_timing():
+    from inno3d.core.dll_profiling import get_last_timing as _gt
+    return _gt(_dll, "B2B_GetLastTiming")
 
 
 def _check():

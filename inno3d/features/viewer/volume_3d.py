@@ -279,6 +279,9 @@ class Volume3dMixin:
 
         self._hide_3d_disabled_placeholder()
         if self.volume_data is not None:
+            # Force camera reset when re-enabling — the camera was set by
+            # crosshair-only code while volume was OFF (no AABB context).
+            self._camera_initialized = False
             self.render_3d()
             if getattr(self, "crosshair_enabled", False) and hasattr(self, "update_3d_crosshair"):
                 try:

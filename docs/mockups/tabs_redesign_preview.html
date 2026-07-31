@@ -1,0 +1,1558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inno3D — Line Pulse + 3D Analysis Preview</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --bg2: #121820;
+    --panel: #151c26;
+    --panel2: #1a2330;
+    --border: #2a3544;
+    --border2: #3a4a5c;
+    --text: #e8eef6;
+    --muted: #8b9bb0;
+    --cyan: #22d3ee;
+    --cyan-dim: #0e7490;
+    --green: #34d399;
+    --amber: #fbbf24;
+    --red: #f87171;
+    --blue: #60a5fa;
+    --purple: #a78bfa;
+    --chip-ok: #14532d;
+    --chip-ng: #7f1d1d;
+    --chip-pend: #1e293b;
+    --chip-run: #164e63;
+    --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: "Cascadia Code", "Consolas", monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  /* App chrome */
+  .app-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    background: linear-gradient(180deg, #0f1620, #0b0f14);
+    border-bottom: 1px solid var(--border);
+  }
+  .logo {
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    background: linear-gradient(135deg, var(--cyan), #0891b2);
+    display: grid; place-items: center;
+    font-weight: 800; font-size: 11px; color: #042f2e;
+  }
+  .app-title { font-weight: 700; letter-spacing: 0.04em; font-size: 13px; }
+  .app-title span { color: var(--cyan); }
+  .nav {
+    display: flex; gap: 4px; margin-left: 24px; flex-wrap: wrap;
+  }
+  .nav button {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--muted);
+    padding: 7px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    text-transform: uppercase;
+  }
+  .nav button:hover { color: var(--text); background: var(--panel); }
+  .nav button.active {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+    background: rgba(34, 211, 238, 0.08);
+  }
+  .preview-badge {
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--amber);
+    border: 1px solid #854d0e;
+    background: rgba(251, 191, 36, 0.08);
+    padding: 4px 10px;
+    border-radius: 999px;
+    letter-spacing: 0.04em;
+  }
+  .tagline {
+    padding: 6px 14px;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+  }
+  .tagline b { color: var(--cyan); font-weight: 600; }
+  .stage { flex: 1; min-height: 0; display: none; }
+  .stage.active { display: flex; flex-direction: column; }
+  /* Shared layout */
+  .split {
+    display: grid;
+    grid-template-columns: 270px 1fr 290px;
+    gap: 0;
+    flex: 1;
+    min-height: 0;
+    height: calc(100vh - 86px);
+  }
+  .col {
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .col:last-child { border-right: none; }
+  .col-center { background: var(--bg2); }
+  .pad { padding: 10px 12px; }
+  .section {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  .field { margin-bottom: 8px; }
+  .field label {
+    display: block;
+    font-size: 10px;
+    color: var(--muted);
+    margin-bottom: 3px;
+  }
+  select, input[type="text"] {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border2);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin: 8px 0 10px;
+  }
+  .kpi {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+  }
+  .kpi .v {
+    font-size: 16px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .kpi .l { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .kpi.ok .v { color: var(--green); }
+  .kpi.ng .v { color: var(--red); }
+  .kpi.live .v { color: var(--cyan); }
+  .wafer-row {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    cursor: pointer;
+  }
+  .wafer-row:hover, .wafer-row.sel {
+    border-color: var(--cyan-dim);
+    background: rgba(34, 211, 238, 0.06);
+  }
+  .wafer-row .top {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 12px; font-weight: 600;
+  }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    display: inline-block; margin-right: 6px;
+  }
+  .dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.off { background: #475569; }
+  .wafer-row .mid { font-size: 11px; color: var(--text); margin-top: 4px; }
+  .wafer-row .sub { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .progress {
+    height: 4px; background: #1e293b; border-radius: 2px; margin-top: 6px; overflow: hidden;
+  }
+  .progress > i {
+    display: block; height: 100%; background: linear-gradient(90deg, var(--cyan-dim), var(--cyan));
+    width: 78%;
+  }
+  .btn-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 8px; }
+  .btn {
+    background: var(--panel2);
+    border: 1px solid var(--border2);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .btn:hover { border-color: var(--cyan-dim); color: var(--cyan); }
+  .btn.primary {
+    background: rgba(34, 211, 238, 0.12);
+    border-color: var(--cyan-dim);
+    color: var(--cyan);
+    font-weight: 600;
+  }
+  .breadcrumb {
+    font-size: 11px;
+    color: var(--muted);
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .breadcrumb strong { color: var(--text); font-weight: 600; }
+  .breadcrumb .sep { margin: 0 6px; opacity: 0.5; }
+  .live-strip {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    background: linear-gradient(90deg, rgba(34, 211, 238, 0.1), transparent);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+  }
+  .live-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--green); font-weight: 700; letter-spacing: 0.08em;
+  }
+  .live-strip .bar {
+    flex: 1; min-width: 120px; max-width: 220px;
+    height: 8px; background: #1e293b; border-radius: 4px; overflow: hidden;
+  }
+  .live-strip .bar > i { display: block; height: 100%; width: 78%; background: var(--cyan); }
+  /* Map stage */
+  .map-wrap {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+  }
+  .map-toolbar {
+    display: flex; align-items: center; gap: 8px; font-size: 11px;
+  }
+  .map-toolbar .levels {
+    display: flex; background: var(--bg); border-radius: 6px; border: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .map-toolbar .levels button {
+    border: none; background: transparent; color: var(--muted);
+    padding: 5px 10px; font-size: 11px; cursor: pointer;
+  }
+  .map-toolbar .levels button.on {
+    background: rgba(34, 211, 238, 0.15); color: var(--cyan);
+  }
+  .map-canvas {
+    background: radial-gradient(circle at 50% 50%, #1a2533 0%, #0d1218 70%);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    height: 280px;
+    position: relative;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+  }
+  .wafer-disk {
+    width: 240px; height: 240px;
+    border-radius: 50%;
+    border: 2px solid #334155;
+    position: relative;
+    background: #0f172a;
+    box-shadow: inset 0 0 40px rgba(0,0,0,0.5);
+  }
+  .die {
+    position: absolute;
+    width: 14px; height: 14px;
+    border-radius: 2px;
+    border: 1px solid #0006;
+    cursor: pointer;
+    transition: transform 0.12s;
+  }
+  .die:hover { transform: scale(1.25); z-index: 2; }
+  .die.ok { background: #16a34a; }
+  .die.ng { background: #dc2626; }
+  .die.pend { background: #334155; }
+  .die.run { background: var(--cyan); animation: pulse 1.2s infinite; }
+  .die.sel { outline: 2px solid #fff; outline-offset: 1px; z-index: 3; }
+  @keyframes pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(34,211,238,0.5); }
+    50% { box-shadow: 0 0 0 6px rgba(34,211,238,0); }
+  }
+  .chip-zoom {
+    width: 220px; height: 220px;
+    background: #0f172a;
+    border: 1px solid var(--border2);
+    border-radius: 12px;
+    padding: 12px;
+    display: none;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .chip-zoom.show { display: flex; }
+  .wafer-disk.hide { display: none; }
+  .chip-zoom h4 { font-size: 12px; font-weight: 600; color: var(--cyan); }
+  .fov-grid {
+    flex: 1;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+  .fov-cell {
+    border-radius: 8px;
+    border: 1px solid var(--border2);
+    display: grid;
+    place-items: center;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    background: #1e293b;
+  }
+  .fov-cell.ok { background: #14532d; border-color: #166534; color: #bbf7d0; }
+  .fov-cell.ng { background: #7f1d1d; border-color: #991b1b; color: #fecaca; }
+  .fov-cell.pend { color: var(--muted); }
+  .fov-cell.sel { box-shadow: 0 0 0 2px var(--cyan); }
+  .legend {
+    display: flex; gap: 10px; font-size: 10px; color: var(--muted); flex-wrap: wrap;
+  }
+  .legend i {
+    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    margin-right: 4px; vertical-align: -1px;
+  }
+  table.data {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+  }
+  table.data th {
+    text-align: left;
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky; top: 0;
+  }
+  table.data td {
+    padding: 6px 8px;
+    border-bottom: 1px solid #1e293b;
+    font-variant-numeric: tabular-nums;
+  }
+  table.data tr.sel td { background: rgba(34, 211, 238, 0.08); }
+  table.data tr:hover td { background: rgba(255,255,255,0.03); }
+  .badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .badge.ok { background: #14532d; color: #bbf7d0; }
+  .badge.ng { background: #7f1d1d; color: #fecaca; }
+  .table-box {
+    margin: 0 12px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: auto;
+    max-height: 130px;
+    background: var(--panel);
+  }
+  .table-title {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    padding: 8px 12px 4px;
+  }
+  .hint {
+    font-size: 10px;
+    color: var(--muted);
+    padding: 0 12px 8px;
+    font-style: italic;
+  }
+  .snapshot {
+    margin: 0 12px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    padding: 10px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  .thumb {
+    width: 72px; height: 72px;
+    border-radius: 6px;
+    background:
+      linear-gradient(45deg, #0e7490 25%, transparent 25%),
+      linear-gradient(-45deg, #155e75 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #0e7490 75%),
+      linear-gradient(-45deg, transparent 75%, #164e63 75%);
+    background-size: 12px 12px;
+    background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+    border: 1px solid var(--border2);
+    position: relative;
+  }
+  .thumb::after {
+    content: "mask";
+    position: absolute; inset: 0;
+    display: grid; place-items: center;
+    font-size: 9px; color: #a5f3fc; background: rgba(0,0,0,0.25);
+  }
+  .snap-meta { flex: 1; font-size: 11px; }
+  .snap-meta h4 { font-size: 12px; margin-bottom: 4px; }
+  .snap-meta p { color: var(--muted); line-height: 1.4; }
+  .right-block { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .bars { display: flex; align-items: flex-end; gap: 6px; height: 80px; margin-top: 8px; }
+  .bars .b {
+    flex: 1;
+    background: linear-gradient(180deg, var(--cyan), var(--cyan-dim));
+    border-radius: 3px 3px 0 0;
+    position: relative;
+    min-height: 4px;
+  }
+  .bars .b span {
+    position: absolute; bottom: -16px; left: 50%; transform: translateX(-50%);
+    font-size: 9px; color: var(--muted);
+  }
+  .timeline { list-style: none; font-size: 11px; }
+  .timeline li {
+    display: flex; gap: 8px; padding: 6px 0;
+    border-bottom: 1px solid #1e293b;
+  }
+  .timeline .t { color: var(--muted); width: 42px; font-variant-numeric: tabular-nums; }
+  .timeline .ok { color: var(--green); }
+  .ticker {
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--muted);
+    max-height: 100px;
+    overflow: auto;
+  }
+  .ticker div { padding: 3px 0; border-bottom: 1px solid #1e293b; }
+  .ticker .ng { color: var(--red); }
+  .ticker .ok { color: var(--green); }
+
+  /* Analysis tab */
+  .a-split {
+    display: grid;
+    grid-template-columns: 280px 1fr 300px;
+    height: calc(100vh - 86px);
+  }
+  .tree {
+    font-size: 11px;
+    overflow: auto;
+    flex: 1;
+    padding: 0 4px 8px;
+  }
+  .tree details { margin-left: 8px; }
+  .tree summary {
+    cursor: pointer;
+    padding: 3px 4px;
+    border-radius: 4px;
+    list-style: none;
+  }
+  .tree summary::-webkit-details-marker { display: none; }
+  .tree summary:hover { background: rgba(255,255,255,0.04); }
+  .tree label {
+    display: flex; align-items: center; gap: 6px;
+    padding: 2px 4px 2px 18px;
+    cursor: pointer;
+  }
+  .tree input { accent-color: var(--cyan); }
+  .metric-bar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 8px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+  }
+  .metric-bar select {
+    width: auto; min-width: 110px;
+  }
+  .studio-tabs {
+    display: flex; gap: 2px; padding: 8px 12px 0; flex-wrap: wrap;
+  }
+  .studio-tabs button {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--muted);
+    padding: 6px 12px;
+    border-radius: 6px 6px 0 0;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .studio-tabs button.on {
+    color: var(--cyan);
+    border-color: var(--border);
+    border-bottom-color: var(--bg2);
+    background: var(--bg2);
+  }
+  .studio-body { padding: 12px; overflow: auto; flex: 1; }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+  }
+  .card .v { font-size: 18px; font-weight: 700; color: var(--cyan); }
+  .card .l { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .charts {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .chart-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    min-height: 160px;
+  }
+  .chart-box h5 {
+    font-size: 10px; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 10px;
+  }
+  .layer-bars {
+    display: flex; align-items: flex-end; gap: 4px; height: 110px;
+  }
+  .layer-bars .lb {
+    flex: 1;
+    background: linear-gradient(180deg, #67e8f9, #0e7490);
+    border-radius: 2px 2px 0 0;
+    position: relative;
+  }
+  .layer-bars .lb span {
+    position: absolute; bottom: -14px; left: 50%; transform: translateX(-50%);
+    font-size: 8px; color: var(--muted);
+  }
+  .heat {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    max-width: 180px;
+    margin: 8px auto;
+  }
+  .heat div {
+    aspect-ratio: 1;
+    border-radius: 6px;
+    display: grid; place-items: center;
+    font-size: 10px; font-weight: 700;
+    color: #042f2e;
+  }
+  .insight-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    margin-bottom: 10px;
+    font-size: 11px;
+  }
+  .insight-card h4 { font-size: 12px; color: var(--cyan); margin-bottom: 6px; }
+  .hist {
+    display: flex; align-items: flex-end; gap: 2px; height: 60px; margin: 8px 0;
+  }
+  .hist i {
+    flex: 1;
+    background: var(--purple);
+    border-radius: 1px 1px 0 0;
+    opacity: 0.85;
+  }
+  .vs {
+    display: flex; gap: 8px; margin-top: 8px;
+  }
+  .vs .side {
+    flex: 1;
+    background: var(--bg);
+    border-radius: 6px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    font-size: 10px;
+  }
+  .footer-note {
+    padding: 6px 14px;
+    font-size: 10px;
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+    background: #0a0e13;
+  }
+  .diff-callout {
+    margin: 8px 12px;
+    padding: 8px 10px;
+    border-left: 3px solid var(--amber);
+    background: rgba(251, 191, 36, 0.06);
+    font-size: 11px;
+    color: #fde68a;
+    border-radius: 0 6px 6px 0;
+  }
+  .diff-callout.danger {
+    border-left-color: var(--red);
+    background: rgba(248, 113, 113, 0.08);
+    color: #fecaca;
+  }
+  .diff-callout.info {
+    border-left-color: var(--cyan);
+    background: rgba(34, 211, 238, 0.06);
+    color: #a5f3fc;
+  }
+  .shk-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(34, 211, 238, 0.1);
+    border: 1px solid var(--cyan-dim);
+    color: var(--cyan);
+    font-size: 11px;
+    font-family: var(--mono);
+    font-weight: 600;
+  }
+  .lock-row {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    font-size: 11px; margin-top: 6px;
+  }
+  .lock-row label {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: var(--bg); border: 1px solid var(--border);
+    padding: 3px 8px; border-radius: 6px; cursor: pointer;
+  }
+  .lock-row input { accent-color: var(--cyan); }
+  .mode-ladder {
+    display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 8px;
+  }
+  .mode-ladder button {
+    border: 1px solid var(--border2);
+    background: var(--bg);
+    color: var(--muted);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .mode-ladder button.on {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+    background: rgba(34, 211, 238, 0.12);
+  }
+  .mode-ladder button.warn.on {
+    color: var(--amber);
+    border-color: #854d0e;
+    background: rgba(251, 191, 36, 0.1);
+  }
+  .vstack {
+    display: flex; flex-direction: column; gap: 6px; margin-top: 8px;
+  }
+  .vstack .row {
+    display: grid; grid-template-columns: 64px 1fr 40px;
+    gap: 8px; align-items: center; font-size: 11px;
+  }
+  .vstack .track {
+    height: 10px; background: #1e293b; border-radius: 4px; overflow: hidden;
+  }
+  .vstack .track > i {
+    display: block; height: 100%; border-radius: 4px;
+  }
+  .pair-matrix {
+    display: grid;
+    grid-template-columns: 48px repeat(4, 1fr);
+    gap: 3px;
+    font-size: 9px;
+    margin-top: 8px;
+  }
+  .pair-matrix .h, .pair-matrix .l {
+    color: var(--muted); display: grid; place-items: center; text-align: center;
+  }
+  .pair-matrix .c {
+    aspect-ratio: 1;
+    border-radius: 4px;
+    display: grid; place-items: center;
+    font-weight: 700; color: #0b0f14;
+  }
+  .bump-delta-grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 3px;
+    margin-top: 8px;
+  }
+  .bump-delta-grid i {
+    aspect-ratio: 1;
+    border-radius: 3px;
+  }
+  .studio-pane { display: none; }
+  .studio-pane.on { display: block; }
+  .anchor-box {
+    background: var(--bg);
+    border: 1px dashed var(--cyan-dim);
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 11px;
+    margin-bottom: 8px;
+  }
+  .anchor-box strong { color: var(--cyan); }
+  .two-col-charts {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  @media (max-width: 1200px) {
+    .two-col-charts { grid-template-columns: 1fr; }
+    .split, .a-split { grid-template-columns: 240px 1fr 260px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="app-bar">
+  <div class="logo">3D</div>
+  <div class="app-title">Inno<span>3D</span> HBM</div>
+  <nav class="nav">
+    <button type="button" data-tab="viewer">3D Viewer</button>
+    <button type="button" data-tab="teaching">Teaching</button>
+    <button type="button" data-tab="online">Online</button>
+    <button type="button" data-tab="pulse" id="nav-pulse">Line Pulse</button>
+    <button type="button" class="active" data-tab="analysis" id="nav-analysis">3D Analysis</button>
+    <button type="button" data-tab="help">Help</button>
+  </nav>
+  <div class="preview-badge">UI PREVIEW · NOT LIVE APP</div>
+</div>
+
+<div class="tagline">
+  Concept · <b>Pulse</b> live line · <b>Probe</b> Viewer · <b>Prove</b> H²C² Homology Cross (SHK-matched chip/wafer/FOUP/lot)
+</div>
+
+<!-- ========== LINE PULSE ========== -->
+<section class="stage" id="stage-pulse">
+  <div class="split">
+    <!-- LEFT -->
+    <aside class="col">
+      <div class="pad" style="flex:1; overflow:auto; display:flex; flex-direction:column;">
+        <div class="section">Production browser</div>
+        <div class="field">
+          <label>Date</label>
+          <select><option>2026-07-25</option><option>2026-07-24</option></select>
+        </div>
+        <div class="field">
+          <label>Lot</label>
+          <select><option>LOT240701</option><option>LOT240101</option></select>
+        </div>
+        <div class="field">
+          <label>FOUP</label>
+          <select><option>01</option><option>09</option></select>
+        </div>
+        <div class="field">
+          <label>Wafer</label>
+          <select><option>WAFER01</option><option>WAFER09</option></select>
+        </div>
+        <div class="field">
+          <label>Judgment</label>
+          <select><option>All</option><option>OK only</option><option>NG only</option></select>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi live"><div class="v">94 / 120</div><div class="l">FOV done</div></div>
+          <div class="kpi ok"><div class="v">90.4%</div><div class="l">Yield (OK FOV)</div></div>
+          <div class="kpi ng"><div class="v">9</div><div class="l">NG FOV</div></div>
+          <div class="kpi"><div class="v">412</div><div class="l">NG bumps</div></div>
+        </div>
+
+        <div class="section">Wafer queue</div>
+        <div class="wafer-row sel">
+          <div class="top"><span><i class="dot live"></i>WAFER01</span><span style="color:var(--green);font-size:10px;">LIVE</span></div>
+          <div class="mid">94 / 120 FOV done · Yield 90.4% · NG 9</div>
+          <div class="sub">FOUP 01 · Recipe config_HBM · updated 14:22</div>
+          <div class="progress"><i></i></div>
+        </div>
+        <div class="wafer-row">
+          <div class="top"><span><i class="dot off"></i>WAFER09</span><span style="color:var(--muted);font-size:10px;">QUEUED</span></div>
+          <div class="mid">0 / 120 FOV done · Yield —</div>
+          <div class="sub">FOUP 01 · Recipe config_HBM</div>
+          <div class="progress"><i style="width:0%"></i></div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn primary" type="button">● Live</button>
+          <button class="btn" type="button">Refresh</button>
+          <button class="btn" type="button">Export</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- CENTER -->
+    <main class="col col-center" style="display:flex; flex-direction:column;">
+      <div class="live-strip">
+        <span class="live-pill"><i class="dot live"></i> LIVE</span>
+        <span><strong>LOT240701</strong> · FOUP 01 · WAFER01</span>
+        <span>FOV 94/120</span>
+        <div class="bar"><i></i></div>
+        <span style="color:var(--green)">Yield 90.4%</span>
+        <span style="color:var(--red)">NG 9</span>
+        <span style="color:var(--muted); margin-left:auto;">Last: Chip 19,11 · P6 · OK · 0.2s ago</span>
+      </div>
+      <div class="breadcrumb">
+        LINE PULSE
+        <span class="sep">›</span> 2026-07-25
+        <span class="sep">›</span> <strong>LOT240701</strong>
+        <span class="sep">›</span> FOUP 01
+        <span class="sep">›</span> WAFER01
+        <span class="sep">›</span> Chip 19,11
+        <span class="sep">›</span> <strong style="color:var(--cyan)">FOV P6</strong>
+      </div>
+
+      <div class="map-wrap">
+        <div class="map-toolbar">
+          <div class="section" style="margin:0">Map stage</div>
+          <div class="levels">
+            <button type="button" class="on" id="lvl-wafer">Wafer</button>
+            <button type="button" id="lvl-chip">Chip ▸ FOV</button>
+          </div>
+          <button class="btn" type="button" id="btn-zoom" style="padding:4px 8px;">Zoom in die</button>
+          <button class="btn" type="button" id="btn-zoomout" style="padding:4px 8px;">Back</button>
+          <div class="legend" style="margin-left:auto;">
+            <span><i style="background:#16a34a"></i>OK</span>
+            <span><i style="background:#dc2626"></i>NG</span>
+            <span><i style="background:#334155"></i>Pending</span>
+            <span><i style="background:var(--cyan)"></i>Running</span>
+          </div>
+        </div>
+        <div class="map-canvas" id="map-canvas">
+          <div class="wafer-disk" id="wafer-disk"></div>
+          <div class="chip-zoom" id="chip-zoom">
+            <h4>Chip 19,11 · FOV P1–P9</h4>
+            <div class="fov-grid" id="fov-grid"></div>
+            <div class="hint" style="padding:0; margin-top:4px;">Click FOV → select run · Double-click path → Open Viewer</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-title">FOV RUNS · filtered by map</div>
+      <div class="table-box">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>Chip</th><th>FOV</th><th>Status</th><th>Bumps</th><th>NG bumps</th><th>Time</th><th>Finished</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="sel">
+              <td>19,11</td><td>P6</td><td><span class="badge ok">OK</span></td>
+              <td>1,248</td><td>12</td><td>48.2s</td><td>14:22:08</td>
+            </tr>
+            <tr>
+              <td>19,11</td><td>P4</td><td><span class="badge ng">NG</span></td>
+              <td>1,248</td><td>86</td><td>51.0s</td><td>14:20:11</td>
+            </tr>
+            <tr>
+              <td>11,11</td><td>P6</td><td><span class="badge ok">OK</span></td>
+              <td>1,240</td><td>8</td><td>47.1s</td><td>14:18:02</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="table-title">BUMP RESULTS · this FOV</div>
+      <div class="hint">Each row = one bump site measured on this FOV (inspection MES step).</div>
+      <div class="table-box" style="max-height:100px;">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>#</th><th>Layer</th><th>Bump ID</th><th>Height</th><th>Void%</th><th>Judge</th><th>Gap X</th><th>Gap Y</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>L1</td><td>0,0</td><td>12.4</td><td>1.2</td><td><span class="badge ok">OK</span></td><td>7.4</td><td>5.7</td></tr>
+            <tr><td>2</td><td>L1</td><td>0,1</td><td>11.1</td><td>8.9</td><td><span class="badge ng">NG</span></td><td>7.4</td><td>6.0</td></tr>
+            <tr><td>3</td><td>L2</td><td>1,0</td><td>12.0</td><td>2.1</td><td><span class="badge ok">OK</span></td><td>7.1</td><td>5.7</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="snapshot">
+        <div class="thumb" title="1-slice snapshot"></div>
+        <div class="snap-meta">
+          <h4>FOV snapshot · not full MPR</h4>
+          <p>Mid-slice + mask preview only. Full zoom / window-level / MES↔3D link lives in Viewer.</p>
+          <p style="margin-top:4px;">Status OK · 12 layers · enhance 0.8s · MES done</p>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px;">
+          <button class="btn primary" type="button">Open full Viewer</button>
+          <button class="btn" type="button">Results folder</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- RIGHT -->
+    <aside class="col">
+      <div class="right-block">
+        <div class="section">Line summary</div>
+        <div style="font-size:12px; line-height:1.5;">
+          <div>Progress <strong>78%</strong> · 94/120 FOV</div>
+          <div>Yield <strong style="color:var(--green)">90.4%</strong></div>
+          <div>NG rate <strong style="color:var(--red)">9.6%</strong></div>
+          <div style="color:var(--muted); font-size:10px; margin-top:4px;">
+            Yield = OK FOV / finished FOV (tooltip formula)
+          </div>
+        </div>
+      </div>
+      <div class="right-block">
+        <div class="section">Yield by FOV point (P1–P9)</div>
+        <div class="bars" id="p-bars"></div>
+      </div>
+      <div class="right-block">
+        <div class="section">Run timeline · this FOV</div>
+        <ul class="timeline">
+          <li><span class="t">0.0s</span><span class="ok">Enhance ✓</span></li>
+          <li><span class="t">0.8s</span><span class="ok">SEG ✓</span></li>
+          <li><span class="t">12s</span><span class="ok">MES ✓ · 1248 bumps</span></li>
+          <li><span class="t">48s</span><span class="ok">B2B ✓ · gaps OK</span></li>
+        </ul>
+      </div>
+      <div class="right-block" style="flex:1; overflow:auto;">
+        <div class="section">Event ticker</div>
+        <div class="ticker">
+          <div class="ok">14:22:08  Chip 19,11 P6  OK</div>
+          <div class="ng">14:20:11  Chip 19,11 P4  NG  void%</div>
+          <div class="ok">14:18:02  Chip 11,11 P6  OK</div>
+          <div class="ok">14:16:40  Chip 11,11 P4  OK</div>
+          <div class="ng">14:14:01  Chip 15,12 P5  NG  SOH</div>
+        </div>
+      </div>
+      <div class="diff-callout">
+        No void-ratio deep hist here · that lives in <b>3D Analysis</b>.
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- ========== 3D ANALYSIS ========== -->
+<section class="stage active" id="stage-analysis">
+  <div class="a-split">
+    <aside class="col">
+      <div class="pad" style="flex:1; display:flex; flex-direction:column; min-height:0;">
+        <div class="section">Analysis scope</div>
+        <div class="field">
+          <label>Source</label>
+          <select><option>Database (default)</option><option>CSV lab fallback…</option></select>
+        </div>
+        <div class="field">
+          <label>Lot · FOUP</label>
+          <select>
+            <option>LOT240701 · FOUP 01</option>
+            <option>LOT240701 · FOUP 09</option>
+            <option>LOT240101 · FOUP 09</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Metric m</label>
+          <select><option>SOH / Z height (µm)</option><option>Void %</option><option>Bump volume</option><option>B2B gap</option></select>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi"><div class="v">36</div><div class="l">FOV in set</div></div>
+          <div class="kpi"><div class="v">44.8k</div><div class="l">Bumps</div></div>
+          <div class="kpi ok"><div class="v">12.31</div><div class="l">Mean SOH</div></div>
+          <div class="kpi"><div class="v">98.2%</div><div class="l">SHK coverage</div></div>
+        </div>
+
+        <div class="section">Anchor (baseline run)</div>
+        <div class="anchor-box">
+          <div><strong>ANCHOR</strong></div>
+          <div>LOT240701 · FOUP 01 · <strong>WAFER01</strong></div>
+          <div>Chip <strong>19,11</strong> · FOV <strong>P6</strong></div>
+          <div style="color:var(--muted); margin-top:4px;">Peers auto-match on SHK</div>
+        </div>
+
+        <div class="section">Cohort (multi-select)</div>
+        <div class="tree">
+          <details open>
+            <summary>▼ LOT240701 · FOUP 01</summary>
+            <details open>
+              <summary>▼ WAFER01</summary>
+              <details open>
+                <summary>▼ Chip 11,11</summary>
+                <label><input type="checkbox" /> FOV P4 <span style="color:var(--amber)">≠P6</span></label>
+                <label><input type="checkbox" checked /> FOV P6 ✓</label>
+              </details>
+              <details open>
+                <summary>▼ Chip 19,11</summary>
+                <label><input type="checkbox" /> FOV P4</label>
+                <label><input type="checkbox" checked /> FOV P6 · anchor</label>
+              </details>
+            </details>
+            <details open>
+              <summary>▼ WAFER09</summary>
+              <label><input type="checkbox" checked /> Chip 19,11 · P6 ✓</label>
+              <label><input type="checkbox" checked /> Chip 11,11 · P6 ✓</label>
+              <label><input type="checkbox" /> Chip 19,11 · P4 <span style="color:var(--amber)">blocked M1</span></label>
+            </details>
+          </details>
+          <details>
+            <summary>▼ LOT240101 · FOUP 09</summary>
+            <label><input type="checkbox" /> WAFER01 · Chip 19,11 · P6 (M4)</label>
+          </details>
+        </div>
+        <div class="btn-row">
+          <button class="btn primary" type="button">Run H²C²</button>
+          <button class="btn" type="button">Fair cohort</button>
+          <button class="btn" type="button">Export</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="col col-center" style="display:flex; flex-direction:column; min-height:0;">
+      <div class="breadcrumb">
+        3D ANALYSIS · H²C² Metrology lab
+        <span class="sep">›</span> Homology Cross
+        <span class="sep">›</span> <span class="shk-pill">SHK = (L8, P6, r,c)</span>
+      </div>
+      <div class="metric-bar">
+        <span>Mode ladder</span>
+        <div class="mode-ladder" id="mode-ladder" style="margin:0;">
+          <button type="button" class="on" data-mode="m1">M1 Die↔Die</button>
+          <button type="button" data-mode="m2">M2 Wafer↔Wafer</button>
+          <button type="button" data-mode="m3">M3 FOUP↔FOUP</button>
+          <button type="button" data-mode="m4">M4 Lot↔Lot</button>
+          <button type="button" class="warn" data-mode="m5">M5 FOV Bias ⚠</button>
+        </div>
+      </div>
+      <div class="metric-bar" style="border-top:none; padding-top:0;">
+        <span>SHK locks</span>
+        <div class="lock-row" style="margin:0;">
+          <label><input type="checkbox" checked disabled /> Layer</label>
+          <label><input type="checkbox" checked id="lock-fov" /> FOV index</label>
+          <label><input type="checkbox" checked /> Grid (r,c)</label>
+        </div>
+        <span style="margin-left:8px;">Δ agg</span>
+        <select style="width:auto;"><option>Median Δ</option><option>Mean Δ</option><option>P95 |Δ|</option></select>
+        <span>Tol</span>
+        <select style="width:auto;"><option>0.50 µm</option><option>0.30 µm</option></select>
+      </div>
+      <div class="studio-tabs" id="analysis-studio-tabs">
+        <button type="button" data-pane="overview">Overview</button>
+        <button type="button" class="on" data-pane="homology">Homology Cross</button>
+        <button type="button" data-pane="variance">Variance Stack</button>
+        <button type="button" data-pane="bump">Bump σ</button>
+        <button type="button" data-pane="root">Root cause</button>
+        <button type="button" data-pane="table">Table</button>
+      </div>
+      <div class="studio-body" style="overflow:auto; flex:1;">
+        <!-- Overview pane -->
+        <div class="studio-pane" id="pane-overview">
+          <div class="cards">
+            <div class="card"><div class="v">12</div><div class="l">Layers</div></div>
+            <div class="card"><div class="v">12.31</div><div class="l">Mean SOH µm</div></div>
+            <div class="card"><div class="v">0.42</div><div class="l">σ SOH</div></div>
+            <div class="card"><div class="v">3.8%</div><div class="l">NG rate (bumps)</div></div>
+          </div>
+          <div class="charts">
+            <div class="chart-box">
+              <h5>SOH BY LAYER · analysis set</h5>
+              <div class="layer-bars" id="layer-bars"></div>
+            </div>
+            <div class="chart-box">
+              <h5>SOH BY FOV · P1–P9 (µm) — descriptive only</h5>
+              <div class="heat" id="soh-heat"></div>
+            </div>
+          </div>
+          <div class="table-box" style="max-height:140px; margin:0;">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>Layer</th><th>N</th><th>Mean SOH</th><th>σ</th><th>Min</th><th>Max</th><th>Void%</th><th>NG%</th>
+                </tr>
+              </thead>
+              <tbody id="layer-table"></tbody>
+            </table>
+          </div>
+          <div class="diff-callout info" style="margin:12px 0 0;">
+            Overview pools descriptive stats. For fair cross-die/wafer compare use <b>Homology Cross</b> (SHK-matched).
+          </div>
+        </div>
+
+        <!-- Homology Cross pane -->
+        <div class="studio-pane on" id="pane-homology">
+          <div class="diff-callout info" style="margin:0 0 12px;" id="homology-banner">
+            <b>M1 Die↔Die</b> ⭐ · Chips are design-identical · Map folders
+            <code>Chip_A/FOV_P6</code> ↔ <code>Chip_B/FOV_P6</code> · Lock Layer + FOV + Grid · Free: <b>chip</b>.
+            Same FOV on every die is the natural compare — not a restriction against chip-to-chip.
+          </div>
+          <div class="diff-callout danger" style="margin:0 0 12px; display:none;" id="fov-bias-banner">
+            ⚠ <b>M5 FOV Bias study</b> — FOV index unlocked. Volumes are NOT class-matched.
+            Use only to estimate φ_f (P1…P9 bias). Do not blame die yield from this mode.
+          </div>
+
+          <div class="cards">
+            <div class="card"><div class="v">1,224</div><div class="l">Matched SHK pairs</div></div>
+            <div class="card"><div class="v">98.2%</div><div class="l">Coverage</div></div>
+            <div class="card"><div class="v" style="color:var(--amber)">−0.18</div><div class="l">Median Δ SOH µm</div></div>
+            <div class="card"><div class="v" style="color:var(--red)">4.1%</div><div class="l">Sites |Δ| &gt; tol</div></div>
+          </div>
+
+          <div class="two-col-charts">
+            <div class="chart-box">
+              <h5>Δ SOH BY FOV · median over grids (locked FOV → single cell lit)</h5>
+              <div class="heat" id="delta-fov-heat"></div>
+              <div class="legend" style="justify-content:center; margin-top:8px;">
+                <span><i style="background:#0e7490"></i>near 0</span>
+                <span><i style="background:#fbbf24"></i>shift</span>
+                <span><i style="background:#f87171"></i>|Δ| high</span>
+              </div>
+            </div>
+            <div class="chart-box">
+              <h5>Δ BUMP GRID · Layer 8 · FOV P6 · peer Chip 11,11 − anchor 19,11</h5>
+              <div class="bump-delta-grid" id="bump-delta"></div>
+              <div style="font-size:10px; color:var(--muted); margin-top:8px;">
+                Each cell = one lattice site (r,c). Color = ΔSOH at identical SHK.
+              </div>
+            </div>
+          </div>
+
+          <div class="two-col-charts" style="margin-top:10px;">
+            <div class="chart-box">
+              <h5>PAIR MATRIX · median |Δ| µm · chips on WAFER01 @ P6</h5>
+              <div class="pair-matrix" id="pair-matrix"></div>
+            </div>
+            <div class="chart-box">
+              <h5>MATCHED TABLE · top |Δ| sites</h5>
+              <div class="table-box" style="max-height:180px; margin:0; border:none;">
+                <table class="data">
+                  <thead>
+                    <tr>
+                      <th>SHK</th><th>m_anchor</th><th>m_peer</th><th>Δ</th><th>z</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td style="font-family:var(--mono);font-size:10px;">L8,P6,(3,2)</td>
+                      <td>12.40</td><td>11.02</td>
+                      <td style="color:var(--red)">−1.38</td><td>3.1</td>
+                    </tr>
+                    <tr>
+                      <td style="font-family:var(--mono);font-size:10px;">L8,P6,(1,4)</td>
+                      <td>12.10</td><td>11.21</td>
+                      <td style="color:var(--red)">−0.89</td><td>2.4</td>
+                    </tr>
+                    <tr>
+                      <td style="font-family:var(--mono);font-size:10px;">L7,P6,(2,2)</td>
+                      <td>12.05</td><td>11.40</td>
+                      <td style="color:var(--amber)">−0.65</td><td>1.9</td>
+                    </tr>
+                    <tr>
+                      <td style="font-family:var(--mono);font-size:10px;">L1,P6,(0,0)</td>
+                      <td>12.80</td><td>12.72</td>
+                      <td style="color:var(--green)">−0.08</td><td>0.3</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="diff-callout" style="margin:12px 0 0;">
+            Doctrine: <b>never compare volumes — compare homologous sites across volumes</b>, then attribute Δ to Lot / FOUP / Wafer / Chip.
+            Method doc: <code>docs/ANALYSIS_CROSS_HOMOLOGY_PATENT.md</code>
+          </div>
+        </div>
+
+        <!-- Variance Stack pane -->
+        <div class="studio-pane" id="pane-variance">
+          <div class="chart-box">
+            <h5>NESTED VARIANCE STACK · fixed SHK filter Layer=L8, FOV=P6 (pooled grids)</h5>
+            <div class="vstack" id="var-stack">
+              <div class="row"><span>Lot</span><div class="track"><i style="width:18%;background:#a78bfa;"></i></div><span>18%</span></div>
+              <div class="row"><span>FOUP</span><div class="track"><i style="width:7%;background:#60a5fa;"></i></div><span>7%</span></div>
+              <div class="row"><span>Wafer</span><div class="track"><i style="width:29%;background:#22d3ee;"></i></div><span>29%</span></div>
+              <div class="row"><span>Chip</span><div class="track"><i style="width:34%;background:#34d399;"></i></div><span>34%</span></div>
+              <div class="row"><span>Residual</span><div class="track"><i style="width:12%;background:#64748b;"></i></div><span>12%</span></div>
+            </div>
+            <p style="font-size:11px; color:var(--muted); margin-top:12px; line-height:1.5;">
+              High <b>Chip%</b> → die-local process · High <b>Wafer%</b> → wafer map / chuck ·
+              High <b>Lot%</b> → lot shift · High <b>Residual</b> → metrology / re-run noise.
+              Model: m = μ_SHK + α_Lot + β_FOUP|Lot + γ_Wafer|FOUP + δ_Chip|Wafer + ε
+            </p>
+          </div>
+          <div class="charts" style="margin-top:10px;">
+            <div class="chart-box">
+              <h5>HSI · Homology Stability Index (top unstable sites)</h5>
+              <div class="table-box" style="max-height:160px; margin:0; border:none;">
+                <table class="data">
+                  <thead><tr><th>SHK</th><th>σ strata</th><th>HSI</th><th>Rank</th></tr></thead>
+                  <tbody>
+                    <tr><td>L8,P6,(3,2)</td><td>0.71</td><td style="color:var(--red)">0.29</td><td>1 hotspot</td></tr>
+                    <tr><td>L8,P6,(1,4)</td><td>0.55</td><td style="color:var(--amber)">0.45</td><td>2</td></tr>
+                    <tr><td>L1,P6,(0,0)</td><td>0.11</td><td style="color:var(--green)">0.91</td><td>gold site</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="chart-box">
+              <h5>LOSO · leave-one-stratum-out impact on σ</h5>
+              <div class="table-box" style="max-height:160px; margin:0; border:none;">
+                <table class="data">
+                  <thead><tr><th>Remove</th><th>σ before</th><th>σ after</th><th>Impact</th></tr></thead>
+                  <tbody>
+                    <tr><td>Chip 19,11</td><td>0.42</td><td>0.31</td><td style="color:var(--red)">−0.11</td></tr>
+                    <tr><td>WAFER09</td><td>0.42</td><td>0.38</td><td>−0.04</td></tr>
+                    <tr><td>FOUP 01</td><td>0.42</td><td>0.40</td><td>−0.02</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Placeholder panes -->
+        <div class="studio-pane" id="pane-bump">
+          <div class="diff-callout info">Per-SHK σ across cohort (classic bump σ) — same SHK definition as Homology Cross.</div>
+          <div class="cards">
+            <div class="card"><div class="v">0.38</div><div class="l">Median site σ</div></div>
+            <div class="card"><div class="v">0.71</div><div class="l">Worst site σ</div></div>
+            <div class="card"><div class="v">12</div><div class="l">Sites &gt; tol σ</div></div>
+            <div class="card"><div class="v">L8</div><div class="l">Worst layer</div></div>
+          </div>
+        </div>
+        <div class="studio-pane" id="pane-root">
+          <div class="diff-callout info">Root cause = HSI hotspots + LOSO impact + optional classic LOO-VD on homologous means.</div>
+          <div class="insight-card">
+            <h4>Primary driver</h4>
+            Chip stratum explains 34% of nested variance @ L8/P6.
+            Site L8,P6,(3,2) is chronic hotspot (HSI 0.29).
+            Removing Chip 19,11 collapses cohort σ most (LOSO).
+          </div>
+        </div>
+        <div class="studio-pane" id="pane-table">
+          <div class="table-box" style="max-height:320px; margin:0;">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>Lot</th><th>FOUP</th><th>Wafer</th><th>Chip</th><th>FOV</th><th>Layer</th><th>r</th><th>c</th><th>SOH</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>240701</td><td>01</td><td>01</td><td>19,11</td><td>P6</td><td>L8</td><td>3</td><td>2</td><td>12.40</td></tr>
+                <tr><td>240701</td><td>01</td><td>01</td><td>11,11</td><td>P6</td><td>L8</td><td>3</td><td>2</td><td>11.02</td></tr>
+                <tr><td>240701</td><td>01</td><td>09</td><td>19,11</td><td>P6</td><td>L8</td><td>3</td><td>2</td><td>11.55</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <aside class="col">
+      <div class="pad" style="overflow:auto;">
+        <div class="section">Homology insight</div>
+        <div class="insight-card">
+          <h4>Focus · SHK L8,P6,(3,2)</h4>
+          <div>Anchor SOH <strong>12.40</strong></div>
+          <div>Peer Chip11,11 <strong style="color:var(--red)">11.02</strong></div>
+          <div>Δ <strong style="color:var(--red)">−1.38 µm</strong> · z=3.1</div>
+          <div style="color:var(--muted); margin-top:4px;">Same FOV class P6 · fair die-to-die</div>
+        </div>
+        <div class="section">Why FOV must lock</div>
+        <div class="insight-card" style="font-size:10px; line-height:1.45; color:var(--muted);">
+          P4 vs P6 differ in scan geometry, SNR, edge process.
+          Cross without SHK.fov mixes metrology bias with process signal.
+        </div>
+        <div class="section">Δ distribution (matched)</div>
+        <div class="hist" id="delta-hist"></div>
+        <div class="section">Variance stack (mini)</div>
+        <div class="vstack">
+          <div class="row"><span>Chip</span><div class="track"><i style="width:34%;background:#34d399;"></i></div><span>34%</span></div>
+          <div class="row"><span>Wafer</span><div class="track"><i style="width:29%;background:#22d3ee;"></i></div><span>29%</span></div>
+          <div class="row"><span>Lot</span><div class="track"><i style="width:18%;background:#a78bfa;"></i></div><span>18%</span></div>
+        </div>
+        <div class="section" style="margin-top:12px;">Deep links</div>
+        <div class="vs">
+          <div class="side">→ Viewer anchor<br/><span style="color:var(--muted)">P6 Chip 19,11</span></div>
+          <div class="side">→ Viewer peer<br/><span style="color:var(--muted)">P6 Chip 11,11</span></div>
+        </div>
+        <div class="btn-row" style="margin-top:12px;">
+          <button class="btn primary" type="button">Open pair Viewer</button>
+          <button class="btn" type="button">Line Pulse</button>
+        </div>
+        <div class="diff-callout" style="margin:12px 0 0;">
+          IP: H²C² · SHK join · nested σ · HSI · LOSO
+        </div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<div class="footer-note">
+  Preview: docs/mockups/tabs_redesign_preview.html · Default = 3D Analysis Homology Cross · Mode ladder M1–M5 · studio tabs · Line Pulse still available
+</div>
+
+<script>
+  // Nav
+  const stages = {
+    pulse: document.getElementById('stage-pulse'),
+    analysis: document.getElementById('stage-analysis'),
+  };
+  document.querySelectorAll('.nav button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const t = btn.dataset.tab;
+      if (t !== 'pulse' && t !== 'analysis') {
+        btn.animate([{ opacity: 1 }, { opacity: 0.4 }, { opacity: 1 }], { duration: 300 });
+        return;
+      }
+      document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      Object.values(stages).forEach(s => s.classList.remove('active'));
+      stages[t].classList.add('active');
+    });
+  });
+
+  // Wafer dies
+  const disk = document.getElementById('wafer-disk');
+  const positions = [];
+  for (let r = 0; r < 11; r++) {
+    for (let c = 0; c < 11; c++) {
+      const dx = c - 5, dy = r - 5;
+      if (dx * dx + dy * dy > 28) continue;
+      positions.push({ r, c, dx, dy });
+    }
+  }
+  const states = ['ok', 'ok', 'ok', 'ok', 'ng', 'pend', 'run'];
+  positions.forEach((p, i) => {
+    const d = document.createElement('div');
+    d.className = 'die ' + states[i % states.length];
+    if (p.r === 7 && p.c === 8) d.className = 'die ng sel';
+    const left = 50 + p.dx * 8;
+    const top = 50 + p.dy * 8;
+    d.style.left = `calc(${left}% - 7px)`;
+    d.style.top = `calc(${top}% - 7px)`;
+    d.title = `Chip ${10 + p.c},${10 + p.r}`;
+    d.addEventListener('click', () => {
+      disk.querySelectorAll('.die').forEach(x => x.classList.remove('sel'));
+      d.classList.add('sel');
+      showChip();
+    });
+    disk.appendChild(d);
+  });
+
+  const chipZoom = document.getElementById('chip-zoom');
+  const fovGrid = document.getElementById('fov-grid');
+  const fovStates = ['ok','ok','pend','ng','ok','ok','pend','pend','ok'];
+  fovStates.forEach((st, i) => {
+    const cell = document.createElement('div');
+    cell.className = 'fov-cell ' + st + (i === 5 ? ' sel' : '');
+    cell.textContent = 'P' + (i + 1);
+    cell.addEventListener('click', () => {
+      fovGrid.querySelectorAll('.fov-cell').forEach(x => x.classList.remove('sel'));
+      cell.classList.add('sel');
+    });
+    fovGrid.appendChild(cell);
+  });
+
+  function showChip() {
+    disk.classList.add('hide');
+    chipZoom.classList.add('show');
+    document.getElementById('lvl-wafer').classList.remove('on');
+    document.getElementById('lvl-chip').classList.add('on');
+  }
+  function showWafer() {
+    disk.classList.remove('hide');
+    chipZoom.classList.remove('show');
+    document.getElementById('lvl-wafer').classList.add('on');
+    document.getElementById('lvl-chip').classList.remove('on');
+  }
+  document.getElementById('btn-zoom').onclick = showChip;
+  document.getElementById('btn-zoomout').onclick = showWafer;
+  document.getElementById('lvl-wafer').onclick = showWafer;
+  document.getElementById('lvl-chip').onclick = showChip;
+
+  // P1-P9 bars
+  const heights = [92, 88, 95, 70, 91, 90, 86, 89, 93];
+  const pb = document.getElementById('p-bars');
+  heights.forEach((h, i) => {
+    const b = document.createElement('div');
+    b.className = 'b';
+    b.style.height = h + '%';
+    if (h < 80) b.style.background = 'linear-gradient(180deg, #f87171, #991b1b)';
+    b.innerHTML = '<span>P' + (i + 1) + '</span>';
+    pb.appendChild(b);
+  });
+
+  // Analysis studio panes
+  document.querySelectorAll('#analysis-studio-tabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#analysis-studio-tabs button').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      document.querySelectorAll('.studio-pane').forEach(p => p.classList.remove('on'));
+      const pane = document.getElementById('pane-' + btn.dataset.pane);
+      if (pane) pane.classList.add('on');
+    });
+  });
+
+  // Mode ladder
+  const modeText = {
+    m1: '<b>M1 Die↔Die</b> ⭐ · Dies are copies of the same design · Folder map <code>Chip_*/FOV_Pn</code> with <b>same n</b> · Lock Layer+FOV+Grid · Free: <b>chip</b> · Chip A vs Chip B at P6 is the primary fair compare.',
+    m2: '<b>M2 Wafer↔Wafer</b> · Lock SHK + <b>chip coordinate</b> (e.g. 19,11) + FOUP + lot · Free: <b>wafer</b>. Fair wafer drift at homologous die address.',
+    m3: '<b>M3 FOUP↔FOUP</b> · Lock SHK + chip + wafer slot · Free: <b>FOUP</b>. Carrier / logistics effect.',
+    m4: '<b>M4 Lot↔Lot</b> · Lock SHK + relative map slots · Free: <b>lot</b>. Process / lot shift at homologous sites.',
+    m5: ''
+  };
+  document.querySelectorAll('#mode-ladder button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#mode-ladder button').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      const m = btn.dataset.mode;
+      const ban = document.getElementById('homology-banner');
+      const warn = document.getElementById('fov-bias-banner');
+      const lockFov = document.getElementById('lock-fov');
+      if (m === 'm5') {
+        ban.style.display = 'none';
+        warn.style.display = 'block';
+        lockFov.checked = false;
+      } else {
+        ban.style.display = 'block';
+        warn.style.display = 'none';
+        ban.innerHTML = modeText[m];
+        lockFov.checked = true;
+      }
+    });
+  });
+
+  // Analysis layer bars
+  const sohs = [12.8, 12.6, 12.5, 12.4, 12.3, 12.1, 11.6, 11.0, 11.4, 12.0, 12.2, 12.3];
+  const lb = document.getElementById('layer-bars');
+  const mn = Math.min(...sohs), mx = Math.max(...sohs);
+  sohs.forEach((v, i) => {
+    const el = document.createElement('div');
+    el.className = 'lb';
+    el.style.height = (25 + ((v - mn) / (mx - mn + 0.01)) * 75) + '%';
+    if (v < 11.5) el.style.background = 'linear-gradient(180deg, #fbbf24, #b45309)';
+    el.innerHTML = '<span>L' + (i + 1) + '</span>';
+    lb.appendChild(el);
+  });
+
+  const heatVals = [12.5, 12.4, 12.6, 11.9, 12.3, 12.1, 12.4, 12.2, 12.5];
+  const heat = document.getElementById('soh-heat');
+  heatVals.forEach((v, i) => {
+    const d = document.createElement('div');
+    const t = (v - 11.8) / 0.9;
+    const g = Math.round(80 + t * 100);
+    const b = Math.round(120 + t * 80);
+    d.style.background = `rgb(20, ${g}, ${b})`;
+    d.textContent = 'P' + (i + 1) + '\n' + v.toFixed(1);
+    d.style.whiteSpace = 'pre-line';
+    d.style.color = '#ecfeff';
+    heat.appendChild(d);
+  });
+
+  // Delta FOV heat — M1 locks FOV so only P6 shows real Δ; others dim
+  const dHeat = document.getElementById('delta-fov-heat');
+  for (let i = 1; i <= 9; i++) {
+    const d = document.createElement('div');
+    if (i === 6) {
+      d.style.background = '#f87171';
+      d.style.color = '#450a0a';
+      d.textContent = 'P6\n−0.18';
+    } else {
+      d.style.background = '#1e293b';
+      d.style.color = '#64748b';
+      d.textContent = 'P' + i + '\n—';
+    }
+    d.style.whiteSpace = 'pre-line';
+    dHeat.appendChild(d);
+  }
+
+  // Bump delta grid 8x6
+  const bd = document.getElementById('bump-delta');
+  for (let k = 0; k < 48; k++) {
+    const cell = document.createElement('i');
+    const delta = (Math.sin(k * 0.7) * 0.4 + Math.cos(k * 0.3) * 0.3 - 0.15);
+    // map delta -0.8..0.4 to color blue-green-yellow-red
+    const t = Math.max(0, Math.min(1, (Math.abs(delta)) / 0.8));
+    if (Math.abs(delta) < 0.12) cell.style.background = '#0e7490';
+    else if (delta < 0) cell.style.background = `rgba(248,113,113,${0.35 + t * 0.65})`;
+    else cell.style.background = `rgba(52,211,153,${0.35 + t * 0.5})`;
+    if (k === 3 * 8 + 2) {
+      cell.style.outline = '2px solid #fff';
+      cell.title = 'SHK L8,P6,(3,2) Δ=−1.38';
+    }
+    bd.appendChild(cell);
+  }
+
+  // Pair matrix 4 chips
+  const labels = ['19,11', '11,11', '15,12', '7,8'];
+  const mat = [
+    [0, 0.18, 0.22, 0.31],
+    [0.18, 0, 0.15, 0.28],
+    [0.22, 0.15, 0, 0.19],
+    [0.31, 0.28, 0.19, 0]
+  ];
+  const pm = document.getElementById('pair-matrix');
+  pm.appendChild(document.createElement('div'));
+  labels.forEach(l => {
+    const h = document.createElement('div');
+    h.className = 'h';
+    h.textContent = l;
+    pm.appendChild(h);
+  });
+  for (let r = 0; r < 4; r++) {
+    const lab = document.createElement('div');
+    lab.className = 'l';
+    lab.textContent = labels[r];
+    pm.appendChild(lab);
+    for (let c = 0; c < 4; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'c';
+      const v = mat[r][c];
+      if (r === c) {
+        cell.style.background = '#334155';
+        cell.style.color = '#94a3b8';
+        cell.textContent = '—';
+      } else {
+        const t = v / 0.35;
+        cell.style.background = `rgb(${Math.round(20 + t * 200)}, ${Math.round(180 - t * 100)}, ${Math.round(200 - t * 120)})`;
+        cell.textContent = v.toFixed(2);
+      }
+      pm.appendChild(cell);
+    }
+  }
+
+  const lt = document.getElementById('layer-table');
+  sohs.forEach((v, i) => {
+    const tr = document.createElement('tr');
+    const ng = v < 11.5 ? '6.2' : (1.5 + (i % 3) * 0.4).toFixed(1);
+    tr.innerHTML = `<td>L${i+1}</td><td>3720</td><td>${v.toFixed(2)}</td><td>${(0.3+(12.8-v)*0.15).toFixed(2)}</td>
+      <td>${(v-1.2).toFixed(1)}</td><td>${(v+0.9).toFixed(1)}</td><td>${(2+(i%5)*0.3).toFixed(1)}</td><td>${ng}%</td>`;
+    lt.appendChild(tr);
+  });
+
+  const dh = document.getElementById('delta-hist');
+  [5, 12, 28, 55, 90, 100, 70, 40, 22, 14, 8, 4].forEach(h => {
+    const i = document.createElement('i');
+    i.style.height = h + '%';
+    i.style.background = 'var(--amber)';
+    dh.appendChild(i);
+  });
+</script>
+</body>
+</html>

@@ -76,12 +76,14 @@ def build_wafer_context_from_db(
     selected_row: int = 0,
     selected_fov: int = 0,
     map_size: int = 25,
+    runs: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[WaferContext]:
     """Build Online-style WaferContext from inspection DB FOV runs."""
     if not wafer_key:
         return None
-    runs = db.list_fov_runs(wafer_key=wafer_key, limit=5000)
-    if not runs and not wafer_key:
+    if runs is None:
+        runs = db.list_fov_runs(wafer_key=wafer_key, limit=5000)
+    if not runs:
         return None
 
     # Meta from first run (or wafer_key parts: date|lot_foup|wafer)
@@ -412,6 +414,115 @@ class SliceViewLabel(QLabel):
             mode = Qt.SmoothTransformation
         scaled = self._pix.scaled(self.size(), Qt.KeepAspectRatio, mode)
         self.setPixmap(scaled)
+
+
+class FovSnapshotPanel(QFrame):
+    """PNG-only FOV preview for Batch Review; volume inspection stays in Viewer."""
+
+    _SNAPSHOT_KINDS = ("snapshot_xy", "preview_xy", "thumb_xy")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("BatchPanel")
+        self.setMinimumHeight(150)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        layout.addWidget(self._section_label("FOV SNAPSHOTS · 2D PREVIEW"))
+
+        self.status = QLabel("Select a FOV run to preview available snapshots")
+        self.status.setObjectName("BatchReviewMuted")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        previews = QHBoxLayout()
+        previews.setSpacing(6)
+        self.image_slots = [self._image_slot(), self._image_slot()]
+        for slot in self.image_slots:
+            previews.addWidget(slot, 1)
+        layout.addLayout(previews, 1)
+
+    @staticmethod
+    def _section_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("BatchSection")
+        return label
+
+    @staticmethod
+    def _image_slot() -> QLabel:
+        label = QLabel("No PNG snapshot")
+        label.setAlignment(Qt.AlignCenter)
+        label.setMinimumSize(160, 90)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            f"background:#050a14;border:1px solid {SemiconductorTheme.BORDER_DEFAULT};"
+            "border-radius:6px;color:#64748b;"
+        )
+        return label
+
+    @staticmethod
+    def _resolve_artifact_path(path: str, results_dir: str) -> str:
+        """Resolve relative artifact paths against the run's Results directory."""
+        if not path:
+            return ""
+        if os.path.isabs(path):
+            return path
+        return os.path.join(results_dir, path) if results_dir else path
+
+    def set_run(self, run: dict, artifacts: Optional[List[dict]] = None) -> None:
+        """Display up to two registered PNG snapshots without touching TIFF volumes."""
+        run = run or {}
+        results_dir = str(run.get("results_dir") or "")
+        artifacts = artifacts if artifacts is not None else (run.get("artifacts") or [])
+
+        snapshot_paths = []
+        for kind in self._SNAPSHOT_KINDS:
+            for artifact in artifacts:
+                if not isinstance(artifact, dict) or artifact.get("kind") != kind:
+                    continue
+                path = self._resolve_artifact_path(
+                    str(artifact.get("path") or ""), results_dir
+                )
+                # Snapshot previews are intentionally PNG-only; never decode TIFF volumes.
+                if path.lower().endswith(".png") and os.path.isfile(path):
+                    snapshot_paths.append(path)
+
+        judgment = str(run.get("judgment") or "—").upper()
+        layers = sorted(
+            {
+                str(item.get("layer_name") or "")
+                for item in (run.get("mes_objects") or [])
+                if isinstance(item, dict) and item.get("layer_name")
+            }
+        )
+        layer_text = f" · layers: {', '.join(layers)}" if layers else ""
+        if snapshot_paths:
+            self.status.setText(f"Judgment: {judgment}{layer_text}")
+        else:
+            self.status.setText(
+                f"Judgment: {judgment}{layer_text} · "
+                "No snapshot · FOV pending or Results incomplete"
+            )
+
+        for index, slot in enumerate(self.image_slots):
+            if index >= len(snapshot_paths):
+                slot.setPixmap(QPixmap())
+                slot.setText("No PNG snapshot")
+                slot.setToolTip("")
+                continue
+            path = snapshot_paths[index]
+            pixmap = QPixmap(path)
+            if pixmap.isNull():
+                slot.setPixmap(QPixmap())
+                slot.setText("Snapshot unreadable")
+                slot.setToolTip(path)
+                continue
+            slot.setText("")
+            slot.setPixmap(
+                pixmap.scaled(slot.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            slot.setToolTip(path)
 
 
 class VolumeLoadThread(QThread):

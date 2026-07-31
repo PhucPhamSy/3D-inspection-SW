@@ -286,6 +286,21 @@ def _setup():
     _dll.Mes_GetObjects.restype = ctypes.c_int
     _dll.Mes_Clear.argtypes = []
     _dll.Mes_Clear.restype = None
+    try:
+        from inno3d.core.dll_profiling import _bind_optional
+        _bind_optional(_dll, "Mes_SetProfiling", "Mes_GetProfiling", "Mes_GetLastTiming")
+    except Exception:
+        pass
+
+
+def set_profiling(enable: bool) -> bool:
+    from inno3d.core.dll_profiling import set_profiling as _sp
+    return _sp(_dll, enable, "Mes_SetProfiling")
+
+
+def get_last_timing():
+    from inno3d.core.dll_profiling import get_last_timing as _gt
+    return _gt(_dll, "Mes_GetLastTiming")
 
 
 def _check():
@@ -372,11 +387,11 @@ def reindex_grid_top_left(
     per_layer: bool = True,
 ) -> List[Dict[str, Any]]:
     """
-    Unified indexing for MES Object Stats + B2B Boundary (Teaching-style, 0-based).
+    Unified indexing for MES Object Stats + B2B Boundary (Teaching-style, 1-based).
 
     Convention (user / Online):
-      - Index starts at **(0,0)**
-      - **(0,0)** = top-left of the **XY** face:
+      - Index starts at **(1,1)**
+      - **(1,1)** = top-left of the **XY** face:
           row increases with image Y (down the axial plane)
           col increases with image X (to the right)
       - Sort: centroid_y ascending (top→bottom), then centroid_x ascending (left→right)
@@ -384,7 +399,7 @@ def reindex_grid_top_left(
       - Pitch Gap X / Gap Y recomputed after index assign
 
     If ``per_layer`` and ``layer_name`` is set, each layer is indexed independently
-    (Teaching multi-layer), so every layer has its own (0,0) at that layer's top-left.
+    (Teaching multi-layer), so every layer has its own (1,1) at that layer's top-left.
     """
     if not stats:
         return []
@@ -433,10 +448,10 @@ def reindex_grid_top_left(
         for r_idx, row_list in enumerate(rows):
             row_list.sort(key=lambda s: float(s.get("centroid_x", 0)))
             for c_idx, s in enumerate(row_list):
-                s["grid_row"] = r_idx  # 0-based, top row = 0
-                s["grid_col"] = c_idx  # 0-based, left col = 0
+                s["grid_row"] = r_idx + 1  # 1-based, top row = 1
+                s["grid_col"] = c_idx + 1  # 1-based, left col = 1
                 # Unified display id for MES # and B2B Bump (R,C)
-                s["bump_id"] = f"{r_idx},{c_idx}"  # raw for B2B DLL / CSV
+                s["bump_id"] = f"{r_idx + 1},{c_idx + 1}"  # raw for B2B DLL / CSV
                 s["pitch_x"] = 0.0
                 s["pitch_y"] = 0.0
                 if c_idx < len(row_list) - 1:

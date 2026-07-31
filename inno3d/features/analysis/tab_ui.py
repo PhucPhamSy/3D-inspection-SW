@@ -17,6 +17,8 @@ analysis set (each FOV run ≈ one SampleData unit).
 import os
 import csv
 import glob
+import subprocess
+import sys
 from dataclasses import dataclass, field
 import re
 from typing import Any, Dict, List, Optional, Set
@@ -39,6 +41,8 @@ from inno3d.core.soh_data import (
     load_samples_from_db,
     aggregate_layers_from_samples,
     aggregate_fov_from_samples,
+    chip_metric_grid,
+    fov_metric_grid,
 )
 from matplotlib.patches import Rectangle as MplRect
 from matplotlib.patches import Patch
@@ -50,10 +54,14 @@ from inno3d.features.analysis.domain import (
     compute_layer_stats,
     EmbeddedChart,
 )
+from inno3d.features.analysis.homology_page import HomologyPage
 
 
 class AnalysisTab(QWidget):
     """3D Analysis Tab — DB-first SOH workbench."""
+
+    open_in_line_pulse = pyqtSignal(str)
+    open_in_viewer = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
@@ -63,6 +71,7 @@ class AnalysisTab(QWidget):
         self._scope_wafer_key: str = ""
         self._scope_lot: str = ""
         self._scope_run_ids: Set[str] = set()
+        self._map_focus_chip: Optional[tuple] = None
         self._db_lots: List[Dict[str, Any]] = []
         self._db_wafers: List[Dict[str, Any]] = []
         self._auto_loaded = False
@@ -271,14 +280,18 @@ class AnalysisTab(QWidget):
         self._view_mode_buttons = []
         view_configs = [
             (" Overview", 0, "bar-chart-2.svg"),
-            (" Cross-σ", 1, "trending-up.svg"),
-            (" Bump σ", 2, "grid.svg"),
-            (" Spatial", 3, "zap.svg"),
-            (" LOO", 4, "crosshair.svg"),
+            (" Maps", 1, "grid.svg"),
+            (" Homology", 2, "git-branch.svg"),
+            (" Bump σ", 3, "grid.svg"),
+            (" Spatial", 4, "zap.svg"),
+            (" Root cause", 5, "crosshair.svg"),
+            (" Table", 6, "list.svg"),
+            (" Legacy σ", 7, "trending-up.svg"),
         ]
         for text, mode_idx, icon_name in view_configs:
             btn = QPushButton(text)
             btn.setProperty("role", "toggle")
+            btn.setProperty("view_mode_idx", mode_idx)
             btn.setProperty("theme_icon", True)
             btn.setProperty("icon_name", icon_name)
             btn.setProperty("icon_size_w", 14)
@@ -395,6 +408,21 @@ class AnalysisTab(QWidget):
             row.addWidget(val, 1)
             detail_layout.addLayout(row)
             self.detail_labels[key] = val
+
+        deep_link_row = QHBoxLayout()
+        deep_link_row.setSpacing(4)
+        self.btn_open_line_pulse = QPushButton("Open in Line Pulse")
+        self.btn_open_line_pulse.setToolTip("Open the focused DB FOV in Line Pulse")
+        self.btn_open_line_pulse.clicked.connect(self._open_focused_in_line_pulse)
+        deep_link_row.addWidget(self.btn_open_line_pulse)
+        self.btn_open_results = QPushButton("Open Results folder")
+        self.btn_open_results.clicked.connect(self._open_focused_results)
+        deep_link_row.addWidget(self.btn_open_results)
+        self.btn_open_viewer = QPushButton("Open Viewer")
+        self.btn_open_viewer.setToolTip("Open the focused DB FOV in the 3D Viewer")
+        self.btn_open_viewer.clicked.connect(self._open_focused_in_viewer)
+        deep_link_row.addWidget(self.btn_open_viewer)
+        detail_layout.addLayout(deep_link_row)
         layout.addWidget(detail_group)
         return panel
 
@@ -406,14 +434,32 @@ class AnalysisTab(QWidget):
         return 5.0, 15.0
 
     def _set_view_mode(self, mode_idx: int):
-        """Switch between SOH(0), Cross-σ(1), Per-Bump σ(2), 3D-SIM(3), LOO-VD(4)."""
+        """Switch the primary Analysis workbench page."""
+        if mode_idx in (3, 4, 5, 7) and not self.samples:
+            self.status_label.setText("Load FOVs into Analysis Set first.")
+            for btn in self._view_mode_buttons:
+                btn.setChecked(btn.property("view_mode_idx") == self._current_view_mode)
+            return
+
         self._current_view_mode = mode_idx
-        for i, btn in enumerate(self._view_mode_buttons):
-            btn.setChecked(i == mode_idx)
+        for btn in self._view_mode_buttons:
+            btn.setChecked(btn.property("view_mode_idx") == mode_idx)
 
         # Update QStackedWidget to show the correct page
         if hasattr(self, '_right_vsplit') and isinstance(self._right_vsplit, QStackedWidget):
             self._right_vsplit.setCurrentIndex(mode_idx)
+        if mode_idx == 2 and hasattr(self, "homology_page"):
+            self.homology_page.refresh_runs()
+        if mode_idx in (1, 6):
+            self._refresh_maps(include_mes_table=(mode_idx == 6))
+        elif mode_idx == 3:
+            self._refresh_per_bump_sigma()
+        elif mode_idx == 4:
+            self._refresh_3d_sim()
+        elif mode_idx == 5:
+            self._refresh_loo_vd()
+        elif mode_idx == 7:
+            self._refresh_sigma()
 
 
     def _create_right_panel(self):
@@ -535,7 +581,14 @@ class AnalysisTab(QWidget):
         soh_layout.addWidget(chart_splitter, 1)
         self._right_vsplit.addWidget(soh_page)
 
-        # ── PAGE 1: Cross-Sample Sigma Analysis ──
+        # ── PAGE 1: Wafer / chip metrology maps ──
+        self._right_vsplit.addWidget(self._create_maps_page())
+
+        # ── PAGE 2: Homology (C-P1 owns the functional UI) ──
+        self._right_vsplit.addWidget(self._create_homology_shell_page())
+
+        # Construct the legacy Cross-σ page here; it is added after the
+        # primary workbench pages so existing implementation remains intact.
         sigma_page = QWidget()
         sigma_layout = QVBoxLayout(sigma_page)
         sigma_layout.setContentsMargins(0, 0, 0, 0)
@@ -620,19 +673,24 @@ class AnalysisTab(QWidget):
 
         sigma_splitter.setSizes([250, 450])
         sigma_layout.addWidget(sigma_splitter, 1)
-        self._right_vsplit.addWidget(sigma_page)
 
-        # ── PAGE 2: Per-Bump Sigma Analysis ──
+        # ── PAGE 3: Per-Bump Sigma Analysis ──
         bump_sigma_page = self._create_per_bump_sigma_section()
         self._right_vsplit.addWidget(bump_sigma_page)
 
-        # ── PAGE 3: 3D Structural Integrity Map ──
+        # ── PAGE 4: 3D Structural Integrity Map ──
         sim_page = self._create_3d_sim_section()
         self._right_vsplit.addWidget(sim_page)
 
-        # ── PAGE 4: LOO Variance Decomposition ──
+        # ── PAGE 5: Root cause (LOO Variance Decomposition) ──
         loo_page = self._create_loo_vd_section()
         self._right_vsplit.addWidget(loo_page)
+
+        # ── PAGE 6: Flat MES table ──
+        self._right_vsplit.addWidget(self._create_mes_table_page())
+
+        # ── PAGE 7: Legacy Cross-σ ──
+        self._right_vsplit.addWidget(sigma_page)
 
         # Default to page 0
         self._right_vsplit.setCurrentIndex(0)
@@ -642,6 +700,220 @@ class AnalysisTab(QWidget):
         return panel
 
 
+    def _create_maps_page(self):
+        """Build wafer-level and focused-die metrology maps."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        title = QLabel("<b>ANALYSIS MAPS</b>  <span style='color:#808080;'>metrology deviation from set mean</span>")
+        title.setStyleSheet(f"font-size: 10pt; color: {SemiconductorTheme.ACCENT_PRIMARY}; padding: 4px 8px;")
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(QLabel("Metric:"))
+        self.maps_metric_combo = QComboBox()
+        self.maps_metric_combo.addItems(["SOH", "Void%", "NG rate"])
+        self.maps_metric_combo.currentIndexChanged.connect(self._refresh_maps)
+        header.addWidget(self.maps_metric_combo)
+        header.addWidget(QLabel("Aggregate:"))
+        self.maps_aggregate_combo = QComboBox()
+        self.maps_aggregate_combo.addItem("Mean")
+        self.maps_aggregate_combo.setEnabled(False)
+        header.addWidget(self.maps_aggregate_combo)
+        layout.addLayout(header)
+
+        self.maps_status_label = QLabel("Select a wafer, then load FOVs to render maps.")
+        self.maps_status_label.setStyleSheet(f"color: {SemiconductorTheme.TEXT_SECONDARY}; padding: 0 8px;")
+        layout.addWidget(self.maps_status_label)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.wafer_map_table = QTableWidget()
+        self.wafer_map_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.wafer_map_table.setSelectionBehavior(QTableWidget.SelectItems)
+        self.wafer_map_table.setStyleSheet(self._map_table_style())
+        self.wafer_map_table.itemSelectionChanged.connect(self._on_map_chip_selected)
+        splitter.addWidget(self._map_group("WAFER SOH MAP", self.wafer_map_table))
+
+        self.fov_map_table = QTableWidget(3, 3)
+        self.fov_map_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.fov_map_table.setSelectionBehavior(QTableWidget.SelectItems)
+        self.fov_map_table.setStyleSheet(self._map_table_style())
+        splitter.addWidget(self._map_group("CHIP FOV 3×3", self.fov_map_table))
+        splitter.setSizes([650, 350])
+        layout.addWidget(splitter, 1)
+        return page
+
+    def _map_group(self, title: str, table: QTableWidget) -> QWidget:
+        group = QGroupBox(title)
+        group.setStyleSheet(
+            f"QGroupBox {{ color: {SemiconductorTheme.ACCENT_PRIMARY}; font-weight: bold; "
+            f"border: 1px solid {SemiconductorTheme.BORDER_DEFAULT}; margin-top: 8px; padding-top: 10px; }}"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }")
+        group_layout = QVBoxLayout(group)
+        group_layout.setContentsMargins(6, 8, 6, 6)
+        group_layout.addWidget(table)
+        return group
+
+    def _map_table_style(self) -> str:
+        return f"""
+            QTableWidget {{ background: {SemiconductorTheme.BG_DARK}; color: {SemiconductorTheme.TEXT_PRIMARY};
+                gridline-color: {SemiconductorTheme.BORDER_DEFAULT}; border: 0; font-size: 9pt; }}
+            QHeaderView::section {{ background: {SemiconductorTheme.BG_PANEL}; color: {SemiconductorTheme.TEXT_SECONDARY};
+                border: 1px solid {SemiconductorTheme.BORDER_DEFAULT}; padding: 3px; }}
+        """
+
+    def _create_homology_shell_page(self):
+        self.homology_page = HomologyPage(
+            db=self._db,
+            get_run_ids=self._map_scope_run_ids,
+            parent=self,
+        )
+        return self.homology_page
+
+    def _create_mes_table_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("<b>MES OBJECT TABLE</b>  <span style='color:#808080;'>current analysis scope</span>")
+        title.setStyleSheet(f"font-size: 10pt; color: {SemiconductorTheme.ACCENT_PRIMARY}; padding: 4px 8px;")
+        layout.addWidget(title)
+        self.mes_table = QTableWidget()
+        self.mes_table.setColumnCount(10)
+        self.mes_table.setHorizontalHeaderLabels(
+            ["Chip", "FOV", "Layer", "SOH", "Void%", "Judgment", "Grid row", "Grid col", "X", "Y"])
+        self.mes_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.mes_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.mes_table.setAlternatingRowColors(True)
+        self.mes_table.setStyleSheet(self._map_table_style())
+        self.mes_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.mes_table, 1)
+        return page
+
+    def _map_scope_run_ids(self) -> List[str]:
+        return sorted({s.run_id for s in self.samples if getattr(s, "run_id", "")})
+
+    def _map_metric_value(self, row: Dict[str, Any]) -> float:
+        metric = self.maps_metric_combo.currentText()
+        if metric == "Void%":
+            return float(row.get("mean_ratio") or 0.0) * 100.0
+        if metric == "NG rate":
+            return float(row.get("ng_rate") or 0.0) * 100.0
+        return float(row.get("mean_soh") or 0.0)
+
+    @staticmethod
+    def _metrology_color(value: float, mean: float, max_deviation: float) -> QColor:
+        """Cyan → amber → red by absolute deviation from scoped mean."""
+        t = min(1.0, abs(value - mean) / max(max_deviation, 1e-12))
+        cyan, amber, red = QColor("#22d3ee"), QColor("#fbbf24"), QColor("#ef4444")
+        start, end, ratio = (cyan, amber, t * 2) if t <= .5 else (amber, red, (t - .5) * 2)
+        return QColor(
+            round(start.red() + (end.red() - start.red()) * ratio),
+            round(start.green() + (end.green() - start.green()) * ratio),
+            round(start.blue() + (end.blue() - start.blue()) * ratio),
+        )
+
+    def _refresh_maps(self, *_args, include_mes_table: bool = False):
+        """Query SQL scope aggregates for wafer/FOV maps; MES table only when requested."""
+        if not hasattr(self, "wafer_map_table"):
+            return
+        run_ids = self._map_scope_run_ids()
+        if not run_ids and not self._scope_wafer_key:
+            self.maps_status_label.setText("Select a wafer, then load FOVs to render maps.")
+            self.wafer_map_table.clear()
+            if include_mes_table:
+                self._refresh_mes_table([])
+            return
+        try:
+            scope = {"run_ids": run_ids} if run_ids else {"wafer_key": self._scope_wafer_key}
+            threshold = self.ng_threshold_spin.value() / 100.0
+            chips = self._db.aggregate_soh_by_chip(**scope, ng_threshold=threshold)
+            for row in chips:
+                row["metric"] = self._map_metric_value(row)
+            self._populate_wafer_map(chips)
+
+            focus_ids = [s.run_id for s in self.samples if s.run_id and self._map_focus_chip and
+                         (s.chip_col, s.chip_row) == self._map_focus_chip]
+            if self._map_focus_chip and not focus_ids and self._scope_wafer_key:
+                col, row_idx = self._map_focus_chip
+                focus_ids = [
+                    str(run.get("run_id") or "") for run in self._db.list_fov_runs(
+                        wafer_key=self._scope_wafer_key, limit=5000)
+                    if int(run.get("chip_col") or 0) == col and int(run.get("chip_row") or 0) == row_idx
+                ]
+            fov_scope = {"run_ids": focus_ids} if focus_ids else scope
+            fovs = self._db.aggregate_soh_by_fov(**fov_scope, ng_threshold=threshold)
+            for row in fovs:
+                row["metric"] = self._map_metric_value(row)
+            self._populate_fov_map(fovs)
+            focus = f" · focus Chip {self._map_focus_chip[0]},{self._map_focus_chip[1]}" if self._map_focus_chip else ""
+            self.maps_status_label.setText(f"{len(chips)} die(s) · {self.maps_metric_combo.currentText()} mean{focus}")
+            if include_mes_table:
+                self._refresh_mes_table(self._db.list_mes_joined(**scope, limit=10000))
+        except Exception as exc:
+            self.maps_status_label.setText(f"Map query error: {exc}")
+
+    def _populate_wafer_map(self, rows: List[Dict[str, Any]]):
+        grid, table = chip_metric_grid(rows), self.wafer_map_table
+        table.blockSignals(True)
+        table.clear()
+        if not grid:
+            table.setRowCount(0); table.setColumnCount(0); table.blockSignals(False)
+            return
+        cols, rows_idx = sorted({p[0] for p in grid}), sorted({p[1] for p in grid})
+        table.setRowCount(len(rows_idx)); table.setColumnCount(len(cols))
+        table.setHorizontalHeaderLabels([f"C{x}" for x in cols])
+        table.setVerticalHeaderLabels([f"R{x}" for x in rows_idx])
+        values = list(grid.values()); mean = sum(values) / len(values)
+        deviation = max(abs(v - mean) for v in values)
+        for (col, row_idx), value in grid.items():
+            item = QTableWidgetItem(f"{value:.3f}\nC{col},R{row_idx}")
+            item.setTextAlignment(Qt.AlignCenter); item.setData(Qt.UserRole, (col, row_idx))
+            item.setToolTip(f"Chip {col},{row_idx}\n{self.maps_metric_combo.currentText()}: {value:.4f}\nSet mean: {mean:.4f}")
+            item.setBackground(self._metrology_color(value, mean, deviation))
+            item.setForeground(QColor(SemiconductorTheme.TEXT_ON_ACCENT))
+            table.setItem(rows_idx.index(row_idx), cols.index(col), item)
+        table.resizeRowsToContents(); table.resizeColumnsToContents(); table.blockSignals(False)
+
+    def _populate_fov_map(self, rows: List[Dict[str, Any]]):
+        grid, table = fov_metric_grid(rows), self.fov_map_table
+        table.clear(); table.setRowCount(3); table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["1", "2", "3"]); table.setVerticalHeaderLabels(["1", "2", "3"])
+        values = list(grid.values()); mean = sum(values) / len(values) if values else 0.0
+        deviation = max((abs(v - mean) for v in values), default=0.0)
+        for index in range(1, 10):
+            row, col = divmod(index - 1, 3); value = grid.get(index)
+            item = QTableWidgetItem(f"P{index}\n{'—' if value is None else f'{value:.3f}'}")
+            item.setTextAlignment(Qt.AlignCenter)
+            if value is not None:
+                item.setBackground(self._metrology_color(value, mean, deviation))
+                item.setForeground(QColor(SemiconductorTheme.TEXT_ON_ACCENT))
+            else:
+                item.setForeground(QColor(SemiconductorTheme.TEXT_DISABLED))
+            table.setItem(row, col, item)
+        table.resizeRowsToContents(); table.resizeColumnsToContents()
+
+    def _on_map_chip_selected(self):
+        items = self.wafer_map_table.selectedItems()
+        if items and items[0].data(Qt.UserRole) != self._map_focus_chip:
+            self._map_focus_chip = items[0].data(Qt.UserRole)
+            self._refresh_maps()
+
+    def _refresh_mes_table(self, rows: List[Dict[str, Any]]):
+        if not hasattr(self, "mes_table"):
+            return
+        self.mes_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            raw_ratio = float(row.get("ratio") or 0.0)
+            ratio = raw_ratio * (100 if raw_ratio <= 1 else 1)
+            values = [f"{row.get('chip_col', '')},{row.get('chip_row', '')}", row.get("fov_index", ""),
+                      row.get("layer_name", ""), f"{float(row.get('soh') or 0):.4f}", f"{ratio:.3f}%",
+                      row.get("judgment", ""), row.get("grid_row", ""), row.get("grid_col", ""),
+                      row.get("centroid_x", ""), row.get("centroid_y", "")]
+            for c, value in enumerate(values):
+                item = QTableWidgetItem(str(value)); item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.mes_table.setItem(r, c, item)
 
     def _create_per_bump_sigma_section(self):
         """Build the Per-Bump Sigma Analysis UI section."""
@@ -963,8 +1235,12 @@ class AnalysisTab(QWidget):
         data = items[0].data(0, Qt.UserRole)
         if not data:
             return
-        if data[0] == "fov":
+        if data[0] == "chip":
+            self._map_focus_chip = (data[1], data[2])
+            self._refresh_maps()
+        elif data[0] == "fov":
             rid = data[1]
+            self._map_focus_chip = (data[3], data[4])
             # Focus matching loaded sample if present
             for i, s in enumerate(self.samples):
                 if s.run_id == rid:
@@ -972,6 +1248,7 @@ class AnalysisTab(QWidget):
                     self._update_detail_sample(s)
                     self._refresh_charts()
                     break
+            self._refresh_maps()
 
     def _checked_run_ids(self) -> List[str]:
         ids: List[str] = []
@@ -1042,10 +1319,17 @@ class AnalysisTab(QWidget):
     def _replace_samples(self, samples: List[SampleData]):
         self.samples = list(samples)
         self._selected_sample_idx = 0 if samples else None
+        self._map_focus_chip = (
+            (samples[0].chip_col, samples[0].chip_row)
+            if samples and samples[0].run_id else None
+        )
         self._rebuild_tree()
         self._refresh_summary_table()
         self._refresh_overview_kpis()
         self._refresh_charts()
+        self._refresh_maps()
+        if hasattr(self, "homology_page"):
+            self.homology_page.refresh_runs()
         if samples:
             self._update_detail_sample(samples[0])
         else:
@@ -1226,6 +1510,8 @@ class AnalysisTab(QWidget):
             self._refresh_summary_table()
             self._refresh_overview_kpis()
             self._refresh_charts()
+            if hasattr(self, "homology_page"):
+                self.homology_page.refresh_runs()
             if self.samples:
                 self._update_detail_sample(self.samples[0])
             else:
@@ -1251,6 +1537,8 @@ class AnalysisTab(QWidget):
             self._refresh_overview_kpis()
             self._refresh_charts()
             self._clear_detail()
+            if hasattr(self, "homology_page"):
+                self.homology_page.refresh_runs()
             self.status_label.setText("Analysis set cleared.")
 
     # ────────── Tree ──────────
@@ -1334,18 +1622,83 @@ class AnalysisTab(QWidget):
             s_idx = data[1]
             self._selected_sample_idx = s_idx
             sample = self.samples[s_idx]
+            if sample.run_id:
+                self._map_focus_chip = (sample.chip_col, sample.chip_row)
             self._update_detail_sample(sample)
             self._refresh_charts()
+            self._refresh_maps()
 
         elif data[0] == 'layer':
             s_idx = data[1]
             layer_name = data[2]
             self._selected_sample_idx = s_idx
             sample = self.samples[s_idx]
+            if sample.run_id:
+                self._map_focus_chip = (sample.chip_col, sample.chip_row)
             layer_stats = sample.layers.get(layer_name)
             if layer_stats:
                 self._update_detail_layer(sample, layer_stats)
             self._refresh_charts()
+            self._refresh_maps()
+
+    def _focused_sample(self) -> Optional[SampleData]:
+        """Return the Analysis Set FOV currently in focus, falling back to first."""
+        if not self.samples:
+            return None
+        idx = self._selected_sample_idx
+        if idx is None or idx < 0 or idx >= len(self.samples):
+            return self.samples[0]
+        return self.samples[idx]
+
+    def _focused_run(self) -> Optional[Dict[str, Any]]:
+        sample = self._focused_sample()
+        if sample is None or not sample.run_id:
+            return None
+        try:
+            return self._db.get_run(sample.run_id)
+        except Exception:
+            return None
+
+    def _open_focused_in_line_pulse(self):
+        run = self._focused_run()
+        if not run:
+            QMessageBox.information(
+                self, "Line Pulse", "Select a DB-backed FOV in the Analysis Set first."
+            )
+            return
+        self.open_in_line_pulse.emit(str(run.get("run_id") or ""))
+
+    def _open_focused_in_viewer(self):
+        run = self._focused_run()
+        if not run:
+            QMessageBox.information(
+                self, "Viewer", "Select a DB-backed FOV in the Analysis Set first."
+            )
+            return
+        self.open_in_viewer.emit(run)
+
+    def _open_focused_results(self):
+        run = self._focused_run()
+        if not run:
+            QMessageBox.information(
+                self, "Results", "Select a DB-backed FOV in the Analysis Set first."
+            )
+            return
+        results_dir = str(run.get("results_dir") or "")
+        if not results_dir or not os.path.isdir(results_dir):
+            QMessageBox.warning(
+                self, "Results", f"Results folder not found on disk:\n{results_dir or '(empty)'}"
+            )
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(results_dir)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", results_dir])
+            else:
+                subprocess.Popen(["xdg-open", results_dir])
+        except OSError as exc:
+            QMessageBox.warning(self, "Results", f"Could not open results folder:\n{exc}")
 
     def _update_detail_sample(self, sample: SampleData):
         """Show sample-level summary in detail panel."""
@@ -1717,6 +2070,12 @@ class AnalysisTab(QWidget):
 
     def _refresh_sigma(self):
         """Refresh sigma table and chart."""
+        if not self.samples:
+            self.status_label.setText("Load FOVs into Analysis Set first.")
+            self.sigma_table.setRowCount(0)
+            self.sigma_chart.fig.clear()
+            self.sigma_chart.draw()
+            return
         sigma_data = self._compute_sigma_data()
         metric_key = self._get_sigma_metric_key()
 
@@ -1928,6 +2287,13 @@ class AnalysisTab(QWidget):
         - 'All Bumps': overview table (σ per bump, sorted worst-first)
         - Specific bump selected: detail table (1 row per sample)
         """
+        if not self.samples:
+            self.status_label.setText("Load FOVs into Analysis Set first.")
+            self.bump_sigma_table.setRowCount(0)
+            self.bump_sigma_summary_label.setText("Load FOVs into Analysis Set first.")
+            self.bump_sigma_chart.clear()
+            return
+
         # Update layer combo options (preserve current selection)
         current_layer = self.bump_sigma_layer_combo.currentText()
         self.bump_sigma_layer_combo.blockSignals(True)
@@ -2460,7 +2826,8 @@ class AnalysisTab(QWidget):
             sim_sort_key = _natural_sort_key
 
         if not self.samples:
-            self.sim_summary_label.setText("No samples loaded. Import data first.")
+            self.status_label.setText("Load FOVs into Analysis Set first.")
+            self.sim_summary_label.setText("Load FOVs into Analysis Set first.")
             return
 
         # Use first selected sample, or first sample
@@ -2497,8 +2864,12 @@ class AnalysisTab(QWidget):
         total_risk = sum(s.risk_count for s in sii.values())
         total_wz = sum(len(z) for z in weak_zones.values())
         prop_dir = prop.dominant_direction if prop else 'N/A'
+        scope_warning = (
+            f"<span style='color:#ffc107;'>Spatial runs on one FOV — using: {sample.name}</span><br>"
+            if len(self.samples) > 1 else ""
+        )
         self.sim_summary_label.setText(
-            f"<b>{sample.name}</b> — {n_layers} layers, {total_bumps} bumps | "
+            f"{scope_warning}<b>{sample.name}</b> — {n_layers} layers, {total_bumps} bumps | "
             f"Mean SII: {fp.mean_sii:.3f} | Risk bumps: {total_risk} | "
             f"Weak zones: {total_wz} | Propagation: {prop_dir}")
 
@@ -2911,7 +3282,8 @@ class AnalysisTab(QWidget):
         from inno3d.core.spatial_analysis import compute_loo_variance
 
         if not self.samples:
-            self.loo_summary_label.setText("No samples loaded.")
+            self.status_label.setText("Load FOVs into Analysis Set first.")
+            self.loo_summary_label.setText("Load FOVs into Analysis Set first.")
             return
 
         idx = self._selected_sample_idx if self._selected_sample_idx is not None else 0

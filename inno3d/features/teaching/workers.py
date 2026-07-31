@@ -283,6 +283,14 @@ class BoundaryAnalysisThread(QThread):
                         )
                         
                         boundary_dll = ctypes.CDLL(active_dll_path)
+                        try:
+                            if hasattr(boundary_dll, "B2B_SetProfiling"):
+                                from inno3d.core import bumpvoid_b2b as _b2b
+                                # Same HMODULE as bumpvoid_b2b when paths match — sync flag
+                                if hasattr(_b2b, "_dll") and _b2b._dll is not None and hasattr(_b2b._dll, "B2B_GetProfiling"):
+                                    boundary_dll.B2B_SetProfiling(int(_b2b._dll.B2B_GetProfiling()))
+                        except Exception:
+                            pass
                         run_func = getattr(boundary_dll, func_name)
                         run_func.argtypes = [
                             ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
@@ -742,6 +750,14 @@ class SegmentationInspectionThread(QThread):
                         res = bumpvoid.process_bump_only(self.config, callback)
                     else:
                         res = bumpvoid.process(self.config, callback)
+
+                    try:
+                        info = bumpvoid.get_last_timing()
+                        if info and info.get("enabled"):
+                            from inno3d.core.dll_profiling import format_timing_banner
+                            print(f"--- {layer_name} ---\n{format_timing_banner('SEG', info)}")
+                    except Exception:
+                        pass
 
                     if res is not None:
                         res.layer_name = layer_name

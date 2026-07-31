@@ -62,9 +62,49 @@ class CrosshairMixin:
             'gap': 12,
         }
 
+    # ── Adaptive 3D crosshair debounce (Phase 2a) ────────────────────────
+    def _volume_data_gb(self):
+        """Return volume size in GB (0.0 if no volume)."""
+        if self.volume_data is None:
+            return 0.0
+        return self.volume_data.nbytes / (1024 ** 3)
+
+    def _schedule_3d_crosshair_update(self):
+        """Adaptively debounce 3D crosshair render based on volume size.
+
+        - < 4 GB  → immediate (unchanged behaviour, butter-smooth on small data)
+        - 4–8 GB  → 33 ms debounce (~30 fps cap — imperceptible)
+        - > 8 GB  → 100 ms debounce (~10 fps cap — avoids GPU ray-cast stall)
+
+        Only the *3D pane* render is deferred; 2D MPR planes stay real-time.
+        """
+        from PyQt5.QtCore import QTimer
+
+        data_gb = self._volume_data_gb()
+
+        if data_gb < 4.0:
+            # Small volume: call immediately (no debounce)
+            self.update_3d_crosshair()
+            return
+
+        delay_ms = 33 if data_gb < 8.0 else 100
+
+        if not hasattr(self, '_3d_ch_debounce_timer'):
+            self._3d_ch_debounce_timer = QTimer(self)
+            self._3d_ch_debounce_timer.setSingleShot(True)
+            self._3d_ch_debounce_timer.timeout.connect(self.update_3d_crosshair)
+
+        # Restart timer on each event (coalesce rapid drags)
+        self._3d_ch_debounce_timer.setInterval(delay_ms)
+        if self._3d_ch_debounce_timer.isActive():
+            self._3d_ch_debounce_timer.stop()
+        self._3d_ch_debounce_timer.start()
 
     def _crosshair_drag_end(self):
         """End drag — force one final sync (sliders + all panes + 3D)."""
+        # Flush any pending debounced 3D update immediately
+        if getattr(self, '_3d_ch_debounce_timer', None) is not None:
+            self._3d_ch_debounce_timer.stop()
         if getattr(self, "_ch_sync_timer", None) is not None:
             self._ch_sync_timer.stop()
         self._ch_sync_pending = False
@@ -288,7 +328,7 @@ class CrosshairMixin:
             for ori in ['axial', 'coronal', 'sagittal']:
                 self._ensure_crosshair_visible(ori)
 
-        self.update_3d_crosshair()
+        self._schedule_3d_crosshair_update()
 
 
     def update_2d_crosshair(self, orientation):

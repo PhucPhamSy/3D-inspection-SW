@@ -56,18 +56,51 @@ class VolumeIOMixin:
             self._handle_volume_load(file_path)
 
     def load_volume(self, from_folder=False):
-        """Load 16-bit volume data"""
-        if from_folder:
-            file_path = QFileDialog.getExistingDirectory(
-                self, "Select Folder Containing Image Files"
-            )
-        else:
-            file_path, _ = QFileDialog.getOpenFileName(
-                self, "Select Image Volume", "", "Image Files (*.tif *.tiff *.raw *.bin)"
-            )
-        
-        if file_path:
-            self._handle_volume_load(file_path)
+        """Load 16-bit volume data.
+
+        Opens a unified file dialog where the user can select either
+        a single 3D file (.tif/.tiff/.raw/.bin) **or** a folder that
+        contains a stack of images.  The selection type is determined
+        at the time of user interaction — no separate buttons needed.
+
+        The *from_folder* parameter is kept for backward-compatibility
+        with callers that still pass it, but it is now ignored when
+        the dialog is shown interactively.
+        """
+        dlg = QFileDialog(self, "Open File or Folder")
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        dlg.setNameFilter("Image Files (*.tif *.tiff *.raw *.bin)")
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        # Allow the user to also select directories in the same dialog
+        dlg.setOption(QFileDialog.ShowDirsOnly, False)
+        # Permit clicking on a directory to select it (instead of
+        # only entering it).  We achieve this by accepting both files
+        # and directories via a small proxy-model trick on the dialog's
+        # internal tree/list views.
+        from PyQt5.QtWidgets import QTreeView, QListView, QAbstractItemView
+        for view in dlg.findChildren((QTreeView, QListView)):
+            if isinstance(view, (QTreeView, QListView)):
+                view.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        # Override the accept logic so that selecting a directory also
+        # closes the dialog successfully (by default QFileDialog in
+        # ExistingFile mode only accepts files).
+        _orig_accept = dlg.accept
+
+        def _custom_accept():
+            selected = dlg.selectedFiles()
+            if selected and os.path.isdir(selected[0]):
+                # Directory selected — accept immediately
+                dlg.done(QFileDialog.Accepted)
+                return
+            _orig_accept()
+
+        dlg.accept = _custom_accept
+
+        if dlg.exec_() == QFileDialog.Accepted:
+            selected = dlg.selectedFiles()
+            if selected:
+                self._handle_volume_load(selected[0])
 
     def load_volume_from_path(self, file_path, mask_bump_path=None, mask_void_path=None):
         """Programmatic load (Batch Review / Online deep-link).
@@ -800,6 +833,15 @@ class VolumeIOMixin:
         self._cached_slice_actors = {}
         if hasattr(self, '_persistent_crosshair'):
             self._persistent_crosshair = {'axial': {}, 'coronal': {}, 'sagittal': {}}
+
+        # Clear all segmentation/class overlays from the previous volume.
+        # A new input volume must always start clean — no stale masks from a
+        # different-shaped result should survive into the new session.
+        self.segmentation_data = None
+        self.class1_data = None
+        self.class2_data = None
+        self.labeled_class1_data = None
+        self.labeled_class2_data = None
             
         self.volume_data = data
         # Handle multi-channel images (e.g., RGBA): convert to single channel
@@ -868,7 +910,12 @@ class VolumeIOMixin:
             
         for orientation in ['axial', 'coronal', 'sagittal']:
             self.camera_state[orientation] = None
-            
+
+        # ── Phase 4a: Adaptive performance tuning for large volumes ──────
+        data_gb = data.nbytes / (1024 ** 3)
+        if data_gb >= 4.0:
+            self._apply_large_volume_perf_settings(data_gb)
+
         self.update_all_views()
 
         # Batch Review deep-link: apply mask TIFFs after volume is ready
@@ -877,6 +924,56 @@ class VolumeIOMixin:
         except Exception as e:
             print(f"[Viewer] apply pending masks: {e}")
 
+
+    def _apply_large_volume_perf_settings(self, data_gb):
+        """Auto-tune rendering settings for large volumes (≥ 4 GB).
+
+        Called from ``on_volume_loaded`` before ``update_all_views`` so the
+        first render already uses the optimised parameters.
+
+        Thresholds (user-requested 4 GB / 8 GB bands):
+            4–8 GB:  quality → Standard, 3D render stays ON
+            > 8 GB:  quality → Draft, 3D volume render auto-disabled
+                     (user can re-enable manually via the 3D toggle)
+        """
+        from PyQt5.QtCore import QTimer
+
+        # ── 1. Quality preset auto-switch ────────────────────────────────
+        if data_gb >= 8.0:
+            target_quality = "Draft"
+        else:
+            target_quality = "Standard"
+
+        prev_quality = getattr(self, '_current_quality', 'High')
+        if hasattr(self, 'quality_combo'):
+            idx = self.quality_combo.findText(target_quality)
+            if idx >= 0:
+                self.quality_combo.blockSignals(True)
+                self.quality_combo.setCurrentIndex(idx)
+                self.quality_combo.blockSignals(False)
+        self._current_quality = target_quality
+
+        # ── 2. 3D volume render auto-disable for very large data ─────────
+        if data_gb >= 8.0:
+            if hasattr(self, 'set_3d_volume_render_enabled'):
+                self.set_3d_volume_render_enabled(False)
+                print(f"[PERF] Volume {data_gb:.1f} GB → 3D volume render "
+                      f"auto-disabled (re-enable via 3D toggle button)")
+
+        # ── 3. Slice throttle interval (adaptive) ────────────────────────
+        if data_gb >= 8.0:
+            throttle_ms = 33   # ~30 fps
+        elif data_gb >= 4.0:
+            throttle_ms = 25   # ~40 fps
+        else:
+            throttle_ms = 16   # ~60 fps (default)
+
+        if hasattr(self, '_slice_throttle_timer'):
+            self._slice_throttle_timer.setInterval(throttle_ms)
+
+        print(f"[PERF] Volume {data_gb:.1f} GB → quality={target_quality} "
+              f"(was {prev_quality}), slice throttle={throttle_ms}ms, "
+              f"3D crosshair debounce={'100ms' if data_gb >= 8 else '33ms'}")
 
     def update_pixel_value(self, orientation, pos):
         """Show volume XYZ + intensity under cursor (match Teaching MPR readout).
@@ -1928,9 +2025,16 @@ class VolumeIOMixin:
                 self.merge_class_masks()
                 
                 if self.volume_data is not None:
-                     for orientation in ['axial', 'coronal', 'sagittal']:
+                    for orientation in ['axial', 'coronal', 'sagittal']:
                         self.render_slice(orientation)
-                        
+
+                # Rebuild 3D overlay so glass shells appear in the 3D pane
+                if hasattr(self, 'render_3d'):
+                    try:
+                        self.render_3d()
+                    except Exception as e:
+                        print(f"[MaskC{class_num}] 3D overlay rebuild failed: {e}")
+
                 self.update_info_label()
                 
             except Exception as e:
@@ -1973,41 +2077,73 @@ class VolumeIOMixin:
         layer_dirs.sort(key=lambda x: [int(c) if c.isdigit() else c.lower() 
                                         for c in re.split(r'(\d+)', x[0])])
         
-        # 3. Select config file for Z offsets
-        config_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Config File (for layer Z offsets)", 
-            os.path.dirname(folder),
-            "Config Files (*.txt *.cfg *.ini);;All Files (*.*)")
-        if not config_path:
-            return
-        
-        # 4. Parse layer definitions from config (UTF-8 first — not locale cp949)
+        # 3. Get layer definitions from 3D Teaching tab config (if loaded),
+        #    otherwise fall back to manual config file selection.
         layer_config = {}  # "Layer 1" → (z_start, z_end)
+        config_source = None  # for the report message
+
+        # Try to find layer_definitions from SegmentationTab via MainWindow
+        seg_tab = None
         try:
-            for line in read_text_auto(config_path).splitlines():
-                line = line.strip()
-                if line.startswith('#') or not line:
-                    continue
-                match = re.match(r'LAYER_\d+\s*=\s*(.+)', line)
-                if match:
-                    parts = match.group(1).rsplit(',', 3)
-                    if len(parts) >= 3:
-                        try:
-                            name = parts[0].strip()
-                            z_start = int(parts[1].strip())
-                            z_end = int(parts[2].strip())
-                            # Also store with underscore variant: "Layer 1" → "Layer_1"
-                            layer_config[name] = (z_start, z_end)
-                            layer_config[name.replace(' ', '_')] = (z_start, z_end)
-                        except ValueError:
-                            continue
-        except Exception as e:
-            QMessageBox.critical(self, "Config Error", f"Failed to parse config:\n{str(e)}")
-            return
+            from inno3d.app.main_window import MainWindow
+            w = self.window()
+            if isinstance(w, MainWindow):
+                seg_tab = getattr(w, 'segmentation_tab', None)
+        except Exception:
+            pass
+
+        seg_layers = getattr(seg_tab, 'layer_definitions', None) if seg_tab else None
+        seg_config_path = getattr(seg_tab, 'config_path', None) if seg_tab else None
+
+        if seg_layers and seg_config_path:
+            # Use layer definitions already loaded in 3D Teaching tab
+            config_source = seg_config_path
+            for ld in seg_layers:
+                name = ld.get('name', '')
+                z_start = ld.get('z_start', 0)
+                z_end = ld.get('z_end', 0)
+                layer_config[name] = (z_start, z_end)
+                layer_config[name.replace(' ', '_')] = (z_start, z_end)
+            print(f"[MaskFolder] Using {len(seg_layers)} layer definitions "
+                  f"from 3D Teaching config: {config_source}")
+        else:
+            # Fallback: ask user to select a config file manually
+            config_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Config File (for layer Z offsets)",
+                os.path.dirname(folder),
+                "Config Files (*.txt *.cfg *.ini);;All Files (*.*)")
+            if not config_path:
+                return
+            config_source = config_path
+
+            # 4. Parse layer definitions from config (UTF-8 first — not locale cp949)
+            try:
+                for line in read_text_auto(config_path).splitlines():
+                    line = line.strip()
+                    if line.startswith('#') or not line:
+                        continue
+                    match = re.match(r'LAYER_\d+\s*=\s*(.+)', line)
+                    if match:
+                        parts = match.group(1).rsplit(',', 3)
+                        if len(parts) >= 3:
+                            try:
+                                name = parts[0].strip()
+                                z_start = int(parts[1].strip())
+                                z_end = int(parts[2].strip())
+                                # Also store with underscore variant: "Layer 1" → "Layer_1"
+                                layer_config[name] = (z_start, z_end)
+                                layer_config[name.replace(' ', '_')] = (z_start, z_end)
+                            except ValueError:
+                                continue
+            except Exception as e:
+                QMessageBox.critical(self, "Config Error", f"Failed to parse config:\n{str(e)}")
+                return
         
         if not layer_config:
             QMessageBox.warning(self, "No Layers in Config",
-                "No LAYER_N definitions found in config file.")
+                "No LAYER_N definitions found.\n\n"
+                "Please load a config file in the 3D Teaching tab first,\n"
+                "or select a config file manually.")
             return
         
         # 5. Build full-volume masks
@@ -2083,10 +2219,20 @@ class VolumeIOMixin:
         
         for orientation in ['axial', 'coronal', 'sagittal']:
             self.render_slice(orientation)
+
+        # Rebuild 3D overlay so bump/void glass shells appear in the 3D pane
+        if hasattr(self, 'render_3d'):
+            try:
+                self.render_3d()
+            except Exception as e:
+                print(f"[MaskFolder] 3D overlay rebuild failed: {e}")
+
         self.update_info_label()
         
         # Report
-        msg = f"Loaded {loaded_count}/{len(layer_dirs)} layers successfully."
+        cfg_basename = os.path.basename(config_source) if config_source else "unknown"
+        msg = f"Loaded {loaded_count}/{len(layer_dirs)} layers successfully.\n"
+        msg += f"Config: {cfg_basename}"
         if errors:
             msg += f"\n\nWarnings:\n" + "\n".join(errors[:10])
         QMessageBox.information(self, "Mask Folder Loaded", msg)

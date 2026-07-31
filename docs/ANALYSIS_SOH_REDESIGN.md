@@ -1,9 +1,10 @@
 # 3D Analysis — SOH Analytics Workbench (DB-first redesign)
 
 **Status:** P0 implemented (DB-first Overview) · concept + mockup retained  
-**Mockup:** [`docs/mockups/analysis_soh_tab.html`](mockups/analysis_soh_tab.html)  
+**Mockup:** [`docs/mockups/tabs_redesign_preview.html`](mockups/tabs_redesign_preview.html) (Line Pulse + Analysis + Homology Cross)  
 **Code:** `inno3d/tabs/analysis.py`, `inno3d/core/soh_data.py`, `inno3d/core/inspection_db.py` (SOH APIs)  
-**Related:** [`BATCH_REVIEW.md`](BATCH_REVIEW.md)
+**Related:** [`BATCH_REVIEW.md`](BATCH_REVIEW.md), [`BATCH_REVIEW_CONCEPT_REDESIGN.md`](BATCH_REVIEW_CONCEPT_REDESIGN.md)  
+**Cross-compare / IP method:** [`ANALYSIS_CROSS_HOMOLOGY_PATENT.md`](ANALYSIS_CROSS_HOMOLOGY_PATENT.md) — **H²C²** (Site Homology Key, nested variance, FOV lock)
 
 ### Implemented (P0)
 
@@ -80,9 +81,32 @@ Date / Lot-FOUP / Recipe
 | Bump grid (R,C) | Site-specific σ? | Multi-run, fixed layer |
 | FOV re-run / multi-wafer | Gage / process? | Explicit multi-select set |
 
+### 3.2b Homologous cross (fair compare)
+
+**Chips are design-identical.** Comparing Chip A vs Chip B at the **same FOV folder** (`FOV_P6` ↔ `FOV_P6`) is fully valid and is the **default** cross mode. Map by production folders:
+
+```text
+Chip_11_11/FOV_P6  ↔  Chip_19_11/FOV_P6   ✅
+Chip_11_11/FOV_P4  ↔  Chip_19_11/FOV_P6   ❌ (different FOV tile — unless FOV-bias mode)
+```
+
+**Site Homology Key (SHK)** = `(layer, fov_index, grid_row, grid_col)` for bump-level join inside that FOV.
+
+| Mode | Lock | Free | Use |
+|------|------|------|-----|
+| **Die↔Die** ⭐ | SHK + wafer + FOUP + lot | **chip** | Same wafer, other dies, **same FOV_Pn** |
+| Wafer↔Wafer | SHK + chip coord + FOUP + lot | wafer | Same map address + FOV, other wafers |
+| FOUP↔FOUP | SHK + chip + wafer slot | FOUP | Carrier effect |
+| Lot↔Lot | SHK + relative slots | lot | Lot shift |
+| FOV bias (special) | layer+grid only | fov_index | P1–P9 bias on **one** die — warn banner |
+
+Full method → [`ANALYSIS_CROSS_HOMOLOGY_PATENT.md`](ANALYSIS_CROSS_HOMOLOGY_PATENT.md).
+
 ### 3.3 Analysis set
 
-Operator multi-selects FOV runs (or chips/wafers) into an **analysis set**. All Compare / Bump-σ / LOO use that set. Overview defaults to current selection or whole set.
+Operator multi-selects FOV runs (or chips/wafers) into an **analysis set**. All Homology Cross / Bump-σ / LOO use that set. Overview defaults to current selection or whole set.
+
+**Fair cohort rule:** Homology Cross prefers an **Anchor run** + auto-proposed peers with matching SHK coverage; block join when FOV index differs (unless FOV Bias mode).
 
 ---
 
@@ -113,19 +137,28 @@ Three columns (mirrors Batch Review width language):
 - Breadcrumb scope
 - Metric: SOH | Void% | NG rate | Bump vol  
 - Aggregate: Mean / Median / P95  
-- NG threshold + %Tol Excellent / Acceptable  
+- Spec limits: User inputs **UCL** & **LCL** (e.g. +1.5 / -1.5 µm → |UCL - LCL| = 3.0 µm)
+- **%Tol formula**: `%Tol = (5.15 * stdDev) / |UCL - LCL| * 100%`
+- **Configurable Grade Thresholds & Chart Colors**: User inputs threshold values (default Grade 1 = 10%, Grade 2 = 30%) to auto-color charts:
+  - `%Tol < Grade 1 Limit` (default `< 10%`) → **Green** (Grade 1 - PASS / 적합 / 개선 불필요)
+  - `Grade 1 Limit ≤ %Tol < Grade 2 Limit` (default `10% ~ 30%`) → **Amber/Yellow** (Grade 2 - WARNING / 개선 검토)
+  - `%Tol ≥ Grade 2 Limit` (default `≥ 30%`) → **Red** (Grade 3 - FAIL / 개선 필요)  
 
 **Segmented tabs** (not five equal left-panel mode buttons)
 
 | Tab | Role |
 |-----|------|
 | **Overview** | KPI cards, SOH by Layer, FOV 3×3 heatmap, summary table |
-| **Maps** | Wafer SOH map + chip FOV map + optional bump grid |
-| **Compare** | Cross-sample / cross-run σ (%Tol) |
-| **Bump** | Per-bump σ across set |
-| **Spatial** | 3D-SIM (SII, Moran, propagation) |
-| **Root cause** | LOO-VD impact ranking |
+| **Maps** | Wafer SOH map + chip FOV map + optional bump grid (**metrology** colors) |
+| **Homology Cross** | Matched SHK Δ across chip/wafer/FOUP/lot + pair matrix + coverage |
+| **Variance Stack** | Nested σ% Lot→FOUP→Wafer→Chip→residual (panel or sub-tab) |
+| **FOV Bias** | Unlock FOV deliberately; φ_f field — not for yield blame |
+| **Bump** | Per-SHK σ across set |
+| **Spatial** | 3D-SIM (SII, Moran, propagation) within FOV |
+| **Root cause** | LOSO-VD + HSI hotspot ranking |
 | **Table** | Flat MES query (power user) |
+
+Legacy “Cross-σ on sample folders” is superseded by **Homology Cross** (SHK-matched).
 
 ### Right — Insight panel
 
@@ -239,7 +272,7 @@ Existing: `list_lots`, `list_wafers`, `list_fov_runs`, `get_run`, `wafer_chip_bi
 |--------|----------|
 | SOH continuous | Cyan → amber → red scale (low→high deviation from set mean, or absolute) |
 | NG rate | Green / amber / red vs NG threshold |
-| %Tol | Excellent / Acceptable / Poor (existing spin boxes) |
+| %Tol | Dynamic chart color encoding based on user-input Grade thresholds:<br>• `< Grade 1` (default 10%): Green (Grade 1 - PASS)<br>• `Grade 1 .. Grade 2` (default 10~30%): Amber (Grade 2 - WARNING)<br>• `≥ Grade 2` (default 30%): Red (Grade 3 - FAIL) |
 | Pass/fail bin | Batch Review only (Analysis maps use metrology scales) |
 | FOV 3×3 | Same P1–P9 layout as Online / Batch Review |
 

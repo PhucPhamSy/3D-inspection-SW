@@ -296,3 +296,46 @@ def aggregate_fov_from_samples(samples: Sequence[SampleData]) -> List[Dict[str, 
             }
         )
     return out
+
+
+def _aggregate_metric_value(row: Dict[str, Any]) -> float:
+    """Return the map metric value from a SQL aggregate row.
+
+    Callers may add ``metric`` (or ``value``) to select a non-SOH aggregate
+    before passing rows to the grid helpers.  The natural default remains
+    ``mean_soh`` for the SOH map.
+    """
+    for key in ("metric", "value", "mean_soh"):
+        try:
+            value = row.get(key)
+            if value is not None:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def chip_metric_grid(agg_rows: List[Dict[str, Any]]) -> Dict[Tuple[int, int], float]:
+    """Convert chip SQL aggregate rows to ``(chip_col, chip_row) → metric``."""
+    grid: Dict[Tuple[int, int], float] = {}
+    for row in agg_rows:
+        try:
+            col = int(row.get("chip_col"))
+            row_idx = int(row.get("chip_row"))
+        except (TypeError, ValueError):
+            continue
+        grid[(col, row_idx)] = _aggregate_metric_value(row)
+    return grid
+
+
+def fov_metric_grid(agg_rows: List[Dict[str, Any]]) -> Dict[int, float]:
+    """Convert FOV SQL aggregate rows to ``P1..P9 → metric``."""
+    grid: Dict[int, float] = {}
+    for row in agg_rows:
+        try:
+            fov_index = int(row.get("key"))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= fov_index <= 9:
+            grid[fov_index] = _aggregate_metric_value(row)
+    return grid

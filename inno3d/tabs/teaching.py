@@ -35,8 +35,9 @@ from inno3d.features.teaching.workers import (
 from inno3d.features.teaching.seg_ui import SegmentationUIMixin
 from inno3d.features.teaching.seg_pipeline import SegmentationPipelineMixin
 from inno3d.features.teaching.seg_mpr import SegmentationMPRMixin
+from inno3d.features.teaching.layer_define import LayerDefineMixin
 
-class SegmentationTab(SegmentationPipelineMixin, SegmentationMPRMixin, SegmentationUIMixin, QWidget):
+class SegmentationTab(LayerDefineMixin, SegmentationPipelineMixin, SegmentationMPRMixin, SegmentationUIMixin, QWidget):
     """Tab for interactive Bump/Void segmentation with real-time parameter adjustment"""
     # Signal emitted when inspection finishes: (volume_data, bump_data, void_data)
     inspection_done = pyqtSignal(object, object, object)
@@ -133,6 +134,12 @@ class SegmentationTab(SegmentationPipelineMixin, SegmentationMPRMixin, Segmentat
         self.roi_start_point = None  # (x, y) world coords of initial click
         self.roi_temp_end = None    # (x, y) world coords during drag
         self.export_thread = None
+
+        # Layer Define Mode (interactive bar placement on sagittal view)
+        self.layer_define_active = False
+        self._layer_define_dragging = False
+        self._layer_define_drag_idx = None   # (layer_index, 'start'|'end')
+        self._layer_define_hover_idx = None  # currently hovered bar
 
         self._theme_panels = []
         self._theme_accent_labels = []

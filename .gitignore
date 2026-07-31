@@ -6,10 +6,13 @@ __pycache__/
 *.egg
 .eggs/
 
-# PyInstaller
+# PyInstaller / Build outputs
 dist/
 build/
 *.spec
+Publish/
+tools/*/Publish/
+
 
 # IDE
 .vscode/
@@ -47,6 +50,9 @@ BoundaryGPU/
 # Agent / tool caches
 .gemini/
 .antigravityignore
+TRT_Cache/
+*.bak
 
 # Misc
 *.pyc
+

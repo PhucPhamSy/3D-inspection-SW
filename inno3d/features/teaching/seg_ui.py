@@ -522,10 +522,11 @@ class SegmentationUIMixin:
         self.setLayout(layout)
         self.refresh_theme()
         
-        # Load default DLL and Config (portable: next to exe when frozen, project V2 in dev)
+        # Load default DLL and Config (portable: ini override → V2/V3 → project V2)
         from inno3d.core.resources import default_config_path, default_dll_dir
+        from inno3d.app.settings import get_dll_dir as settings_dll_dir
 
-        default_dll = default_dll_dir()
+        default_dll = settings_dll_dir() or default_dll_dir()
         default_config = default_config_path()
 
         if default_dll and os.path.exists(default_dll):
@@ -566,7 +567,11 @@ class SegmentationUIMixin:
         
         self.dll_path_input = QLineEdit()
         self.dll_path_input.setReadOnly(True)
-        self.dll_path_input.setPlaceholderText("Select folder containing BumpVoidSeg.dll...")
+        self.dll_path_input.setPlaceholderText(
+            "Select folder containing BumpVoidSeg.dll (V2 or V3)..."
+        )
+        # Keep toolbar field when sidebar later rebinds dll_path_input
+        self._toolbar_dll_path_input = self.dll_path_input
         layout.addWidget(self.dll_path_input, 2)
         
         dll_btn = make_browse_btn("folder.svg", "Browse DLL folder", self.load_dll_folder, QStyle.SP_DirIcon)
@@ -1727,8 +1732,41 @@ class SegmentationUIMixin:
         """)
         self.layer_gen_btn.clicked.connect(self.generate_layers)
         gen_row.addWidget(self.layer_gen_btn)
+
+        # Manually Define button — toggle interactive bar placement on YZ view
+        self.layer_manual_define_btn = QPushButton("\u270b Manually Define")
+        self.layer_manual_define_btn.setCheckable(True)
+        self.layer_manual_define_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {SemiconductorTheme.BTN_SECONDARY_BG};
+                color: {SemiconductorTheme.TEXT_PRIMARY};
+                font-weight: bold; font-size: 8pt;
+                padding: 4px 10px;
+                border-radius: 4px; border: 1px solid {SemiconductorTheme.BORDER_DEFAULT};
+            }}
+            QPushButton:disabled {{
+                opacity: 0.5; color: {SemiconductorTheme.TEXT_DISABLED};
+            }}
+            QPushButton:hover {{ background-color: {SemiconductorTheme.BG_LIGHT}; }}
+        """)
+        self.layer_manual_define_btn.clicked.connect(self._toggle_layer_define_mode)
+        gen_row.addWidget(self.layer_manual_define_btn)
         gen_row.addStretch()
         single_layout.addLayout(gen_row)
+
+        # Instruction hint (visible only during define mode)
+        self._layer_define_hint_lbl = QLabel(
+            "\u2139\ufe0f  Drag vertical bars on the YZ view to set Z-start / Z-end.\n"
+            "   Solid = Start, Dashed = End. Scroll to zoom in for precision."
+        )
+        self._layer_define_hint_lbl.setWordWrap(True)
+        self._layer_define_hint_lbl.setStyleSheet(
+            f"color: {SemiconductorTheme.ACCENT_WARNING}; font-size: 8pt; "
+            f"padding: 4px 6px; background: {SemiconductorTheme.BG_DARK}; "
+            f"border: 1px solid {SemiconductorTheme.ACCENT_WARNING}; border-radius: 4px;"
+        )
+        self._layer_define_hint_lbl.setVisible(False)
+        single_layout.addWidget(self._layer_define_hint_lbl)
 
         # --- Table ---
         self.layer_table = QTableWidget()
@@ -2079,18 +2117,36 @@ class SegmentationUIMixin:
             
         n = self.layer_spinbox.value()
         z_max = self.volume_data.shape[0]
-        step = z_max // n
-        
-        self.layer_definitions.clear()
-        for i in range(n):
-            z_s = i * step
-            z_e = z_max if i == n - 1 else (i + 1) * step
-            self.layer_definitions.append({
-                'id': i, 'name': f"Layer {i+1}", 'z_start': z_s, 'z_end': z_e, 'selected': True
-            })
+
+        # Smart auto-detect using Z-profile std_dev analysis
+        try:
+            from inno3d.features.teaching.auto_layer_split import auto_detect_layers
+            self.layer_definitions = auto_detect_layers(
+                self.volume_data, n,
+                skip_air_top=10, skip_air_bottom=10,
+            )
+            print(f"[AutoSplit] Detected {len(self.layer_definitions)} layers "
+                  f"from std_dev profile analysis")
+        except Exception as e:
+            print(f"[AutoSplit] Smart detection failed ({e}), using uniform split")
+            # Fallback: uniform split
+            step = z_max // n
+            self.layer_definitions = []
+            for i in range(n):
+                z_s = i * step
+                z_e = z_max if i == n - 1 else (i + 1) * step
+                self.layer_definitions.append({
+                    'id': i, 'name': f"Layer {i+1}",
+                    'z_start': z_s, 'z_end': z_e, 'selected': True
+                })
             
         self.layers_active = True
         self._populate_layer_table()
+
+        # Auto-activate visual layer define mode so user can see and adjust
+        if hasattr(self, 'layer_manual_define_btn'):
+            if not getattr(self, 'layer_define_active', False):
+                self._toggle_layer_define_mode(checked=True)
         
     def _populate_layer_table(self):
         self.layer_table.blockSignals(True)
@@ -2128,10 +2184,57 @@ class SegmentationUIMixin:
                 val = int(item.text())
                 if col == 2: layer['z_start'] = max(0, val)
                 else: layer['z_end'] = val
+                # Flash highlight on successful edit
+                self._flash_layer_cell(row, col)
             except ValueError:
                 pass # Invalid int, keep old value silently
         
         self._update_layer_status()
+
+    def _flash_layer_cell(self, row, col):
+        """Flash-highlight a z_start/z_end cell to confirm the edit.
+
+        col 2 = z_start → green tint; col 3 = z_end → cyan tint.
+        Auto-resets to normal background after 1.2s.
+        """
+        if not hasattr(self, 'layer_table'):
+            return
+        item = self.layer_table.item(row, col)
+        if item is None:
+            return
+
+        # Highlight color: green for start, cyan for end
+        if col == 2:
+            flash_color = QColor(30, 160, 90, 220)   # green
+        else:
+            flash_color = QColor(20, 140, 200, 220)   # cyan
+
+        item.setBackground(flash_color)
+
+        # Cancel any existing timer for this cell to avoid stacking
+        timer_key = f'_flash_timer_{row}_{col}'
+        existing = getattr(self, timer_key, None)
+        if existing is not None:
+            try:
+                existing.stop()
+            except Exception:
+                pass
+
+        def _reset():
+            try:
+                it = self.layer_table.item(row, col)
+                if it is not None:
+                    it.setBackground(QColor(0, 0, 0, 0))  # transparent → stylesheet takes over
+            except Exception:
+                pass
+            setattr(self, timer_key, None)
+
+        from PyQt5.QtCore import QTimer
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(_reset)
+        timer.start(1200)  # 1.2s flash
+        setattr(self, timer_key, timer)
 
     def _set_all_layers(self, state):
         for l in self.layer_definitions:
@@ -5771,6 +5874,14 @@ class SegmentationUIMixin:
                 "bumpFillHoleRadius", [3.0, 3.0, 3.0], step=0.5, decimals=2
             ),
         )
+        # Fiji HBMDetectBumpsHQ: close3D after Fill Holes (SEG ≥ 0.0.1)
+        self._add_named_param_block(
+            layout,
+            "Fill Hole Close (vox)",
+            self._make_xyz_spin_row(
+                "bumpFillHoleClose", [5.0, 5.0, 5.0], step=0.5, decimals=2
+            ),
+        )
 
         group.setLayout(layout)
         return group
@@ -5983,6 +6094,31 @@ class SegmentationUIMixin:
         show_result_check.stateChanged.connect(self.on_parameter_changed)
         layout.addWidget(show_result_check)
         self.param_widgets["showResult"] = show_result_check
+
+        prof_check = QCheckBox("Enable DLL Profiling (bottleneck timing)")
+        prof_check.setChecked(False)
+        prof_check.setToolTip(
+            "When enabled, SEG / MES / B2B / ENH collect stage timings:\n"
+            "  IO load/save, GPU H2D/D2H, algorithm compute, FAR/CSV, etc.\n"
+            "Reports appear in:\n"
+            "  1) Success popup after Inspection (SEG)\n"
+            "  2) Inno3D_Logs/inno3d_log_*.txt  (logger DLL_PROF)\n"
+            "Default OFF — zero overhead for production inspection.\n"
+            "Requires rebuilt ISP DLLs with SetProfiling exports."
+        )
+        prof_check.stateChanged.connect(self.on_parameter_changed)
+        prof_check.stateChanged.connect(lambda _s: self._apply_dll_profiling_flag())
+        layout.addWidget(prof_check)
+        self.param_widgets["enableDllProfiling"] = prof_check
+
+        prof_hint = QLabel(
+            "→ Timing report goes to Inno3D_Logs (search DLL_PROF) + Success dialog after run."
+        )
+        prof_hint.setWordWrap(True)
+        prof_hint.setStyleSheet(
+            f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 7.5pt; padding-left: 4px;"
+        )
+        layout.addWidget(prof_hint)
 
         group.setLayout(layout)
         return group

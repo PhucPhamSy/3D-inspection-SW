@@ -53,6 +53,87 @@ from PyQt5.QtWidgets import *
 import time
 
 
+class OnlineToggleSwitch(QAbstractButton):
+    """Left/right sliding switch with ON/OFF labels above track."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(76, 42)
+        self._colors = {}
+        self.apply_theme()
+
+    def sizeHint(self):
+        return QSize(76, 42)
+
+    def apply_theme(self):
+        is_light = SemiconductorTheme.is_light()
+        self._colors = {
+            "off_bg": QColor("#d2deec") if is_light else QColor("#1a2233"),
+            "on_bg": QColor("#22b273") if is_light else QColor("#00c878"),
+            "off_border": QColor("#7f98b4") if is_light else QColor("#43597a"),
+            "on_border": QColor("#10d88a") if not is_light else QColor("#1a8f5f"),
+            "knob": QColor("#f7fbff") if is_light else QColor("#ecf4ff"),
+            "label_active": QColor("#0a5f3d") if is_light else QColor("#bcf7d9"),
+            "label_inactive": QColor("#5d738c") if is_light else QColor("#7f94ad"),
+            "focus": QColor("#22aed1"),
+        }
+        self.update()
+
+    def _track_rect(self):
+        base = self.rect().adjusted(1, 1, -1, -1)
+        return QRectF(float(base.x()), float(base.y() + 18), float(base.width()), float(base.height() - 18))
+
+    def _knob_rect(self, track_rect):
+        margin = 2.0
+        knob_d = max(12.0, track_rect.height() - margin * 2.0)
+        x = track_rect.right() - margin - knob_d if self.isChecked() else track_rect.x() + margin
+        return QRectF(float(x), float(track_rect.y() + margin), float(knob_d), float(knob_d))
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        base = self.rect().adjusted(1, 1, -1, -1)
+        track_rect = self._track_rect()
+
+        bg = self._colors["on_bg"] if self.isChecked() else self._colors["off_bg"]
+        border = self._colors["on_border"] if self.isChecked() else self._colors["off_border"]
+        if self.underMouse():
+            border = self._colors["focus"]
+
+        font = p.font()
+        font.setPointSizeF(7.8)
+        font.setBold(True)
+        p.setFont(font)
+        label_y = float(base.y() + 1)
+        label_h = 14.0
+        off_rect = QRectF(float(base.x() + 4), label_y, float(base.width() / 2.0 - 6), label_h)
+        on_rect = QRectF(float(base.x() + base.width() / 2.0), label_y, float(base.width() / 2.0 - 6), label_h)
+
+        p.setPen(self._colors["label_inactive"] if self.isChecked() else self._colors["label_active"])
+        p.drawText(off_rect, Qt.AlignVCenter | Qt.AlignLeft, "OFF")
+        p.setPen(self._colors["label_active"] if self.isChecked() else self._colors["label_inactive"])
+        p.drawText(on_rect, Qt.AlignVCenter | Qt.AlignRight, "ON")
+
+        radius = track_rect.height() / 2.0
+        p.setPen(QPen(border, 1.6))
+        p.setBrush(QBrush(bg))
+        p.drawRoundedRect(track_rect, radius, radius)
+
+        knob_rect = self._knob_rect(track_rect)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(self._colors["knob"]))
+        p.drawEllipse(knob_rect)
+
+        if self.hasFocus():
+            p.setPen(QPen(self._colors["focus"], 1.0, Qt.DotLine))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(track_rect.adjusted(-1, -1, 1, 1), radius + 1, radius + 1)
+
+        p.end()
+
+
 class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
     """Main Window - 3D Semiconductor Viewer"""
     
@@ -122,6 +203,10 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
         self.help_tab.set_current_theme(SemiconductorTheme.CURRENT_THEME)
         if hasattr(self.batch_review_tab, "open_in_viewer"):
             self.batch_review_tab.open_in_viewer.connect(self._on_batch_review_open_run)
+        if hasattr(self.analysis_tab, "open_in_line_pulse"):
+            self.analysis_tab.open_in_line_pulse.connect(self._on_analysis_open_in_line_pulse)
+        if hasattr(self.analysis_tab, "open_in_viewer"):
+            self.analysis_tab.open_in_viewer.connect(self._on_batch_review_open_run)
 
         # Tabs Container (Sidebar + Content) uses QSplitter for resizing
         tabs_container = QSplitter(Qt.Horizontal)
@@ -193,34 +278,10 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
         self.online_label = online_label
         online_layout.addWidget(online_label)
         
-        self.online_toggle = QPushButton("OFF")
-        self.online_toggle.setCheckable(True)
-        self.online_toggle.setFixedSize(64, 30)
-        self.online_toggle.setStyleSheet(f"""
-            QPushButton {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba(26, 31, 53, 220),
-                    stop:1 rgba(20, 28, 55, 240));
-                border: 2px solid rgba(45, 55, 72, 0.6);
-                border-radius: 15px;
-                font-size: 9pt;
-                font-weight: bold;
-                padding: 0px 0px 1px 0px;
-                color: {SemiconductorTheme.TEXT_DISABLED};
-                letter-spacing: 0.5px;
-            }}
-            QPushButton:hover {{
-                border-color: rgba(0, 255, 157, 0.3);
-                color: {SemiconductorTheme.TEXT_SECONDARY};
-            }}
-            QPushButton:checked {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #00cc7a, stop:1 #00ff9d);
-                border-color: {SemiconductorTheme.ACCENT_SUCCESS};
-                color: #050510;
-            }}
-        """)
+        self.online_toggle = OnlineToggleSwitch()
         self.online_toggle.clicked.connect(self.toggle_online)
+        self.online_toggle.toggled.connect(self._sync_online_toggle_hint)
+        self._sync_online_toggle_hint(self.online_toggle.isChecked())
         online_layout.addWidget(self.online_toggle)
         online_layout.addStretch()
         online_outer.addWidget(online_row)
@@ -315,21 +376,12 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
         lbl_input.setStyleSheet(SemiconductorTheme.sidebar_section_style())
         ai_layout.addWidget(lbl_input)
         
-        b_ai_load = QPushButton("  LOAD FILE")
-        b_ai_load.setProperty("class", "list-btn")
-        b_ai_load.setCursor(Qt.PointingHandCursor)
-        b_ai_load.clicked.connect(lambda: self.ai_3d_tab.load_volume(from_folder=False))
-        
-        b_ai_load_folder = QPushButton("  LOAD FOLDER")
-        b_ai_load_folder.setProperty("class", "list-btn")
-        b_ai_load_folder.setCursor(Qt.PointingHandCursor)
-        b_ai_load_folder.clicked.connect(lambda: self.ai_3d_tab.load_folder(from_folder=True) if hasattr(self.ai_3d_tab, 'load_folder') else self.ai_3d_tab.load_volume(from_folder=True))
-        
-        ai_load_row = QHBoxLayout()
-        ai_load_row.setContentsMargins(0, 0, 0, 0)
-        ai_load_row.addWidget(b_ai_load)
-        ai_load_row.addWidget(b_ai_load_folder)
-        ai_layout.addLayout(ai_load_row)
+        b_ai_open = QPushButton("  OPEN")
+        b_ai_open.setProperty("class", "list-btn")
+        b_ai_open.setCursor(Qt.PointingHandCursor)
+        b_ai_open.setToolTip("Open a 3D file or a folder of stack images")
+        b_ai_open.clicked.connect(lambda: self.ai_3d_tab.load_volume())
+        ai_layout.addWidget(b_ai_open)
         
         # --- AI VIEW SECTION ---
         def add_ai_section(text):
@@ -516,8 +568,8 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
                 left = min(left, max(160, total // 5))
                 sp.setSizes([left, max(400, total - left)])
         else:
-            # Compact strip: ONLINE toggle + « Menu (must fit 64px switch + label)
-            compact_w = 140
+            # Compact strip: ONLINE label + switch + « Menu
+            compact_w = 160
             sidebar.setMinimumWidth(compact_w)
             sidebar.setMaximumWidth(compact_w)
             if sp is not None:
@@ -532,14 +584,13 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
             QTimer.singleShot(40, mpv._reposition_visible_overlays)
 
     def set_online_app_sidebar_layout(self, online):
-        """Online ON → auto-collapse left menu; Offline → full menu restored."""
+        """Online ON → keep left menu expanded by default (user can manually collapse with 'Hide menu ‹'); Offline → full menu restored."""
         online = bool(online)
         sp = getattr(self, "tabs_splitter", None)
         if online:
             if sp is not None:
                 self._pre_online_sidebar_sizes = list(sp.sizes())
-            self._app_sidebar_user_expanded = False
-            self.set_app_sidebar_expanded(False, remember=True)
+            self.set_app_sidebar_expanded(True, remember=False)
         else:
             self.set_app_sidebar_expanded(True, remember=False)
             # Restore pre-online splitter sizes when possible
@@ -571,43 +622,17 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
                 pass
 
     def _apply_online_toggle_style(self):
-        is_light = SemiconductorTheme.is_light()
-        off_grad_start = "rgba(222, 232, 243, 245)" if is_light else "rgba(26, 31, 53, 220)"
-        off_grad_end = "rgba(206, 219, 235, 250)" if is_light else "rgba(20, 28, 55, 240)"
-        off_border = "rgba(132, 154, 178, 0.72)" if is_light else "rgba(45, 55, 72, 0.6)"
-        off_text = SemiconductorTheme.TEXT_DISABLED
-        hover_border = "rgba(10, 143, 183, 0.60)" if is_light else "rgba(0, 255, 157, 0.3)"
-        hover_text = SemiconductorTheme.TEXT_PRIMARY if is_light else SemiconductorTheme.TEXT_SECONDARY
-        on_start = "#20b574" if is_light else "#00cc7a"
-        on_end = "#1b8e5a" if is_light else "#00ff9d"
-        on_text = "#ffffff" if is_light else "#050510"
+        if hasattr(self, "online_toggle") and hasattr(self.online_toggle, "apply_theme"):
+            self.online_toggle.apply_theme()
 
-        self.online_toggle.setStyleSheet(
-            f"""
-            QPushButton {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {off_grad_start},
-                    stop:1 {off_grad_end});
-                border: 2px solid {off_border};
-                border-radius: 15px;
-                font-size: 9pt;
-                font-weight: bold;
-                padding: 0px 0px 1px 0px;
-                color: {off_text};
-                letter-spacing: 0.5px;
-            }}
-            QPushButton:hover {{
-                border-color: {hover_border};
-                color: {hover_text};
-            }}
-            QPushButton:checked {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {on_start}, stop:1 {on_end});
-                border-color: {SemiconductorTheme.ACCENT_SUCCESS};
-                color: {on_text};
-            }}
-            """
-        )
+    def _sync_online_toggle_hint(self, checked):
+        """Keep inline hint explicit about which side to click next."""
+        if not hasattr(self, "online_toggle"):
+            return
+        if checked:
+            self.online_toggle.setToolTip("Online mode is ON. Slide right to switch OFF.")
+        else:
+            self.online_toggle.setToolTip("Online mode is OFF. Slide left to switch ON.")
 
     def _apply_online_chrome(self, active):
         """Cyan glow frame around ONLINE block when Online is ON."""
@@ -646,18 +671,15 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
                 )
 
     def _set_online_input_locked(self, locked):
-        """Disable manual FILE/FOLDER load while Online controls input (#3)."""
+        """Disable manual OPEN load while Online controls input (#3)."""
         lock_tip = "Input is controlled by Online server (Server.cpp)"
-        for btn, normal_tip in (
-            (getattr(self, "viewer_btn_file", None), "Load single 3D file (.tif/.tiff/.raw)"),
-            (getattr(self, "viewer_btn_folder", None), "Load 3D stack from folder"),
-        ):
-            if btn is None:
-                continue
+        normal_tip = "Open a 3D file or a folder of stack images"
+        btn = getattr(self, "viewer_btn_open", None)
+        if btn is not None:
             btn.setEnabled(not locked)
             btn.setToolTip(lock_tip if locked else normal_tip)
             btn.setCursor(Qt.ArrowCursor if locked else Qt.PointingHandCursor)
-        # Yellow banner removed — FILE/FOLDER stay disabled + tooltip is enough
+        # Yellow banner removed — OPEN stays disabled + tooltip is enough
         hint = getattr(self, "online_input_lock_hint", None)
         if hint is not None:
             hint.setVisible(False)
@@ -933,14 +955,15 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
             "3D TEACHING",
             "3D AI MODULE",
             "3D ANALYSIS",
-            "BATCH REVIEW",
+            "LINE PULSE",
             "HELP",
         ]
         if index < len(tab_names):
             self.status_label.setText(f"ACTIVE MODULE: {tab_names[index]}")
         if index == 4 and hasattr(self, "batch_review_tab"):
             try:
-                self.batch_review_tab.refresh_all()
+                if hasattr(self.batch_review_tab, "_sync_live_poll_timer"):
+                    self.batch_review_tab._sync_live_poll_timer()
             except Exception:
                 pass
         
@@ -1036,13 +1059,30 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
             chip = f"({run.get('chip_col')},{run.get('chip_row')})"
             fov = run.get("fov_index") or "?"
             self.status_label.setText(
-                f"BATCH REVIEW → Viewer full parity · Chip {chip} P{fov} · "
+                f"LINE PULSE → Viewer full parity · Chip {chip} P{fov} · "
                 f"MES {n_mes} · vol/mask/B2B loading…"
             )
         except Exception as e:
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Open full Viewer", f"Failed to load:\n{e}")
+
+    def _on_analysis_open_in_line_pulse(self, run_id: str):
+        """Deep-link focused Analysis FOV to its Line Pulse run detail."""
+        run_id = str(run_id or "")
+        self.switch_tab(4)
+        selected = False
+        if run_id and hasattr(self.batch_review_tab, "select_run"):
+            try:
+                selected = bool(self.batch_review_tab.select_run(run_id))
+            except Exception:
+                selected = False
+        if selected:
+            self.status_label.setText(f"Analysis → Line Pulse · focused run {run_id}")
+        else:
+            self.status_label.setText(
+                f"Analysis → Line Pulse · refresh complete; run {run_id or 'not available'}"
+            )
 
 
     def closeEvent(self, event):

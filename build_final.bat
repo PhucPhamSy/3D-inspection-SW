@@ -7,6 +7,8 @@ echo ==========================================
 echo.
 
 set "APP_NAME=Inno3D"
+REM Native DLL source (override: set DLL_SOURCE_DIR=... before running)
+if not defined DLL_SOURCE_DIR set "DLL_SOURCE_DIR=E:\semiconductor\HBM_DEV_FOR_PROD\DEV\all_v2\V6"
 set "ICON_PATH=%cd%\assets\branding\company_logo_v1.ico"
 set "ICON_SCRIPT=%cd%\build\tools\create_icon.py"
 set "BUILD_WORKDIR=%cd%\build\pyinstaller"
@@ -27,8 +29,9 @@ if not defined PACKAGE_SLIM set PACKAGE_SLIM=0
 if "%PACKAGE_SLIM%"=="1" (
     echo [SLIM MODE] Only core DLLs will be copied ^(no TRT bulk^)
 ) else (
-    echo [FULL MODE] Full V2 package will be copied
+    echo [FULL MODE] Full native DLL package will be copied
 )
+echo DLL source: %DLL_SOURCE_DIR%
 echo.
 
 REM Step 1: Create icon (optional, skips if script or source missing)
@@ -121,11 +124,11 @@ if exist "dist\%APP_NAME%\%APP_NAME%.exe" (
     echo.
 
     REM Native SEG/MES/B2B/ENH + CUDA/OpenCV deps — MUST sit next to the exe.
-    REM PyInstaller does NOT embed these; outsource machines lack E:\semiconductor\...
-    if exist "%cd%\V2" (
+    REM PyInstaller does NOT embed these; copy from shared all_v2\V6 into dist\V2.
+    if exist "%DLL_SOURCE_DIR%" (
         if not exist "dist\%APP_NAME%\V2" mkdir "dist\%APP_NAME%\V2"
         if "%PACKAGE_SLIM%"=="1" (
-            echo Copying SLIM V2 ^(core DLLs only — no TRT bulk^)...
+            echo Copying SLIM native DLLs from V6 ^(core only — no TRT bulk^)...
             REM Core native binaries
             for %%F in (
                 BumpVoidSeg.dll BumpVoidDLL.dll
@@ -134,30 +137,31 @@ if exist "dist\%APP_NAME%\%APP_NAME%.exe" (
                 BumpVoid_ISP_ENH.dll EnhancedVolumeDLL.dll
                 opencv_world4110.dll
             ) do (
-                if exist "%cd%\V2\%%F" (
-                    copy /Y "%cd%\V2\%%F" "dist\%APP_NAME%\V2\%%F" >nul
+                if exist "%DLL_SOURCE_DIR%\%%F" (
+                    copy /Y "%DLL_SOURCE_DIR%\%%F" "dist\%APP_NAME%\V2\%%F" >nul
                     echo   Copied %%F
                 )
             )
             REM CUDA runtime essentials (cublas, cudart, curand — skip cuDNN/TRT bulk)
             for %%F in (cublas64*.dll cublasLt64*.dll cudart64*.dll curand64*.dll) do (
-                for %%G in ("%cd%\V2\%%F") do (
+                for %%G in ("%DLL_SOURCE_DIR%\%%F") do (
                     if exist "%%G" copy /Y "%%G" "dist\%APP_NAME%\V2\" >nul
                 )
             )
-            echo Slim V2 copied  ^(SEG+MES+B2B+ENH+OpenCV+CUDA-core^)
+            echo Slim native DLLs copied  ^(SEG+MES+B2B+ENH+OpenCV+CUDA-core^)
         ) else (
-            echo Copying full V2 native DLL package next to exe ^(this can take several minutes^)...
-            robocopy "%cd%\V2" "dist\%APP_NAME%\V2" /E /XO /R:1 /W:1 /NFL /NDL /NP
+            echo Copying full native DLL package from V6 next to exe ^(this can take several minutes^)...
+            robocopy "%DLL_SOURCE_DIR%" "dist\%APP_NAME%\V2" /E /XO /R:1 /W:1 /NFL /NDL /NP
             if errorlevel 8 (
-                echo WARNING: robocopy reported errors while copying V2
+                echo WARNING: robocopy reported errors while copying native DLLs
             ) else (
-                echo Copied V2\ next to exe  ^(required for BumpVoidSeg / OpenCV / CUDA deps^)
+                echo Copied V6 -^> dist\V2  ^(required for BumpVoidSeg / OpenCV / CUDA deps^)
             )
         )
     ) else (
-        echo WARNING: V2\ folder not found. Packaged app will fail to load native DLLs.
-        echo          Place a complete V2 package at: dist\%APP_NAME%\V2
+        echo WARNING: DLL source folder not found: %DLL_SOURCE_DIR%
+        echo          Packaged app will fail to load native DLLs.
+        echo          Place a complete native package at: dist\%APP_NAME%\V2
     )
 
     REM Optional: copy default recipe configs next to exe for portable browse defaults

@@ -11,6 +11,7 @@ continue to work without modification.
 """
 # inno3d/tabs/batch_review.py  ─── thin façade (Phase 7)
 
+from inno3d.features.batch_review.map_stage import MapStage
 from inno3d.features.batch_review.widgets import (
     WaferMapWidget,
     FovMapWidget,
@@ -25,6 +26,7 @@ from inno3d.features.batch_review.tab import BatchReviewTab
 
 __all__ = [
     "BatchReviewTab",
+    "MapStage",
     "WaferMapWidget",
     "FovMapWidget",
     "SliceViewLabel",

@@ -32,9 +32,20 @@ def _pick_seg_dll_path(dll_dir: str):
     return None
 
 
-def load_dll(dll_dir):
+def unload_dll():
+    """Drop SEG handle so the next load_dll can pick another folder (V2 ↔ V3)."""
+    global _dll, _dll_dir, _dll_path
+    _dll = None
+    _dll_dir = None
+    _dll_path = None
+
+
+def load_dll(dll_dir, force: bool = False):
     """
     Load BumpVoidSeg.dll (or legacy BumpVoidDLL.dll) from dll_dir.
+
+    ``force=True`` reloads even if the same folder is already loaded (needed when
+    switching packages that share the same file name).
     """
     global _dll, _dll_dir, _dll_path
 
@@ -46,8 +57,20 @@ def load_dll(dll_dir):
     if not dll_path:
         raise FileNotFoundError(
             f"Neither {' nor '.join(_SEG_DLL_NAMES)} found in: {dll_dir}\n"
-            "Copy the full V2 folder next to Inno3D.exe (or browse to a complete V2 package)."
+            "Copy a full native package (V2 or V3) with BumpVoidSeg.dll + OpenCV/CUDA deps."
         )
+
+    if (
+        not force
+        and _dll is not None
+        and _dll_path
+        and os.path.normcase(os.path.abspath(_dll_path))
+        == os.path.normcase(os.path.abspath(dll_path))
+    ):
+        return
+
+    if _dll is not None:
+        unload_dll()
 
     dll_name = os.path.basename(dll_path)
 
@@ -101,7 +124,7 @@ def load_dll(dll_dir):
         ):
             error_msg += (
                 "\nTIP: Native dependency missing next to the DLL (OpenCV / CUDA runtime).\n"
-                f"Ensure the full V2 package is present (opencv_world4110.dll, CUDA/NPP DLLs) in:\n"
+                f"Ensure the full package is present (opencv_world4110.dll, CUDA/NPP DLLs) in:\n"
                 f"  {dll_dir}\n"
                 "For packaged builds, rebuild with build_final.bat so dist\\Inno3D\\V2 is copied.\n"
             )
@@ -150,6 +173,10 @@ class BumpVoidConfig(ctypes.Structure):
         ("saveBumpIntermediate",ctypes.c_int),
         ("saveVoidIntermediate",ctypes.c_int),
         ("showResult",          ctypes.c_int),
+        # Appended (SEG ≥ 0.0.1) — keep AFTER showResult for V2 ABI
+        ("bumpFillHoleCloseX",  ctypes.c_double),
+        ("bumpFillHoleCloseY",  ctypes.c_double),
+        ("bumpFillHoleCloseZ",  ctypes.c_double),
     ]
 
 class BumpVoidResult(ctypes.Structure):
@@ -228,6 +255,18 @@ def _setup_functions():
     _dll.BumpVoid_GetGPUMemoryMB.argtypes = []
     _dll.BumpVoid_GetGPUMemoryMB.restype = ctypes.c_int
 
+    # Optional detailed profiling (SEG rebuild with SetProfiling)
+    try:
+        from inno3d.core.dll_profiling import _bind_optional
+        _bind_optional(
+            _dll,
+            "BumpVoid_SetProfiling",
+            "BumpVoid_GetProfiling",
+            "BumpVoid_GetLastTiming",
+        )
+    except Exception:
+        pass
+
     # CC3D — GPU Connected Component 3D Labeling
     try:
         _dll.BumpVoid_CC3D.argtypes = [
@@ -242,6 +281,19 @@ def _setup_functions():
         _dll.BumpVoid_CC3D.restype = ctypes.c_int
     except AttributeError:
         pass  # DLL built without CC3D support
+
+
+def set_profiling(enable: bool) -> bool:
+    """Enable/disable detailed SEG stage timing (requires rebuilt DLL)."""
+    from inno3d.core.dll_profiling import set_profiling as _sp
+    return _sp(_dll, enable, "BumpVoid_SetProfiling")
+
+
+def get_last_timing():
+    """Return last SEG timing dict, or None."""
+    from inno3d.core.dll_profiling import get_last_timing as _gt
+    return _gt(_dll, "BumpVoid_GetLastTiming")
+
 
 # ============================================
 # WRAPPER FUNCTIONS

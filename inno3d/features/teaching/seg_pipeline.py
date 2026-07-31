@@ -16,6 +16,7 @@ import re
 import traceback
 from pathlib import Path
 from pathlib import Path as _Path
+from typing import Optional
 
 import numpy as np
 import vtk
@@ -173,18 +174,89 @@ class SegmentationPipelineMixin:
         self.load_config_from_path(str(path))
 
     def load_dll_folder(self):
-        """Load DLL folder"""
-        folder = QFileDialog.getExistingDirectory(self, "Select DLL Folder")
+        """Browse and load a native DLL package folder (V2 / V3 / custom)."""
+        start = ""
+        if getattr(self, "dll_path", None):
+            start = self.dll_path
+        else:
+            try:
+                from inno3d.infra.paths import default_dll_dir, project_root
+
+                start = default_dll_dir() or str(project_root().parent)
+            except Exception:
+                start = ""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select DLL Folder (V2 / V3 — must contain BumpVoidSeg.dll)",
+            start,
+        )
         if folder:
             try:
-                bumpvoid.load_dll(folder)
-                self.dll_path = folder
-                self.dll_path_input.setText(folder)
-                self.info_label.setText(f"DLL loaded: {bumpvoid.get_version()}")
-                self.check_ready_state()
+                self.apply_dll_folder(folder, persist=True, force=True)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load DLL: {str(e)}")
-                
+
+    def _sync_dll_path_displays(self, folder: str) -> None:
+        """Keep Teaching toolbar + sidebar DLL path fields in sync."""
+        text = folder or ""
+        for attr in ("dll_path_input", "_toolbar_dll_path_input"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    w.setText(text)
+                except Exception:
+                    pass
+
+    def apply_dll_folder(self, folder, persist: bool = True, force: bool = True) -> str:
+        """Load SEG (+ companion MES/B2B/ENH) from ``folder`` and bind for Online.
+
+        Returns the loaded SEG version string when available.
+        """
+        import os
+
+        folder = os.path.abspath(folder)
+        if not os.path.isdir(folder):
+            raise FileNotFoundError(f"DLL folder not found: {folder}")
+
+        bumpvoid.load_dll(folder, force=force)
+        self.dll_path = folder
+        self._sync_dll_path_displays(folder)
+
+        # Companion modules from the same package (Online uses Teaching folder)
+        try:
+            from inno3d.core import bumpvoid_mes
+
+            bumpvoid_mes.load_dll(folder, force=True)
+        except Exception as e:
+            print(f"[DLL] MES not loaded from {folder}: {e}")
+        try:
+            from inno3d.core import bumpvoid_b2b
+
+            bumpvoid_b2b.load_dll(folder, force=True)
+        except Exception as e:
+            print(f"[DLL] B2B not loaded from {folder}: {e}")
+        try:
+            from inno3d.core import enhanced_volume
+
+            enhanced_volume.load_dll(folder)
+        except Exception as e:
+            print(f"[DLL] ENH not loaded from {folder}: {e}")
+
+        if persist:
+            try:
+                from inno3d.app.settings import set_dll_dir
+
+                set_dll_dir(folder)
+            except Exception as e:
+                print(f"[DLL] Failed to persist DLL dir: {e}")
+
+        ver = bumpvoid.get_version() or "?"
+        if hasattr(self, "info_label") and self.info_label is not None:
+            self.info_label.setText(f"DLL: {folder}  ·  SEG v{ver}")
+        self.check_ready_state()
+        print(f"[DLL] Active package → {folder} (SEG v{ver})")
+        return ver
+
     def load_config_file(self, file_path=None):
         """Load configuration file"""
         if not file_path:
@@ -249,6 +321,12 @@ class SegmentationPipelineMixin:
                         self.param_widgets['void_minimum_size'].setText(voidmin_match.group(1))
                     if voidmax_match:
                         self.param_widgets['void_maximum_size'].setText(voidmax_match.group(1))
+
+                    prof_match = re.search(
+                        r'ENABLE_DLL_PROFILING\s*=\s*(true|false)', content, re.IGNORECASE
+                    )
+                    if prof_match:
+                        self._apply_profiling_flag_from_config_text(content)
 
                     z4x_match = re.search(r'Z_STRETCHED_4X\s*=\s*(true|false)', content, re.IGNORECASE)
                     if z4x_match and 'z_stretched_4x' in self.param_widgets:
@@ -338,18 +416,36 @@ class SegmentationPipelineMixin:
             self._handle_volume_load(file_path)
 
     def load_volume(self, from_folder=False):
-        """Load 16-bit volume data"""
-        if from_folder:
-            file_path = QFileDialog.getExistingDirectory(
-                self, "Select Folder Containing Image Files"
-            )
-        else:
-            file_path, _ = QFileDialog.getOpenFileName(
-                self, "Select Image Volume", "", "Image Files (*.tif *.tiff *.raw *.bin)"
-            )
-        
-        if file_path:
-            self._handle_volume_load(file_path)
+        """Load 16-bit volume data.
+
+        Opens a unified dialog that lets the user select either a single
+        3D file or a folder of stack images.
+        """
+        dlg = QFileDialog(self, "Open File or Folder")
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        dlg.setNameFilter("Image Files (*.tif *.tiff *.raw *.bin)")
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.ShowDirsOnly, False)
+        from PyQt5.QtWidgets import QTreeView, QListView, QAbstractItemView
+        for view in dlg.findChildren((QTreeView, QListView)):
+            if isinstance(view, (QTreeView, QListView)):
+                view.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        _orig_accept = dlg.accept
+
+        def _custom_accept():
+            selected = dlg.selectedFiles()
+            if selected and os.path.isdir(selected[0]):
+                dlg.done(QFileDialog.Accepted)
+                return
+            _orig_accept()
+
+        dlg.accept = _custom_accept
+
+        if dlg.exec_() == QFileDialog.Accepted:
+            selected = dlg.selectedFiles()
+            if selected:
+                self._handle_volume_load(selected[0])
             
     def _handle_volume_load(self, file_path):
         from pathlib import Path
@@ -478,7 +574,25 @@ class SegmentationPipelineMixin:
                     self.updatePoint(x // 2, y // 2, z // 2)
             except Exception:
                 pass
-            
+
+            # ── Phase 4a: Adaptive performance tuning for Teaching tab ───
+            data_gb = data.nbytes / (1024 ** 3)
+            if data_gb >= 4.0:
+                throttle_label = '100ms' if data_gb >= 8 else '33ms'
+                quality_hint = 'Draft' if data_gb >= 8 else 'Standard'
+                # Teaching 3D quality presets
+                if hasattr(self, '_3d_quality_presets') and hasattr(self, '_current_3d_quality'):
+                    if quality_hint in self._3d_quality_presets:
+                        self._current_3d_quality = quality_hint
+                        if hasattr(self, '_3d_quality_combo'):
+                            idx = self._3d_quality_combo.findText(quality_hint)
+                            if idx >= 0:
+                                self._3d_quality_combo.blockSignals(True)
+                                self._3d_quality_combo.setCurrentIndex(idx)
+                                self._3d_quality_combo.blockSignals(False)
+                print(f"[PERF] Teaching volume {data_gb:.1f} GB → 3D crosshair "
+                      f"debounce={throttle_label}, quality hint={quality_hint}")
+
             self.info_label.setText(f"Volume loaded: {z}x{y}x{x}")
             print("Volume loading complete!")
             
@@ -516,6 +630,16 @@ class SegmentationPipelineMixin:
         self.param_widgets['bumpFillHoleRadiusX'].setValue(self.config.bumpBgOpenX)
         self.param_widgets['bumpFillHoleRadiusY'].setValue(self.config.bumpBgOpenY)
         self.param_widgets['bumpFillHoleRadiusZ'].setValue(self.config.bumpBgOpenZ)
+        if 'bumpFillHoleCloseX' in self.param_widgets:
+            self.param_widgets['bumpFillHoleCloseX'].setValue(
+                getattr(self.config, 'bumpFillHoleCloseX', 5.0)
+            )
+            self.param_widgets['bumpFillHoleCloseY'].setValue(
+                getattr(self.config, 'bumpFillHoleCloseY', 5.0)
+            )
+            self.param_widgets['bumpFillHoleCloseZ'].setValue(
+                getattr(self.config, 'bumpFillHoleCloseZ', 5.0)
+            )
         
         # Void parameters
         self.param_widgets['voidThresholdWeight'].setValue(self.config.voidThresholdWeight)
@@ -542,6 +666,9 @@ class SegmentationPipelineMixin:
         self.param_widgets['saveBumpIntermediate'].setChecked(bool(self.config.saveBumpIntermediate))
         self.param_widgets['saveVoidIntermediate'].setChecked(bool(self.config.saveVoidIntermediate))
         self.param_widgets['showResult'].setChecked(bool(self.config.showResult))
+        if 'enableDllProfiling' in self.param_widgets:
+            enabled = bool(getattr(self, '_enable_dll_profiling', False))
+            self.param_widgets['enableDllProfiling'].setChecked(enabled)
         
         # Unblock signals
         for widget in self.param_widgets.values():
@@ -560,6 +687,12 @@ class SegmentationPipelineMixin:
         self.config.bumpBgOpenX = self.param_widgets['bumpFillHoleRadiusX'].value()
         self.config.bumpBgOpenY = self.param_widgets['bumpFillHoleRadiusY'].value()
         self.config.bumpBgOpenZ = self.param_widgets['bumpFillHoleRadiusZ'].value()
+        if 'bumpFillHoleCloseX' in self.param_widgets and hasattr(
+            self.config, 'bumpFillHoleCloseX'
+        ):
+            self.config.bumpFillHoleCloseX = self.param_widgets['bumpFillHoleCloseX'].value()
+            self.config.bumpFillHoleCloseY = self.param_widgets['bumpFillHoleCloseY'].value()
+            self.config.bumpFillHoleCloseZ = self.param_widgets['bumpFillHoleCloseZ'].value()
         
         # Void parameters
         self.config.voidThresholdWeight = self.param_widgets['voidThresholdWeight'].value()
@@ -576,17 +709,250 @@ class SegmentationPipelineMixin:
         self.config.erodeBumpY = self.param_widgets['erodeBumpY'].value()
         self.config.erodeBumpZ = self.param_widgets['erodeBumpZ'].value()
         
-        # Blank slices
+        # Blank slices — invalid ranges wipe the whole mask; force off
         self.config.blankStart1 = self.param_widgets['blankStart1'].value()
         self.config.blankEnd1 = self.param_widgets['blankEnd1'].value()
         self.config.blankStart2 = self.param_widgets['blankStart2'].value()
         self.config.blankEnd2 = self.param_widgets['blankEnd2'].value()
+        if self.config.blankEnd1 <= self.config.blankStart1:
+            self.config.blankStart1 = 0
+            self.config.blankEnd1 = 0
+        if self.config.blankEnd2 <= self.config.blankStart2:
+            self.config.blankStart2 = 0
+            self.config.blankEnd2 = 0
         
         # Options
         self.config.saveBumpIntermediate = int(self.param_widgets['saveBumpIntermediate'].isChecked())
         self.config.saveVoidIntermediate = int(self.param_widgets['saveVoidIntermediate'].isChecked())
         self.config.showResult = int(self.param_widgets['showResult'].isChecked())
-        
+        if 'enableDllProfiling' in self.param_widgets:
+            self._enable_dll_profiling = bool(
+                self.param_widgets['enableDllProfiling'].isChecked()
+            )
+
+        try:
+            print(
+                f"[SEG cfg] dll={bumpvoid.get_dll_dir()} v={bumpvoid.get_version()} | "
+                f"bg=({self.config.bumpBgOpenX},{self.config.bumpBgOpenY},{self.config.bumpBgOpenZ}) "
+                f"clean=({self.config.bumpCleanOpenX},{self.config.bumpCleanOpenY},{self.config.bumpCleanOpenZ}) "
+                f"fillClose=({getattr(self.config,'bumpFillHoleCloseX',0)},"
+                f"{getattr(self.config,'bumpFillHoleCloseY',0)},"
+                f"{getattr(self.config,'bumpFillHoleCloseZ',0)}) "
+                f"thW={self.config.bumpThresholdWeight} "
+                f"blank=({self.config.blankStart1}-{self.config.blankEnd1},"
+                f"{self.config.blankStart2}-{self.config.blankEnd2})"
+            )
+        except Exception:
+            pass
+
+    def _apply_profiling_flag_from_config_text(self, content: str) -> None:
+        """Sync ENABLE_DLL_PROFILING from config text → checkbox + internal flag."""
+        prof_match = re.search(
+            r"ENABLE_DLL_PROFILING\s*=\s*(true|false)", content, re.IGNORECASE
+        )
+        if not prof_match:
+            return
+        on = prof_match.group(1).lower() == "true"
+        self._enable_dll_profiling = on
+        if "enableDllProfiling" in getattr(self, "param_widgets", {}):
+            self.param_widgets["enableDllProfiling"].setChecked(on)
+
+    def _profiling_enabled_from_config_file(self) -> Optional[bool]:
+        """Read ENABLE_DLL_PROFILING directly from loaded config path."""
+        path = getattr(self, "config_path", None)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            content = read_text_auto(path)
+            m = re.search(r"ENABLE_DLL_PROFILING\s*=\s*(true|false)", content, re.IGNORECASE)
+            if m:
+                return m.group(1).lower() == "true"
+        except Exception:
+            pass
+        return None
+
+    def _is_dll_profiling_enabled(self) -> bool:
+        w = getattr(self, "param_widgets", None) or {}
+        if "enableDllProfiling" in w:
+            if w["enableDllProfiling"].isChecked():
+                return True
+            # Checkbox unchecked — still honor config file when explicitly true
+            cfg_on = self._profiling_enabled_from_config_file()
+            if cfg_on is True:
+                return True
+            return False
+        cfg_on = self._profiling_enabled_from_config_file()
+        if cfg_on is not None:
+            return cfg_on
+        return bool(getattr(self, "_enable_dll_profiling", False))
+
+    def _apply_dll_profiling_flag(self) -> None:
+        """Push Params checkbox to all loaded ISP DLLs (safe if export missing)."""
+        import logging
+        enabled = self._is_dll_profiling_enabled()
+        self._enable_dll_profiling = enabled
+        applied = []
+        try:
+            if bumpvoid.set_profiling(enabled):
+                applied.append("SEG")
+        except Exception:
+            pass
+        try:
+            from inno3d.core import bumpvoid_mes
+            if bumpvoid_mes.set_profiling(enabled):
+                applied.append("MES")
+        except Exception:
+            pass
+        try:
+            from inno3d.core import bumpvoid_b2b
+            if bumpvoid_b2b.set_profiling(enabled):
+                applied.append("B2B")
+        except Exception:
+            pass
+        try:
+            from inno3d.core import enhanced_volume
+            if enhanced_volume.set_profiling(enabled):
+                applied.append("ENH")
+        except Exception:
+            pass
+        log = logging.getLogger("DLL_PROF")
+        if enabled:
+            msg = (
+                f"[DLL Profiling] ENABLED → {', '.join(applied) or '(no DLL export yet; rebuild ISP DLLs)'}"
+            )
+        else:
+            msg = "[DLL Profiling] disabled"
+        log.info(msg)
+        print(msg)
+
+    def _profiling_gpu_device_id(self) -> int:
+        spin = getattr(self, "enh_gpuid_spin", None)
+        if spin is not None:
+            try:
+                return int(spin.value())
+            except Exception:
+                pass
+        return 0
+
+    def _profiling_voxel_spacing(self):
+        """Best-effort (Z, Y, X) spacing in µm for profiling header."""
+        for attr in ("custom_spacing", "voxel_spacing", "spacing"):
+            sp = getattr(self, attr, None)
+            if sp is not None:
+                try:
+                    vals = [float(x) for x in sp[:3]]
+                    if len(vals) == 3:
+                        return vals
+                except Exception:
+                    pass
+        widgets = getattr(self, "param_widgets", None) or {}
+        keys = [
+            ("voxel_size_z", "voxel_size_y", "voxel_size_x"),
+            ("VoxelSizeZ", "VoxelSizeY", "VoxelSizeX"),
+        ]
+        for kz, ky, kx in keys:
+            wz, wy, wx = widgets.get(kz), widgets.get(ky), widgets.get(kx)
+            if wz is not None and wy is not None and wx is not None:
+                try:
+                    return [float(wz.value()), float(wy.value()), float(wx.value())]
+                except Exception:
+                    pass
+        return None
+
+    def _get_profiling_report_builder(self):
+        from inno3d.core.dll_profiling import ProfilingReportBuilder
+        if not hasattr(self, "_profiling_report_builder"):
+            self._profiling_report_builder = ProfilingReportBuilder()
+        return self._profiling_report_builder
+
+    def _reset_profiling_report(self, header_lines=None) -> None:
+        from inno3d.core.dll_profiling import build_profiling_context_lines
+
+        builder = self._get_profiling_report_builder()
+        builder.reset()
+        if not header_lines and not self._is_dll_profiling_enabled():
+            return
+        extra = list(header_lines or [])
+        if not extra:
+            if getattr(self, "config_path", None):
+                extra.append(f"Config: {self.config_path}")
+            out = getattr(self, "output_path_input", None)
+            if out is not None:
+                p = out.text().strip()
+                if p:
+                    extra.append(f"Output: {p}")
+            inp = getattr(self, "input_path_input", None)
+            if inp is not None:
+                p = inp.text().strip()
+                if p:
+                    extra.append(f"Input: {p}")
+        gpu_id = self._profiling_gpu_device_id()
+        ctx = build_profiling_context_lines(
+            volume=getattr(self, "volume_data", None),
+            spacing=self._profiling_voxel_spacing(),
+            gpu_device_id=gpu_id,
+            extra_lines=extra or None,
+        )
+        builder.set_context(ctx, gpu_device_id=gpu_id)
+
+    def _record_profiling_section(self, module: str, info, note=None) -> str:
+        from inno3d.core.dll_profiling import format_timing_banner
+        banner = format_timing_banner(module, info)
+        if not hasattr(self, "_last_dll_timing_reports"):
+            self._last_dll_timing_reports = {}
+        if info and info.get("report"):
+            self._last_dll_timing_reports[module] = info["report"]
+        else:
+            self._last_dll_timing_reports[module] = banner
+        if self._is_dll_profiling_enabled():
+            self._get_profiling_report_builder().add_section(module, banner, note=note)
+        return banner
+
+    def _flush_profiling_report(self, output_dir=None, footer_lines=None):
+        if not self._is_dll_profiling_enabled():
+            return None
+        if not output_dir:
+            out = getattr(self, "output_path_input", None)
+            if out is not None:
+                output_dir = out.text().strip()
+        if not output_dir:
+            return None
+        builder = self._get_profiling_report_builder()
+        if footer_lines:
+            builder.add_footer(footer_lines)
+        builder.set_runtime_snapshot()
+        path = builder.write(output_dir)
+        if path:
+            import logging
+            msg = f"[DLL Profiling] Report saved → {path}"
+            logging.getLogger("DLL_PROF").info(msg)
+            print(msg)
+        return path
+
+    def _log_dll_timing(self, module: str, getter, note=None, flush_dir=None) -> None:
+        import logging
+        log = logging.getLogger("DLL_PROF")
+        if not self._is_dll_profiling_enabled():
+            log.info("[%s] Profiling checkbox OFF — skip timing report", module)
+            return
+        try:
+            info = getter()
+            banner = self._record_profiling_section(module, info, note=note)
+            for line in banner.splitlines():
+                log.info(line)
+            print(banner)
+            if not info:
+                log.warning(
+                    "[%s] Profiling ON but GetLastTiming empty "
+                    "(DLL may be old, or process did not run yet)",
+                    module,
+                )
+            if flush_dir:
+                self._flush_profiling_report(flush_dir)
+        except Exception as e:
+            log.error("[%s] Profiling read failed: %s", module, e)
+            print(f"[{module}] Profiling read failed: {e}")
+
     def on_parameter_changed(self):
         """Handle parameter change - trigger debounced preview"""
         if hasattr(self, 'warning_label'):
@@ -640,6 +1006,10 @@ class SegmentationPipelineMixin:
         if not output_path:
             QMessageBox.warning(self, "Warning", "Please specify output path")
             return
+
+        self.update_config_from_parameters()
+        self._apply_dll_profiling_flag()
+        self._reset_profiling_report()
 
         # If enhancement is enabled, run the preprocessing first
         if self.enhancement_enabled:
@@ -706,6 +1076,7 @@ class SegmentationPipelineMixin:
             start_slice=start_slice,
             end_slice=end_slice
         )
+        self._apply_dll_profiling_flag()
         self.enhancement_thread.progress.connect(
             lambda v, m: (progress.setValue(v), progress.setLabelText(f"Enhancing: {m}"))
         )
@@ -718,6 +1089,13 @@ class SegmentationPipelineMixin:
         """Callback when preprocessing step finishes."""
         if progress:
             progress.close()
+
+        try:
+            from inno3d.core import enhanced_volume
+            out_dir = self.output_path_input.text().strip()
+            self._log_dll_timing("ENH", enhanced_volume.get_last_timing, flush_dir=out_dir)
+        except Exception:
+            pass
 
         # Clean up temp input directory if any
         if hasattr(self, '_enhancement_temp_dir') and self._enhancement_temp_dir:
@@ -1103,17 +1481,35 @@ class SegmentationPipelineMixin:
             
             if hasattr(self, 'inspect_btn') and hasattr(self, 'dll_path'):
                 # Notify user they can click Measurement next
+                out_dir = self.output_path_input.text().strip()
+                seg_note = "last layer only" if len(valid_results) > 1 else None
                 if len(valid_results) == 1:
                     res = valid_results[0]
-                    QMessageBox.information(self, "Success", 
+                    msg = (
                         f"Inspection completed successfully! Please click 'MES' to proceed.\n"
                         f"Bump Time: {res.bumpTime:.2f}s\n"
                         f"Void Time: {res.voidTime:.2f}s\n"
-                        f"Total Time: {res.totalTime:.2f}s")
+                        f"Total Time: {res.totalTime:.2f}s"
+                    )
+                    self._log_dll_timing(
+                        "SEG", bumpvoid.get_last_timing, note=seg_note, flush_dir=out_dir
+                    )
+                    rep = (getattr(self, "_last_dll_timing_reports", {}) or {}).get("SEG")
+                    if rep:
+                        msg += "\n\n" + rep
+                    QMessageBox.information(self, "Success", msg)
                 else:
-                    QMessageBox.information(self, "Success", 
+                    msg = (
                         f"Multi-layer Inspection completed successfully! Please click 'MES' to proceed.\n"
-                        f"Total Time: {total_time:.2f}s")
+                        f"Total Time: {total_time:.2f}s"
+                    )
+                    self._log_dll_timing(
+                        "SEG", bumpvoid.get_last_timing, note=seg_note, flush_dir=out_dir
+                    )
+                    rep = (getattr(self, "_last_dll_timing_reports", {}) or {}).get("SEG")
+                    if rep:
+                        msg += "\n\n(last layer)\n" + rep
+                    QMessageBox.information(self, "Success", msg)
                     
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load results: {str(e)}")
@@ -1124,8 +1520,15 @@ class SegmentationPipelineMixin:
         if self.bump_segmentation is None and self.void_segmentation is None:
             QMessageBox.warning(self, "Warning", "Please run inspection first to generate masks before measuring.")
             return
-            
+
+        self._apply_dll_profiling_flag()
         self.run_object_analysis()
+        try:
+            from inno3d.core import bumpvoid_mes
+            out_dir = self.output_path_input.text().strip()
+            self._log_dll_timing("MES", bumpvoid_mes.get_last_timing, flush_dir=out_dir)
+        except Exception:
+            pass
         # MES tab index = 4 (Layers=0, ROI=1, Params=2, Enhance=3, MES=4, B2B=5, 3D=6)
         self._set_teaching_tab(4)
 
@@ -1497,7 +1900,7 @@ class SegmentationPipelineMixin:
             progress.setValue(92)
             QApplication.processEvents()
 
-            # Online-style (0,0)=top-left per-layer grid (fixes messy Bump ID)
+            # Online-style (1,1)=top-left per-layer grid (fixes messy Bump ID)
             try:
                 from inno3d.core.bumpvoid_mes import reindex_grid_top_left
                 self.object_stats = reindex_grid_top_left(
@@ -2122,6 +2525,8 @@ class SegmentationPipelineMixin:
                 "No labeled bump data found.\nPlease run MEASUREMENT first.")
             return
 
+        self._apply_dll_profiling_flag()
+
         # Collect layers to process
         layers_to_process = []
         output_base_dir = self.output_path_input.text().strip()
@@ -2293,6 +2698,15 @@ class SegmentationPipelineMixin:
 
         def handle_bnd_finished(success, message):
             self.bnd_progress.close()
+            try:
+                from inno3d.core import bumpvoid_b2b
+                out_dir = self.output_path_input.text().strip()
+                self._log_dll_timing("B2B", bumpvoid_b2b.get_last_timing, flush_dir=out_dir)
+                rep = (getattr(self, "_last_dll_timing_reports", {}) or {}).get("B2B")
+                if rep:
+                    message = f"{message}\n\n{rep}"
+            except Exception:
+                pass
             if success:
                 # Auto-load boundary results into the B2B table (gap or summary)
                 output_base = self.output_path_input.text().strip()
@@ -3000,12 +3414,15 @@ class SegmentationPipelineMixin:
 
                 # Prefer saving under app config/ when user picks that folder
                 # Write recipe file (parameters only — I/O paths set by app at runtime)
-                with open(file_path, 'w') as f:
+                with open(file_path, 'w', encoding='utf-8', newline='\n') as f:
                     f.write("# Bump + VOID DETECTION CONFIG FILE\n")
                     f.write("# Recipe parameters only — INPUT/OUTPUT paths are set by the app at runtime.\n\n")
                     f.write("# === RECIPE META ===\n")
                     f.write(f"INPUT_MODE = {self.input_mode}\n")
-                    f.write(f"TEST_NAME = {self.config.testName.decode()}\n\n")
+                    _test_name = self.config.testName
+                    if isinstance(_test_name, bytes):
+                        _test_name = _test_name.decode('utf-8', errors='replace').rstrip('\x00')
+                    f.write(f"TEST_NAME = {_test_name}\n\n")
                     
                     f.write("# === BUMP DETECTION ===\n")
                     f.write(f"BUMP_THRESHOLD_WEIGHT = {self.config.bumpThresholdWeight}\n")
@@ -3014,7 +3431,18 @@ class SegmentationPipelineMixin:
                     f.write(f"BUMP_CLEAN_OPEN_RADIUS_Z = {self.config.bumpCleanOpenZ}\n")
                     f.write(f"BUMP_BG_OPEN_RADIUS_X = {self.config.bumpBgOpenX}\n")
                     f.write(f"BUMP_BG_OPEN_RADIUS_Y = {self.config.bumpBgOpenY}\n")
-                    f.write(f"BUMP_BG_OPEN_RADIUS_Z = {self.config.bumpBgOpenZ}\n\n")
+                    f.write(f"BUMP_BG_OPEN_RADIUS_Z = {self.config.bumpBgOpenZ}\n")
+                    if hasattr(self.config, 'bumpFillHoleCloseX'):
+                        f.write(
+                            f"BUMP_FILL_HOLE_CLOSE_RADIUS_X = {self.config.bumpFillHoleCloseX}\n"
+                        )
+                        f.write(
+                            f"BUMP_FILL_HOLE_CLOSE_RADIUS_Y = {self.config.bumpFillHoleCloseY}\n"
+                        )
+                        f.write(
+                            f"BUMP_FILL_HOLE_CLOSE_RADIUS_Z = {self.config.bumpFillHoleCloseZ}\n"
+                        )
+                    f.write("\n")
                     
                     f.write("# === VOID DETECTION ===\n")
                     f.write(f"VOID_THRESHOLD_WEIGHT = {self.config.voidThresholdWeight}\n")
@@ -3040,7 +3468,9 @@ class SegmentationPipelineMixin:
                     f.write("# === OPTIONS ===\n")
                     f.write(f"SAVE_TGV_DEBUG_IMG = {'true' if self.config.saveBumpIntermediate else 'false'}\n")
                     f.write(f"SAVE_VOID_DEBUG_IMG = {'true' if self.config.saveVoidIntermediate else 'false'}\n")
-                    f.write(f"SHOW_FLATTENED_TGV_VOID = {'true' if self.config.showResult else 'false'}\n\n")
+                    f.write(f"SHOW_FLATTENED_TGV_VOID = {'true' if self.config.showResult else 'false'}\n")
+                    prof_on = self._is_dll_profiling_enabled()
+                    f.write(f"ENABLE_DLL_PROFILING = {'true' if prof_on else 'false'}\n\n")
                     
                     f.write("# === CC3D Connected Component Labeling ===\n")
                     conn_options = [6, 18, 26]
@@ -3466,6 +3896,10 @@ class SegmentationPipelineMixin:
         if orientation == "axial":
             self.draw_roi_overlay(renderer, h, w)
 
+        # Layer define bars on sagittal (YZ)
+        if orientation == "sagittal" and getattr(self, 'layer_define_active', False):
+            self._draw_layer_define_bars(renderer, h, w)
+
         # Object indices if enabled
         if (
             getattr(self, "show_indices_check", None)
@@ -3727,13 +4161,9 @@ class SegmentationPipelineMixin:
     """
 
     def load_dll_from_path(self, folder):
-        """Load DLL folder programmatically (no file dialog)  used by Online mode"""
+        """Load DLL folder programmatically — used by startup + Online mode."""
         try:
-            bumpvoid.load_dll(folder)
-            self.dll_path = folder
-            self.dll_path_input.setText(folder)
-            self.info_label.setText(f"DLL loaded: {bumpvoid.get_version()}")
-            self.check_ready_state()
+            self.apply_dll_folder(folder, persist=True, force=True)
             return True
         except Exception as e:
             print(f"[SegmentationTab] Failed to load DLL from {folder}: {e}")
@@ -3780,6 +4210,8 @@ class SegmentationPipelineMixin:
                 if voidmax_match:
                     self.param_widgets['void_maximum_size'].setText(voidmax_match.group(1))
 
+                self._apply_profiling_flag_from_config_text(content)
+
                 z4x_match = re.search(r'Z_STRETCHED_4X\s*=\s*(true|false)', content, re.IGNORECASE)
                 if z4x_match and 'z_stretched_4x' in self.param_widgets:
                     self.param_widgets['z_stretched_4x'].setChecked(z4x_match.group(1).lower() == 'true')
@@ -3815,6 +4247,8 @@ class SegmentationPipelineMixin:
                 self._apply_enhancement_from_config_text(content)
             except Exception as e:
                 print(f"Note: Could not parse Measurement Parameters from config: {e}")
+
+            self._apply_dll_profiling_flag()
 
             # Parse Layer Definitions from config if present
             try:
@@ -4080,6 +4514,8 @@ class SegmentationPipelineMixin:
 
         # Update config from UI parameters
         self.update_config_from_parameters()
+        # Online uses this path — must push profiling flag (DLL reload resets it)
+        self._apply_dll_profiling_flag()
 
         # Run inspection — layers=None means full-volume (test_1layer);
         # layers=[...] means single-volume multi-layer split (INPUT_MODE=single)
