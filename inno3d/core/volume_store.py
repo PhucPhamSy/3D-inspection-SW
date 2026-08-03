@@ -25,13 +25,18 @@ _TRUE_VALUES = {"1", "true", "yes", "on", "y"}
 
 
 def large_volume_engine_enabled(host=None) -> bool:
-    """Feature flag: env ``INNO3D_LARGE_VOLUME_ENGINE`` or ``host.large_volume_engine``."""
+    """Feature flag: env, ``host.large_volume_engine``, or app settings."""
     env = os.getenv("INNO3D_LARGE_VOLUME_ENGINE", "")
     if env.strip().lower() in _TRUE_VALUES:
         return True
     if host is not None and bool(getattr(host, "large_volume_engine", False)):
         return True
-    return False
+    try:
+        from inno3d.app.settings import get_large_volume_engine_enabled
+
+        return get_large_volume_engine_enabled()
+    except Exception:
+        return False
 
 
 def large_volume_byte_threshold() -> int:
@@ -47,13 +52,18 @@ def large_volume_byte_threshold() -> int:
 def default_3d_upload_budget_bytes() -> int:
     """Host-side budget for a single 3D VTK upload (default 512 MiB).
 
-    Override with ``INNO3D_3D_UPLOAD_BUDGET_MB`` (integer MiB).
+    Override with ``INNO3D_3D_UPLOAD_BUDGET_MB`` (integer MiB) or Help tab setting.
     """
-    raw = os.getenv("INNO3D_3D_UPLOAD_BUDGET_MB", "512")
     try:
-        mb = float(raw)
-    except ValueError:
-        mb = 512.0
+        from inno3d.app.settings import get_3d_upload_budget_mb
+
+        mb = float(get_3d_upload_budget_mb())
+    except Exception:
+        raw = os.getenv("INNO3D_3D_UPLOAD_BUDGET_MB", "512")
+        try:
+            mb = float(raw)
+        except ValueError:
+            mb = 512.0
     return int(max(16.0, mb) * (1024 ** 2))
 
 
@@ -206,7 +216,7 @@ def _slice_from_volume(
     if orientation == "axial":
         if not 0 <= index < z:
             raise IndexError(f"axial index {index} out of range [0, {z})")
-        return np.ascontiguousarray(vol[index, :, :])
+        return np.ascontiguousarray(np.flipud(vol[index, :, :]))
     if orientation == "coronal":
         if not 0 <= index < y:
             raise IndexError(f"coronal index {index} out of range [0, {y})")
@@ -231,6 +241,30 @@ def upsample_slice_nearest(slice_2d: np.ndarray, target_hw: Tuple[int, int]) -> 
     return np.ascontiguousarray(slice_2d[z_idx][:, y_idx])
 
 
+def _sample_value_range_zyx(
+    data: np.ndarray,
+    *,
+    max_samples: int = 2_000_000,
+) -> Tuple[float, float]:
+    """Fast approximate min/max for very large dense arrays.
+
+    Uses a regular 3D stride sample to avoid a full 10+ GB scan during Online
+    first-paint. Falls back to exact min/max when the volume is already small.
+    """
+    if data.size == 0:
+        return 0.0, 0.0
+    max_samples = int(max(1, max_samples))
+    if int(data.size) <= max_samples:
+        return float(np.min(data)), float(np.max(data))
+    z, y, x = (int(v) for v in data.shape)
+    stride = int(np.ceil((float(z * y * x) / float(max_samples)) ** (1.0 / 3.0)))
+    stride = max(1, stride)
+    sampled = data[::stride, ::stride, ::stride]
+    if sampled.size == 0:
+        sampled = data.reshape(-1)[:1]
+    return float(np.min(sampled)), float(np.max(sampled))
+
+
 class MemoryVolumeStore(VolumeStore):
     """Small in-memory VolumeStore for tests and dev — not for 15 GB volumes."""
 
@@ -238,12 +272,22 @@ class MemoryVolumeStore(VolumeStore):
         self,
         data: np.ndarray,
         spacing: Spacing = (1.0, 1.0, 1.0),
+        *,
+        value_range: Optional[Tuple[float, float]] = None,
+        force_contiguous: bool = True,
     ) -> None:
         if data.ndim != 3:
             raise ValueError(f"expected 3-D volume, got shape {data.shape}")
-        self._data = np.ascontiguousarray(data)
-        vmin = float(np.min(self._data)) if self._data.size else 0.0
-        vmax = float(np.max(self._data)) if self._data.size else 0.0
+        self._data = np.ascontiguousarray(data) if force_contiguous else data
+        if value_range is None:
+            if self._data.size > 10_000_000:
+                vmin, vmax = _sample_value_range_zyx(self._data)
+            else:
+                vmin = float(np.min(self._data)) if self._data.size else 0.0
+                vmax = float(np.max(self._data)) if self._data.size else 0.0
+        else:
+            vmin = float(value_range[0])
+            vmax = float(value_range[1])
         self._metadata = VolumeMetadata(
             shape=tuple(int(x) for x in self._data.shape),  # type: ignore[arg-type]
             dtype=self._data.dtype,
@@ -633,6 +677,22 @@ def open_raw_volume_store(
 def store_from_dense_array(
     data: np.ndarray,
     spacing: Spacing = (1.0, 1.0, 1.0),
+    *,
+    prefer_no_copy: bool = False,
+    sampled_value_range: bool = False,
+    max_samples: int = 2_000_000,
 ) -> MemoryVolumeStore:
     """Fallback store for TIFF/folder loads that still materialize in RAM."""
-    return MemoryVolumeStore(data, spacing=spacing)
+    large = int(getattr(data, "size", 0)) > 10_000_000
+    value_range = None
+    if sampled_value_range or large:
+        value_range = _sample_value_range_zyx(data, max_samples=max_samples)
+    force_contiguous = True
+    if prefer_no_copy and getattr(data, "flags", None) is not None and data.flags["C_CONTIGUOUS"]:
+        force_contiguous = False
+    return MemoryVolumeStore(
+        data,
+        spacing=spacing,
+        value_range=value_range,
+        force_contiguous=force_contiguous,
+    )

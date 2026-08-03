@@ -16,6 +16,7 @@ Protocol matches Server.cpp / ClientBumpVoid.cpp:
 """
 
 import concurrent.futures
+import gc
 import os
 import re
 import shutil
@@ -32,6 +33,10 @@ from PyQt5.QtWidgets import *
 from skimage import io
 
 from inno3d.core.styles import SemiconductorTheme
+from inno3d.core.online_mpr_walltime import (
+    OnlineMprWalltimeReport,
+    online_walltime_phase,
+)
 from inno3d.core.ui_system import OnlinePipelineProgress
 from inno3d.core.view_support import LoadVolumeThread
 from inno3d.core.wafer_context import (
@@ -62,6 +67,157 @@ def _log(msg):
 
 
 class OnlineModeMixin:
+    def _online_walltime_begin(self, received_path):
+        """Start wall-time tracking for Online receive → first MPR paint."""
+        self._online_mpr_walltime = OnlineMprWalltimeReport(host_path=str(received_path))
+        self._online_mpr_walltime.mark("pipeline_start")
+        mpv = getattr(self, "multiplanar_tab", None)
+        if mpv is not None:
+            mpv._online_mpr_walltime = self._online_mpr_walltime
+
+    def _online_walltime_phase(self, phase_name, elapsed_sec=None, note=""):
+        """Append one phase timing entry (best-effort, UI-thread only)."""
+        wt = getattr(self, "_online_mpr_walltime", None)
+        if wt is None:
+            return
+        if elapsed_sec is not None:
+            wt.record(str(phase_name), float(elapsed_sec))
+        else:
+            wt.mark(str(phase_name))
+        if note:
+            wt.set_meta(f"note_{phase_name}", str(note))
+
+    def _online_walltime_finalize_first_mpr(self):
+        """Seal receive → first MPR timing and write final report."""
+        wt = getattr(self, "_online_mpr_walltime", None)
+        if wt is None:
+            return
+        mpv = getattr(self, "multiplanar_tab", None)
+        if mpv is not None and getattr(mpv, "volume_data", None) is not None:
+            vd = mpv.volume_data
+            try:
+                wt.set_meta("volume_shape", tuple(vd.shape))
+                wt.set_meta("volume_dtype", str(getattr(vd, "dtype", "")))
+                wt.set_meta("volume_nbytes", int(getattr(vd, "nbytes", 0)))
+                wt.set_meta(
+                    "lve_used_store",
+                    bool(getattr(mpv, "volume_store", None) is not None),
+                )
+            except Exception:
+                pass
+        wt.mark("first_mpr_ready")
+        report_path = wt.write_report(output_dir=Path(__file__).resolve().parents[3] / "output")
+        if report_path is not None:
+            total_s = wt.elapsed_total()
+            msg = f"[WALLTIME] first MPR ready in {total_s:.2f}s → {report_path}"
+            print(f"[ONLINE] {msg}")
+            if hasattr(self, "_online_append_log") and self._online_append_log:
+                self._online_append_log(msg, SemiconductorTheme.TEXT_SECONDARY)
+        if mpv is not None:
+            mpv._online_mpr_walltime = None
+        self._online_mpr_walltime = None
+
+    def _online_walltime_abort(self, error_text=""):
+        """Write partial report on pipeline failure (never raises)."""
+        wt = getattr(self, "_online_mpr_walltime", None)
+        if wt is None:
+            return
+        if error_text:
+            wt.set_meta("error", str(error_text))
+        try:
+            wt.write_report(output_dir=Path(__file__).resolve().parents[3] / "output")
+        except Exception as e:
+            if hasattr(self, "_online_append_log") and self._online_append_log:
+                self._online_append_log(
+                    f"[WALLTIME WARN] failed to write report: {e}",
+                    SemiconductorTheme.ACCENT_WARNING,
+                )
+        mpv = getattr(self, "multiplanar_tab", None)
+        if mpv is not None:
+            mpv._online_mpr_walltime = None
+        self._online_mpr_walltime = None
+
+    def _online_preflight_cleanup_for_new_volume(self):
+        """Release prior Online runtime volume memory before next pipeline."""
+        mpv = getattr(self, "multiplanar_tab", None)
+        seg_tab = getattr(self, "segmentation_tab", None)
+
+        # Stop/replace old viewer load thread if still around.
+        try:
+            old_thread = getattr(mpv, "load_thread", None) if mpv is not None else None
+            if old_thread is not None and hasattr(old_thread, "isRunning") and old_thread.isRunning():
+                old_thread.terminate()
+                old_thread.wait(200)
+        except Exception:
+            pass
+
+        # Release viewer-side heavy objects (stores, 3D pins, actors, dense arrays).
+        if mpv is not None:
+            try:
+                prev_store = getattr(mpv, "volume_store", None)
+                if prev_store is not None and hasattr(prev_store, "close"):
+                    prev_store.close()
+            except Exception:
+                pass
+            try:
+                mpv.volume_store = None
+            except Exception:
+                pass
+            try:
+                mpv._vtk_3d_numpy_pin = None
+            except Exception:
+                pass
+            try:
+                if hasattr(mpv, "_teardown_3d_volume_actors"):
+                    mpv._teardown_3d_volume_actors()
+            except Exception:
+                pass
+            try:
+                mpv.clear_all_views()
+            except Exception:
+                pass
+
+        # Release teaching-side runtime data while keeping config/DLL state.
+        if seg_tab is not None:
+            try:
+                prev_store = getattr(seg_tab, "volume_store", None)
+                if prev_store is not None and hasattr(prev_store, "close"):
+                    prev_store.close()
+            except Exception:
+                pass
+            try:
+                seg_tab.volume_store = None
+            except Exception:
+                pass
+            for attr in (
+                "volume_data",
+                "bump_segmentation",
+                "void_segmentation",
+                "labeled_class1_data",
+                "labeled_class2_data",
+                "_teaching_vtk_numpy_pin",
+            ):
+                try:
+                    setattr(seg_tab, attr, None)
+                except Exception:
+                    pass
+            try:
+                if hasattr(seg_tab, "_3d_renderer") and getattr(seg_tab, "_3d_volume_actor", None) is not None:
+                    seg_tab._3d_renderer.RemoveVolume(seg_tab._3d_volume_actor)
+                    seg_tab._3d_volume_actor = None
+                    seg_tab._3d_volume_mapper = None
+                if hasattr(seg_tab, "_3d_renderer") and getattr(seg_tab, "_3d_seg_actor", None) is not None:
+                    seg_tab._3d_renderer.RemoveActor(seg_tab._3d_seg_actor)
+                    seg_tab._3d_seg_actor = None
+            except Exception:
+                pass
+
+        gc.collect()
+        self._online_append_log(
+            "[MEM] Preflight cleanup done (released prior volume RAM/VRAM state)",
+            SemiconductorTheme.TEXT_SECONDARY,
+        )
+
     # ── Online progress (stage-only, no algorithm detail) ─────────────
     def _online_has_enhance(self) -> bool:
         return bool(
@@ -489,6 +645,48 @@ class OnlineModeMixin:
                     )
             except Exception as e:
                 _append_log(f"[B2B] unavailable: {e}", SemiconductorTheme.ACCENT_WARNING)
+
+            # ENH DLL (same folder as SEG package — BumpVoid_ISP_ENH.dll)
+            try:
+                from inno3d.core import enhanced_volume as _enh_mod
+                enh_path = ""
+                enh_ver = "?"
+                if seg_tab.dll_path:
+                    for _name in ("BumpVoid_ISP_ENH.dll", "EnhancedVolumeDLL.dll"):
+                        _cand = os.path.join(seg_tab.dll_path, _name)
+                        if os.path.isfile(_cand):
+                            enh_path = _cand
+                            break
+                try:
+                    if seg_tab.dll_path:
+                        _enh_mod.load_dll(seg_tab.dll_path)
+                    enh_ver = _enh_mod.get_version() or "?"
+                    if not enh_path:
+                        enh_path = getattr(_enh_mod, "_dll_path", None) or seg_tab.dll_path or ""
+                except Exception as le:
+                    _append_log(
+                        f"[ENH] load defer: {le}",
+                        SemiconductorTheme.TEXT_SECONDARY,
+                    )
+                if enh_path or enh_ver != "?":
+                    _buf = ""
+                    try:
+                        if hasattr(_enh_mod, "has_process_volume_buffer") and _enh_mod.has_process_volume_buffer():
+                            _buf = "  ·  ProcessVolumeBuffer"
+                    except Exception:
+                        pass
+                    _append_log(
+                        f"[ENH] {os.path.basename(enh_path) or 'BumpVoid_ISP_ENH.dll'}  "
+                        f"v{enh_ver}  ·  {enh_path or seg_tab.dll_path}{_buf}",
+                        "#CE93D8",
+                    )
+                else:
+                    _append_log(
+                        "[ENH] BumpVoid_ISP_ENH.dll not found in DLL package",
+                        SemiconductorTheme.TEXT_SECONDARY,
+                    )
+            except Exception as e:
+                _append_log(f"[ENH] unavailable: {e}", SemiconductorTheme.ACCENT_WARNING)
 
             # Re-apply after Online DLL loads (reload clears SetProfiling flag)
             try:
@@ -920,7 +1118,15 @@ class OnlineModeMixin:
         self._online_processing = True
         self._online_crop_meta = None
         self._online_host_path_info = None
+        self._online_walltime_begin(file_path)
         self.status_label.setText(f"ONLINE: Processing {file_path}...")
+        # Mark pipeline start immediately (secondary FILE RECEIVED log used to
+        # appear only after this handler returned — after a slow temp copy).
+        if hasattr(self, "_online_append_log") and self._online_append_log:
+            self._online_append_log(
+                f"[PIPELINE] start: {file_path}",
+                SemiconductorTheme.TEXT_SECONDARY,
+            )
         if hasattr(self, '_online_append_log') and self._online_append_log:
             self._online_append_log(f"[RECV] {file_path}", SemiconductorTheme.ACCENT_SUCCESS)
 
@@ -1016,7 +1222,7 @@ class OnlineModeMixin:
             roi_box = self.online_roi
 
         if roi_box and 'x1' in roi_box:
-            start_crop = time.time()
+            start_crop = time.perf_counter()
             self._online_append_log("[CROPPING] Applying locked ROI to incoming data...", "#FFA000")
             
             cropped_folder, crop_meta = self._crop_volume_for_online(volume_files, roi_box)
@@ -1028,7 +1234,8 @@ class OnlineModeMixin:
                 ])
                 volume_files.sort(key=extract_slice_number)
                 self._online_crop_meta = crop_meta
-                crop_time = time.time() - start_crop
+                crop_time = time.perf_counter() - start_crop
+                self._online_walltime_phase("roi_crop", elapsed_sec=crop_time)
                 self._online_append_log(
                     f"[CROP DONE] {len(volume_files)} file(s) ({crop_time:.2f}s) "
                     f"offset Z0={crop_meta.get('z0', 0)}",
@@ -1051,10 +1258,18 @@ class OnlineModeMixin:
                         "#00BFA5",
                     )
             else:
+                crop_time = time.perf_counter() - start_crop
+                self._online_walltime_phase(
+                    "roi_crop",
+                    elapsed_sec=crop_time,
+                    note="fallback_full_volume",
+                )
                 self._online_append_log(
                     "[CROP FAILED] Proceeding with full volume as fallback",
                     SemiconductorTheme.ACCENT_ERROR,
                 )
+        else:
+            self._online_walltime_phase("roi_crop", elapsed_sec=0.0, note="skipped")
         
         # Runtime working folder (may be temp crop)
         self._online_folder = str(folder)
@@ -1064,27 +1279,38 @@ class OnlineModeMixin:
             f"[RESULTS] → {self._online_results_dir}", SemiconductorTheme.TEXT_SECONDARY
         )
         
-        # ---- Step 1: Load volume into 3D Viewer immediately ----
-        # Create temp dir for volume-only files (symlink/copy for LoadVolumeThread)
-        self._online_temp_dir = tempfile.mkdtemp(prefix="online_")
-        temp_vol_dir = os.path.join(self._online_temp_dir, "volume")
-        os.makedirs(temp_vol_dir, exist_ok=True)
-        
-        for f in volume_files:
-            link_path = os.path.join(temp_vol_dir, f.name)
-            try:
-                os.symlink(str(f), link_path)
-            except OSError:
-                shutil.copy2(str(f), link_path)
-        
-        # Clear old data and reset all views to blank state
+        # ---- Step 1: Cleanup + load volume into Viewer (MPR first, no 3D) ----
+        self._online_preflight_cleanup_for_new_volume()
+
         mpv = self.multiplanar_tab
-        mpv.clear_all_views()
-        
-        preferred_name = Path(self._online_source_file).name if getattr(self, "_online_source_file", None) else volume_files[0].name
-        preferred_file = os.path.join(temp_vol_dir, preferred_name)
-        first_file = preferred_file if os.path.exists(preferred_file) else os.path.join(temp_vol_dir, volume_files[0].name)
-        self._online_runtime_input_file = first_file
+        # Online: keep GPU 3D OFF so first paint is MPR-only (fast).
+        if hasattr(mpv, "set_3d_volume_render_enabled"):
+            try:
+                mpv.set_3d_volume_render_enabled(False, sync_button=True)
+            except Exception:
+                pass
+
+        # Prefer direct path — avoid Windows symlink-fail → full-file copy2 (10GB+).
+        used_crop_temp = "online_crop_" in str(folder)
+        self._online_temp_dir = None
+        if used_crop_temp:
+            # Cropped multi-slice stack lives in temp folder — load that folder.
+            load_path = str(folder)
+            load_note = "cropped folder"
+        elif len(volume_files) == 1:
+            load_path = str(volume_files[0])
+            load_note = "direct file (no temp copy)"
+        else:
+            # Original multi-file stack: LoadVolumeThread supports directory scan.
+            load_path = str(folder)
+            load_note = "direct folder (no temp copy)"
+
+        self._online_runtime_input_file = load_path
+        if hasattr(self, "_online_append_log") and self._online_append_log:
+            self._online_append_log(
+                f"[LOAD] {load_note}: {load_path}",
+                SemiconductorTheme.TEXT_SECONDARY,
+            )
 
         # Compact stage progress — best-effort UI; must never block the pipeline
         try:
@@ -1093,83 +1319,111 @@ class OnlineModeMixin:
             print(f"[ONLINE] open progress failed: {e}")
             self._online_progress = None
 
-        mpv.load_thread = LoadVolumeThread(first_file, downsample_factor=1)
+        from inno3d.core.volume_store import large_volume_engine_enabled
+
+        wt = getattr(self, "_online_mpr_walltime", None)
+        if wt is not None:
+            wt.set_meta("load_path", str(load_path))
+            wt.set_meta("load_note", load_note)
+            wt.set_meta("crop_used", bool(used_crop_temp))
+            wt.set_meta("lve_enabled", bool(large_volume_engine_enabled(mpv)))
+            mpv._online_mpr_walltime = wt
+
+        mpv.load_thread = LoadVolumeThread(
+            load_path,
+            downsample_factor=1,
+            use_large_volume_engine=large_volume_engine_enabled(mpv),
+        )
         mpv.load_thread.progress.connect(
             lambda v, _m: self._tick_online_progress(v)
         )
         mpv.load_thread.finished.connect(self._on_online_volume_loaded)
+        if wt is not None:
+            wt.begin_load_thread()
         mpv.load_thread.start()
     
     def _on_online_volume_loaded(self, data, error):
-        """Volume loaded into 3D Viewer - now start segmentation in background"""
+        """Volume loaded into Viewer — paint MPR ASAP, then continue pipeline."""
         mpv = self.multiplanar_tab
-        
-        if data is not None:
-            # on_volume_loaded expects mpv.progress to exist - create a dummy one
-            # (it will be closed by on_volume_loaded; _online_progress stays open for segmentation)
-            mpv.progress = QProgressDialog("Loading...", None, 0, 100, self)
-            mpv.progress.close()  # Hide it immediately - we use _online_progress instead
-            self._tick_online_progress(100)
-            # Display volume in 3D Viewer
-            mpv.on_volume_loaded(data, error)
-            
-            # Also set in segmentation tab for manual cropping/tuning
-            src_label = getattr(self, '_online_source_file', None) or (
-                str(self._online_volume_files[0])
-                if getattr(self, '_online_volume_files', None) else None
-            )
-            self.segmentation_tab.set_volume_data(data, src_label)
-            
-            # Clamp/remap layers to actual loaded Z depth (safety after crop)
-            if mpv.volume_data is not None:
-                z, y, x = mpv.volume_data.shape[:3]
-                recipe = getattr(self, '_online_recipe', None) or {}
-                layers = recipe.get('layers')
-                if layers:
-                    clamped = []
-                    for L in layers:
-                        zs = max(0, min(int(L['z_start']), z))
-                        ze = max(0, min(int(L['z_end']), z))
-                        if ze > zs:
-                            e = dict(L)
-                            e['z_start'], e['z_end'] = zs, ze
-                            clamped.append(e)
-                    recipe['layers'] = clamped or None
-                    if hasattr(self, '_online_append_log') and self._online_append_log:
-                        self._online_append_log(
-                            f"[VOLUME] {z}×{y}×{x}  |  runtime layers: "
-                            f"{len(recipe['layers'] or [])}",
-                            SemiconductorTheme.TEXT_SECONDARY,
-                        )
+        wt = getattr(self, "_online_mpr_walltime", None)
+        if wt is not None:
+            wt.mark("on_online_volume_loaded.start")
+            thr = getattr(mpv, "load_thread", None)
+            decode_s = getattr(thr, "decode_walltime_s", None)
+            if decode_s is None:
+                decode_s = getattr(thr, "walltime_total_sec", None)
+            wt.end_load_thread_callback(decode_s)
+            cb_s = wt.get_duration("load_volume_thread.callback_wall")
+            if cb_s is not None and hasattr(self, "_online_append_log") and self._online_append_log:
+                self._online_append_log(
+                    f"[LOAD] decode finished in {cb_s:.1f}s",
+                    SemiconductorTheme.TEXT_SECONDARY,
+                )
 
-                default_slices = {
-                    'axial': z // 2,
-                    'sagittal': x // 2,
-                    'coronal': y // 2
-                }
-                mpv.current_slices = default_slices
-                mpv.crosshair_position = [
-                    default_slices['sagittal'],
-                    default_slices['coronal'],
-                    default_slices['axial'],
-                ]
-                
-                for orientation in ['axial', 'coronal', 'sagittal']:
-                    slider = getattr(mpv, f'{orientation}_slice_slider')
-                    slider.blockSignals(True)
-                    slider.setValue(mpv.current_slices[orientation])
-                    slider.blockSignals(False)
-                    label = getattr(mpv, f'{orientation}_slice_label')
-                    label.setText(f"{mpv.current_slices[orientation]} / {slider.maximum()}")
-                    mpv.render_slice(orientation)
-        elif error:
-            self.status_label.setText(f"ONLINE ERROR (volume): {error}")
-            if hasattr(self, '_online_append_log') and self._online_append_log:
-                self._online_append_log(f"[ERROR] volume load: {error}", SemiconductorTheme.ACCENT_ERROR)
-            self._close_online_progress(ok=False)
-            self._online_cleanup()
-            return
-        
+        with online_walltime_phase(wt, "on_online_volume_loaded.handler"):
+            if data is not None:
+                # on_volume_loaded expects mpv.progress to exist - create a dummy one
+                # (it will be closed by on_volume_loaded; _online_progress stays open for segmentation)
+                mpv.progress = QProgressDialog("Loading...", None, 0, 100, self)
+                mpv.progress.close()  # Hide it immediately - we use _online_progress instead
+                self._tick_online_progress(100)
+
+                # Keep 3D OFF for Online first paint (MPR only).
+                if hasattr(mpv, "set_3d_volume_render_enabled"):
+                    try:
+                        mpv.set_3d_volume_render_enabled(False, sync_button=True)
+                    except Exception:
+                        pass
+
+                # Display volume in Viewer (MPR). processEvents lets panes paint before Teaching sync.
+                mpv.on_volume_loaded(data, error)
+                try:
+                    QApplication.processEvents()
+                except Exception:
+                    pass
+                self._online_walltime_finalize_first_mpr()
+
+                # Also set in segmentation tab for pipeline / manual cropping
+                src_label = getattr(self, '_online_source_file', None) or (
+                    str(self._online_volume_files[0])
+                    if getattr(self, '_online_volume_files', None) else None
+                )
+                self.segmentation_tab.set_volume_data(
+                    getattr(mpv, "volume_data", data),
+                    src_label,
+                )
+
+                # Clamp/remap layers to actual loaded Z depth (safety after crop)
+                if mpv.volume_data is not None:
+                    z, y, x = mpv.volume_data.shape[:3]
+                    recipe = getattr(self, '_online_recipe', None) or {}
+                    layers = recipe.get('layers')
+                    if layers:
+                        clamped = []
+                        for L in layers:
+                            zs = max(0, min(int(L['z_start']), z))
+                            ze = max(0, min(int(L['z_end']), z))
+                            if ze > zs:
+                                e = dict(L)
+                                e['z_start'], e['z_end'] = zs, ze
+                                clamped.append(e)
+                        recipe['layers'] = clamped or None
+                        if hasattr(self, '_online_append_log') and self._online_append_log:
+                            self._online_append_log(
+                                f"[VOLUME] {z}×{y}×{x}  |  runtime layers: "
+                                f"{len(recipe['layers'] or [])}",
+                                SemiconductorTheme.TEXT_SECONDARY,
+                            )
+                    # Sliders/slices already set by Viewer.on_volume_loaded → update_all_views
+            elif error:
+                self._online_walltime_abort(str(error))
+                self.status_label.setText(f"ONLINE ERROR (volume): {error}")
+                if hasattr(self, '_online_append_log') and self._online_append_log:
+                    self._online_append_log(f"[ERROR] volume load: {error}", SemiconductorTheme.ACCENT_ERROR)
+                self._close_online_progress(ok=False)
+                self._online_cleanup()
+                return
+
         # ---- Step 2: Enhancement (if enabled) → then Segmentation ----
         self._online_apply_dll_profiling()
         self._online_reset_profiling_report()
@@ -1186,7 +1440,16 @@ class OnlineModeMixin:
         ):
             if src is None:
                 continue
-            arr = np.asarray(src)
+            try:
+                # VolumeStore proxy must be explicitly materialized for enhancement.
+                if hasattr(src, "store") and hasattr(src.store, "get_level"):
+                    arr = np.asarray(src.store.get_level(0))
+                elif hasattr(src, "get_level"):
+                    arr = np.asarray(src.get_level(0))
+                else:
+                    arr = np.asarray(src)
+            except Exception:
+                continue
             if arr.ndim == 2:
                 arr = arr[np.newaxis]
             elif arr.ndim == 4:
@@ -1220,9 +1483,10 @@ class OnlineModeMixin:
     def _run_online_enhancement(self):
         """Run volume enhancement (ONNX DLL) before segmentation.
 
-        Always feeds the DLL a folder of **per-slice** TIFFs built from the
-        already-loaded 3D volume. Online host often sends one multipage
-        ``Input.tiff``; the DLL cannot enhance multipage Z correctly.
+        Prefer in-memory ``ProcessVolumeBuffer`` (BumpVoid_ISP_ENH >= 0.0.1)
+        so Online does not export thousands of temp TIFF slices. Fall back to
+        per-slice folder export for older DLLs (multipage Input.tiff is not
+        a valid folder input for the DLL).
         """
         import time as _time
 
@@ -1237,17 +1501,11 @@ class OnlineModeMixin:
             self._start_online_segmentation()
             return
 
-        # Keep original for merge when mode=layers (only some Z enhanced)
-        self._online_enhance_base_volume = np.asarray(volume).copy()
-
-        # Slice folder for DLL (under temp online dir)
-        base_temp = getattr(self, "_online_temp_dir", None) or tempfile.mkdtemp(prefix="online_enh_")
-        self._online_temp_dir = base_temp
-        input_dir = os.path.join(base_temp, "enhance_slices")
-        n_slices = self._export_volume_slices_for_enhance(volume, input_dir)
+        volume = np.asarray(volume)
+        n_slices = int(volume.shape[0])
         self._online_enhance_n_slices = n_slices
 
-        # Enhanced output under stable results tree
+        # Enhanced output under stable results tree (archive / fallback assemble)
         results_root = getattr(self, "_online_results_dir", None) or self._resolve_online_results_dir()
         enhanced_output = os.path.join(results_root, "enhanced_volume")
         if os.path.isdir(enhanced_output):
@@ -1270,10 +1528,45 @@ class OnlineModeMixin:
                 start_slice, end_slice = -1, -1
                 mode = "full"
 
+        # Probe DLL for buffer API (load only — init happens in worker thread)
+        use_buffer = False
+        seg_tab = self.segmentation_tab
+        try:
+            from inno3d.core import enhanced_volume as _ev
+            try:
+                _ev.load_dll(seg_tab.dll_path)
+            except Exception:
+                pass
+            use_buffer = bool(
+                hasattr(_ev, "has_process_volume_buffer")
+                and _ev.has_process_volume_buffer()
+            )
+        except Exception:
+            use_buffer = False
+
+        input_dir = None
+        volume_u16 = None
+        if use_buffer:
+            # In-memory: DLL copies non-enhanced Z itself for layers mode
+            self._online_enhance_base_volume = None
+            volume_u16 = np.ascontiguousarray(volume, dtype=np.uint16)
+            path_note = "in-memory buffer (no temp slice export)"
+        else:
+            # Legacy DLL: keep original for merge when mode=layers
+            self._online_enhance_base_volume = np.asarray(volume).copy()
+            base_temp = getattr(self, "_online_temp_dir", None) or tempfile.mkdtemp(
+                prefix="online_enh_"
+            )
+            self._online_temp_dir = base_temp
+            input_dir = os.path.join(base_temp, "enhance_slices")
+            n_slices = self._export_volume_slices_for_enhance(volume, input_dir)
+            self._online_enhance_n_slices = n_slices
+            path_note = f"temp slice folder ({n_slices} files)"
+
         self._online_append_log("[ENHANCE] Starting ONNX enhancement...", "#CE93D8")
         self._online_append_log(
             f"[ENHANCE] Volume {volume.shape[0]}×{volume.shape[1]}×{volume.shape[2]} "
-            f"→ {n_slices} slice files",
+            f"— {path_note}",
             SemiconductorTheme.TEXT_SECONDARY,
         )
         self._online_append_log(f"[ENHANCE] Mode: {mode}", "#CE93D8")
@@ -1282,12 +1575,14 @@ class OnlineModeMixin:
                 f"[ENHANCE] Slice range: [{start_slice}, {end_slice}) (selected layers)",
                 SemiconductorTheme.TEXT_SECONDARY,
             )
-        self._online_append_log(f"[ENHANCE] Input:  {input_dir}", SemiconductorTheme.TEXT_SECONDARY)
+        if input_dir:
+            self._online_append_log(f"[ENHANCE] Input:  {input_dir}", SemiconductorTheme.TEXT_SECONDARY)
+        else:
+            self._online_append_log("[ENHANCE] Input:  RAM volume buffer", SemiconductorTheme.TEXT_SECONDARY)
         self._online_append_log(f"[ENHANCE] Output: {enhanced_output}", SemiconductorTheme.TEXT_SECONDARY)
 
         self._set_online_stage("enhance", 0)
 
-        seg_tab = self.segmentation_tab
         self._online_enhancement_thread = EnhancementThread(
             dll_dir=seg_tab.dll_path,
             model_path=self._online_enhancement_model,
@@ -1298,6 +1593,7 @@ class OnlineModeMixin:
             output_dir=enhanced_output,
             start_slice=start_slice,
             end_slice=end_slice,
+            volume_u16=volume_u16,
         )
         # Percent only — never surface model/CUDA/path detail to the dialog
         self._online_enhancement_thread.progress.connect(
@@ -1397,14 +1693,25 @@ class OnlineModeMixin:
                 pass
 
             enhanced_dir = self._online_enhanced_output
-            try:
-                enh_stack, n_applied = self._assemble_enhanced_volume_stack(enhanced_dir)
-            except Exception as e:
-                enh_stack, n_applied = None, 0
-                self._online_append_log(
-                    f"[ENHANCE WARN] assemble failed: {e}",
-                    SemiconductorTheme.ACCENT_WARNING,
-                )
+            enh_stack, n_applied = None, 0
+            thr = getattr(self, "_online_enhancement_thread", None)
+            if thr is not None and getattr(thr, "enhanced_volume", None) is not None:
+                enh_stack = thr.enhanced_volume
+                n_applied = int(getattr(self, "_online_enhance_n_slices", 0) or enh_stack.shape[0])
+                if getattr(thr, "used_buffer_api", False):
+                    self._online_append_log(
+                        "[ENHANCE] Used in-memory ProcessVolumeBuffer (no temp slices)",
+                        SemiconductorTheme.TEXT_SECONDARY,
+                    )
+            else:
+                try:
+                    enh_stack, n_applied = self._assemble_enhanced_volume_stack(enhanced_dir)
+                except Exception as e:
+                    enh_stack, n_applied = None, 0
+                    self._online_append_log(
+                        f"[ENHANCE WARN] assemble failed: {e}",
+                        SemiconductorTheme.ACCENT_WARNING,
+                    )
 
             if enh_stack is not None and enh_stack.shape[0] > 0:
                 z, y, x = enh_stack.shape[:3]

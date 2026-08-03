@@ -135,10 +135,22 @@ class MprRenderMixin:
             slice_data = store.get_slice("axial", lvl_idx, level=level)
             if level > 0:
                 slice_data = upsample_slice_nearest(slice_data, target_hw)
-            # Masks always from dense overlays at level-0 indices
-            seg_slice = self.segmentation_data[actual_z, :, :] if self.segmentation_data is not None else None
-            c1_slice = self.class1_data[actual_z, :, :] if self.class1_data is not None else None
-            c2_slice = self.class2_data[actual_z, :, :] if self.class2_data is not None else None
+            # Masks at level-0 indices; flipud to match store axial / non-LVE path
+            seg_slice = (
+                np.flipud(self.segmentation_data[actual_z, :, :])
+                if self.segmentation_data is not None
+                else None
+            )
+            c1_slice = (
+                np.flipud(self.class1_data[actual_z, :, :])
+                if self.class1_data is not None
+                else None
+            )
+            c2_slice = (
+                np.flipud(self.class2_data[actual_z, :, :])
+                if self.class2_data is not None
+                else None
+            )
             return slice_data, seg_slice, c1_slice, c2_slice
 
         if orientation == "coronal":
@@ -210,16 +222,20 @@ class MprRenderMixin:
             )
             if level > 0:
                 self._schedule_mpr_idle_refine(orientation, gen)
+                # One-line breadcrumb so preview/refine is observable in logs
+                if getattr(self, "_mpr_last_logged_level", None) != (orientation, level):
+                    self._mpr_last_logged_level = (orientation, level)
+                    print(f"[MPR] {orientation} preview level={level} (idle → refine L0)")
         else:
             if orientation == 'axial':
-                # Axial (XY): X = horizontal, Y = vertical (so shape: Y, X)
+                # Axial (XY): X = horizontal, Y = vertical (np.flipud matches Dragonfly/Fiji orientation)
                 actual_z = slice_idx
                 if self.reverse_z:
                     actual_z = self.volume_data.shape[0] - 1 - slice_idx
-                slice_data = self.volume_data[actual_z, :, :]
-                seg_slice = self.segmentation_data[actual_z, :, :] if self.segmentation_data is not None else None
-                c1_slice = self.class1_data[actual_z, :, :] if self.class1_data is not None else None
-                c2_slice = self.class2_data[actual_z, :, :] if self.class2_data is not None else None
+                slice_data = np.flipud(self.volume_data[actual_z, :, :])
+                seg_slice = np.flipud(self.segmentation_data[actual_z, :, :]) if self.segmentation_data is not None else None
+                c1_slice = np.flipud(self.class1_data[actual_z, :, :]) if self.class1_data is not None else None
+                c2_slice = np.flipud(self.class2_data[actual_z, :, :]) if self.class2_data is not None else None
 
             elif orientation == 'coronal':
                 # Coronal (XZ): X = horizontal, Z = vertical (Z increases downwards -> Z=0 at top)

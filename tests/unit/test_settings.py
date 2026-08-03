@@ -75,3 +75,56 @@ class TestGetOnlinePort:
             ini.write_text("[ONLINE]\nport = 9000\n", encoding="utf-8")
             with patch("inno3d.app.settings.app_config_ini_path", return_value=ini):
                 assert settings.get_online_port() == 9000
+
+
+class TestVolume3dSettings:
+    def test_default_budget(self):
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            env = os.environ.pop("INNO3D_3D_UPLOAD_BUDGET_MB", None)
+            try:
+                assert settings.get_3d_upload_budget_mb() in settings.VOLUME_3D_BUDGET_MB_OPTIONS
+            finally:
+                if env is not None:
+                    os.environ["INNO3D_3D_UPLOAD_BUDGET_MB"] = env
+
+    def test_budget_env_override(self):
+        with patch.dict("os.environ", {"INNO3D_3D_UPLOAD_BUDGET_MB": "1024"}):
+            assert settings.get_3d_upload_budget_mb() == 1024
+
+    def test_budget_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_ini = Path(tmpdir) / "app_config.ini"
+            with patch("inno3d.app.settings.app_config_ini_path", return_value=fake_ini):
+                with patch.dict("os.environ", {}, clear=False):
+                    import os
+
+                    env = os.environ.pop("INNO3D_3D_UPLOAD_BUDGET_MB", None)
+                    try:
+                        settings.set_3d_upload_budget_mb(1536)
+                        assert settings.get_3d_upload_budget_mb() == 1536
+                    finally:
+                        if env is not None:
+                            os.environ["INNO3D_3D_UPLOAD_BUDGET_MB"] = env
+
+    def test_lve_env_override(self):
+        with patch.dict("os.environ", {"INNO3D_LARGE_VOLUME_ENGINE": "1"}):
+            assert settings.get_large_volume_engine_enabled() is True
+
+    def test_lve_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_ini = Path(tmpdir) / "app_config.ini"
+            with patch("inno3d.app.settings.app_config_ini_path", return_value=fake_ini):
+                with patch.dict("os.environ", {}, clear=False):
+                    import os
+
+                    env = os.environ.pop("INNO3D_LARGE_VOLUME_ENGINE", None)
+                    try:
+                        settings.set_large_volume_engine_enabled(True)
+                        assert settings.get_large_volume_engine_enabled() is True
+                        settings.set_large_volume_engine_enabled(False)
+                        assert settings.get_large_volume_engine_enabled() is False
+                    finally:
+                        if env is not None:
+                            os.environ["INNO3D_LARGE_VOLUME_ENGINE"] = env

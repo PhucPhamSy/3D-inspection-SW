@@ -60,6 +60,103 @@ def _ui_icon_3d(name, widget=None, fallback=None):
     return QIcon()
 
 
+def compute_viewer_3d_upload_plan(
+    volume_data,
+    *,
+    spacing,
+    store=None,
+    host=None,
+    proxy_min_level=2,
+):
+    """Viewer source-of-truth for 3D upload level selection."""
+    from inno3d.core.volume_store import (
+        VolumeArrayProxy,
+        choose_3d_mip_level,
+        default_3d_upload_budget_bytes,
+        large_volume_engine_enabled,
+        level_nbytes,
+    )
+
+    vol_for_3d = None
+    level_3d = 0
+    skipped_full_upload = False
+    used_lve_coarse = False
+    source = "dense"
+    budget = default_3d_upload_budget_bytes()
+    full_bytes = int(getattr(volume_data, "nbytes", 0) or 0)
+
+    # Store-backed coarse selection first when possible.
+    if store is not None:
+        full_bytes = level_nbytes(store.shape, store.dtype, 0)
+        prefer_coarse = (
+            large_volume_engine_enabled(host)
+            or isinstance(volume_data, VolumeArrayProxy)
+            or full_bytes > budget
+        )
+        if prefer_coarse:
+            preferred = choose_3d_mip_level(
+                store.shape,
+                store.dtype,
+                budget,
+                is_available=store._level_available,
+            )
+            level_3d = int(store.best_available_level(preferred))
+            if isinstance(volume_data, VolumeArrayProxy) and int(proxy_min_level) > 0:
+                level_3d = max(int(proxy_min_level), int(level_3d))
+                level_3d = int(store.best_available_level(level_3d) or level_3d)
+            vol_for_3d = np.ascontiguousarray(store.get_level(level_3d))
+            skipped_full_upload = level_3d > 0 or full_bytes > budget
+            used_lve_coarse = level_3d > 0
+            source = "store"
+
+    # Dense fallback path (still protected by budget-based auto-coarse).
+    if vol_for_3d is None:
+        dense = volume_data
+        full_bytes = int(getattr(dense, "nbytes", 0) or 0)
+        preferred = 0
+        if (
+            full_bytes > budget
+            and getattr(dense, "ndim", 0) == 3
+            and all(int(s) > 0 for s in dense.shape)
+        ):
+            preferred = choose_3d_mip_level(
+                tuple(int(s) for s in dense.shape),
+                dense.dtype,
+                budget,
+            )
+        if preferred > 0:
+            step = 1 << int(preferred)
+            level_3d = int(preferred)
+            vol_for_3d = np.ascontiguousarray(dense[::step, ::step, ::step])
+            skipped_full_upload = True
+            used_lve_coarse = True
+            source = "dense"
+        else:
+            level_3d = 0
+            vol_for_3d = np.ascontiguousarray(dense)
+            skipped_full_upload = False
+            used_lve_coarse = False
+            source = "dense"
+
+    factor = 1 << int(level_3d)
+    spacing_3d = (
+        float(spacing[0]) * factor,
+        float(spacing[1]) * factor,
+        float(spacing[2]) * factor,
+    )
+    return {
+        "volume": vol_for_3d,
+        "level": int(level_3d),
+        "spacing_3d": spacing_3d,
+        "budget_bytes": int(budget),
+        "full_level0_bytes": int(full_bytes),
+        "approx_bytes": int(getattr(vol_for_3d, "nbytes", 0)),
+        "source": source,
+        "used_lve_coarse": bool(used_lve_coarse),
+        "skipped_full_upload": bool(skipped_full_upload),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 class Volume3dMixin:
     """Mixin: 3-D volume rendering, transfer function, orientation marker, LOD.
@@ -1868,144 +1965,46 @@ class Volume3dMixin:
 
         spacing = self.custom_spacing if getattr(self, 'custom_spacing', None) is not None else self.spacing
 
-        # Prefer store-backed coarse mip for 3D (plan §5) when volume_store exists.
-        # Avoids full-volume transpose/flatten/deep upload of level-0.
-        vol_for_3d = None
-        level_3d = 0
-        skipped_full_upload = False
-        used_lve_coarse = False
         store = getattr(self, "volume_store", None)
-        try:
-            from inno3d.core.volume_store import (
-                VolumeArrayProxy,
-                choose_3d_mip_level,
-                default_3d_upload_budget_bytes,
-                large_volume_engine_enabled,
-                level_nbytes,
+        upload = compute_viewer_3d_upload_plan(
+            self.volume_data,
+            spacing=spacing,
+            store=store,
+            host=self,
+            proxy_min_level=2,
+        )
+        vol_for_3d = upload["volume"]
+        level_3d = int(upload["level"])
+        skipped_full_upload = bool(upload["skipped_full_upload"])
+        used_lve_coarse = bool(upload["used_lve_coarse"])
+        sp_3d = upload["spacing_3d"]
+
+        if upload["source"] == "store":
+            print(
+                f"[LVE] 3D upload level={level_3d} shape={tuple(vol_for_3d.shape)} "
+                f"approx_bytes={upload['approx_bytes'] / (1024 ** 2):.1f} MiB "
+                f"(full_level0={upload['full_level0_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"budget={upload['budget_bytes'] / (1024 ** 2):.0f} MiB, "
+                f"full_upload_skipped={skipped_full_upload})"
             )
-
-            # Use store mip selection whenever a store is attached. Also treat
-            # proxy volumes as coarse-eligible even if the feature flag was missed.
-            prefer_coarse = store is not None and (
-                large_volume_engine_enabled(self)
-                or isinstance(self.volume_data, VolumeArrayProxy)
-                or level_nbytes(store.shape, store.dtype, 0) > default_3d_upload_budget_bytes()
+        elif used_lve_coarse:
+            lve_note = "LVE store not attached" if store is None else "shared dense fallback"
+            print(
+                f"[PERF] 3D auto-coarse level={level_3d} "
+                f"shape={tuple(vol_for_3d.shape)} "
+                f"approx_bytes={upload['approx_bytes'] / (1024 ** 2):.1f} MiB "
+                f"(full_level0={upload['full_level0_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"budget={upload['budget_bytes'] / (1024 ** 2):.0f} MiB, "
+                f"full_upload_skipped=True; {lve_note})"
             )
-            if prefer_coarse:
-                budget = default_3d_upload_budget_bytes()
-                full_bytes = level_nbytes(store.shape, store.dtype, 0)
-                preferred = choose_3d_mip_level(
-                    store.shape,
-                    store.dtype,
-                    budget,
-                    is_available=store._level_available,
-                )
-                level_3d = int(store.best_available_level(preferred))
-                coarse_bytes = level_nbytes(store.shape, store.dtype, level_3d)
-                # Materialize only the chosen level (stride/memmap → contiguous once)
-                level_arr = store.get_level(level_3d)
-                vol_for_3d = np.ascontiguousarray(level_arr)
-                if level_arr is not vol_for_3d and level_3d > 0:
-                    del level_arr
-                skipped_full_upload = level_3d > 0 or full_bytes > budget
-                used_lve_coarse = True
-                print(
-                    f"[LVE] 3D upload level={level_3d} shape={tuple(vol_for_3d.shape)} "
-                    f"approx_bytes={coarse_bytes / (1024 ** 2):.1f} MiB "
-                    f"(full_level0={full_bytes / (1024 ** 2):.1f} MiB, "
-                    f"budget={budget / (1024 ** 2):.0f} MiB, "
-                    f"full_upload_skipped={skipped_full_upload})"
-                )
-        except Exception as e:
-            print(f"[LVE] 3D coarse path failed, falling back: {e}")
-            vol_for_3d = None
-            level_3d = 0
-            used_lve_coarse = False
-            skipped_full_upload = False
-
-        if vol_for_3d is None:
-            # Legacy dense path only — never materialize a 15 GB memmap here
-            from inno3d.core.volume_store import VolumeArrayProxy
-
-            if isinstance(self.volume_data, VolumeArrayProxy) and store is not None:
-                from inno3d.core.volume_store import (
-                    choose_3d_mip_level,
-                    default_3d_upload_budget_bytes,
-                    level_nbytes,
-                )
-
-                budget = default_3d_upload_budget_bytes()
-                preferred = choose_3d_mip_level(
-                    store.shape,
-                    store.dtype,
-                    budget,
-                    is_available=store._level_available,
-                )
-                level_3d = max(2, int(store.best_available_level(preferred) or 2))
-                vol_for_3d = np.ascontiguousarray(store.get_level(level_3d))
-                skipped_full_upload = True
-                used_lve_coarse = True
-                print(
-                    f"[LVE] 3D forced coarse level={level_3d} "
-                    f"shape={tuple(vol_for_3d.shape)} "
-                    f"approx_bytes={level_nbytes(store.shape, store.dtype, level_3d) / (1024 ** 2):.1f} MiB "
-                    f"(proxy volume; full_upload_skipped=True)"
-                )
-            else:
-                # Dense legacy path. Multi-GB full GPU uploads often blank the
-                # 3D pane silently (log: 1200^3 ≈ 3.3 GiB first load). Cap by
-                # stride-mip even when large_volume_engine is off / no store.
-                from inno3d.core.volume_store import (
-                    choose_3d_mip_level,
-                    default_3d_upload_budget_bytes,
-                )
-
-                dense = self.volume_data
-                budget = default_3d_upload_budget_bytes()
-                full_bytes = int(getattr(dense, "nbytes", 0) or 0)
-                preferred = 0
-                if (
-                    full_bytes > budget
-                    and getattr(dense, "ndim", 0) == 3
-                    and all(int(s) > 0 for s in dense.shape)
-                ):
-                    preferred = choose_3d_mip_level(
-                        tuple(int(s) for s in dense.shape),
-                        dense.dtype,
-                        budget,
-                    )
-                if preferred > 0:
-                    step = 1 << int(preferred)
-                    level_3d = int(preferred)
-                    vol_for_3d = np.ascontiguousarray(
-                        dense[::step, ::step, ::step]
-                    )
-                    skipped_full_upload = True
-                    used_lve_coarse = True
-                    coarse_bytes = int(vol_for_3d.nbytes)
-                    print(
-                        f"[PERF] 3D auto-coarse level={level_3d} "
-                        f"shape={tuple(vol_for_3d.shape)} "
-                        f"approx_bytes={coarse_bytes / (1024 ** 2):.1f} MiB "
-                        f"(full_level0={full_bytes / (1024 ** 2):.1f} MiB, "
-                        f"budget={budget / (1024 ** 2):.0f} MiB, "
-                        f"full_upload_skipped=True; LVE store not attached)"
-                    )
-                else:
-                    vol_for_3d = np.ascontiguousarray(dense)
-                    print(
-                        f"[PERF] 3D full upload level=0 shape={tuple(vol_for_3d.shape)} "
-                        f"approx_bytes={vol_for_3d.nbytes / (1024 ** 2):.1f} MiB "
-                        f"(full_upload_skipped=False)"
-                    )
+        else:
+            print(
+                f"[PERF] 3D full upload level=0 shape={tuple(vol_for_3d.shape)} "
+                f"approx_bytes={upload['approx_bytes'] / (1024 ** 2):.1f} MiB "
+                f"(full_upload_skipped=False)"
+            )
 
         z, y, x = vol_for_3d.shape
-        factor = 1 << int(level_3d)
-        sp_3d = (
-            float(spacing[0]) * factor,
-            float(spacing[1]) * factor,
-            float(spacing[2]) * factor,
-        )
 
         vtk_data = vtk.vtkImageData()
         vtk_data.SetDimensions(x, y, z)

@@ -179,6 +179,11 @@ class SliceViewMixin:
         slice_slider.setMaximumHeight(16)
         slice_slider.setToolTip("Drag or scroll (step 1) to change slice")
         slice_slider.valueChanged.connect(lambda value, o=orientation: self.update_slice(o, value))
+        # Progressive MPR: slider drag must mark interaction (preview mip → idle refine).
+        if hasattr(self, "mark_mpr_interaction_start"):
+            slice_slider.sliderPressed.connect(self.mark_mpr_interaction_start)
+        if hasattr(self, "mark_mpr_interaction_end"):
+            slice_slider.sliderReleased.connect(self.mark_mpr_interaction_end)
         bottom_layout.addWidget(slice_slider, 1)
         
         slice_label = QLabel("50 / 100")
@@ -405,7 +410,7 @@ class SliceViewMixin:
 
             if orientation == "axial":
                 px = int(round(world_pos[0]))
-                py = int(round(world_pos[1]))
+                py = (vol_y - 1) - int(round(world_pos[1]))
                 if 0 <= px < vol_x and 0 <= py < vol_y:
                     actual_z = (
                         (vol_z - 1 - slice_idx)
@@ -416,7 +421,7 @@ class SliceViewMixin:
                     coord_str = f"X:{px} Y:{py} Z:{actual_z}"
             elif orientation == "coronal":
                 px = int(round(world_pos[0]))
-                pz = int(round(world_pos[1]))
+                pz = (vol_z - 1) - int(round(world_pos[1]))
                 if 0 <= px < vol_x and 0 <= pz < vol_z:
                     value = self.volume_data[pz, slice_idx, px]
                     coord_str = f"X:{px} Y:{slice_idx} Z:{pz}"
@@ -690,7 +695,7 @@ class SliceViewMixin:
                 
                 result = map_coordinates(data, [z_coords, y_coords, x_coords],
                                          order=order, mode='constant', cval=bg_val)
-                return result
+                return np.flipud(result)
                 
             elif orientation == 'coronal':
                 zz, xx = np.mgrid[0:vol_z, 0:vol_x].astype(np.float64)

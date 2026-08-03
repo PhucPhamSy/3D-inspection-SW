@@ -37,6 +37,7 @@ from inno3d.core.view_support import (
     volume_world_aabb,
 )
 from inno3d.core.perf_timing import perf_phase
+from inno3d.core.online_mpr_walltime import online_walltime_phase
 from inno3d.infra.textio import read_text_auto
 
 
@@ -813,64 +814,76 @@ class VolumeIOMixin:
         self.progress.setValue(int(self._progress_current))
 
     def on_volume_loaded(self, data, error):
+        wt = getattr(self, "_online_mpr_walltime", None)
         with perf_phase("viewer.on_volume_loaded.total"):
-            # Stop animation timer
-            if hasattr(self, '_progress_timer'):
-                self._progress_timer.stop()
-            if hasattr(self, 'progress') and self.progress is not None:
-                self.progress.setValue(100)  # Ensure bar reaches 100%
-                self.progress.close()
-            if error:
-                # Drop pending Batch Review replay so next load is clean
-                self._pending_batch_replay = None
-                self._pending_mask_bump = ""
-                self._pending_mask_void = ""
-                QMessageBox.critical(self, "Error", f"Failed to load volume: {error}")
-                return
+            with online_walltime_phase(wt, "on_volume_loaded.total"):
+                self._on_volume_loaded_body(data, error)
 
-            # Reset alignment backups and camera init state
-            self.original_volume_data = None
-            self._camera_initialized = False
-            self.original_class1_data = None
-            self.original_class2_data = None
-            self.original_labeled_class1_data = None
-            self.original_labeled_class2_data = None
+        # Batch Review deep-link: apply mask TIFFs after volume is ready
+        try:
+            self._apply_pending_masks_if_any()
+        except Exception as e:
+            print(f"[Viewer] apply pending masks: {e}")
 
-            if hasattr(self, 'btn_reset_align'):
-                self.btn_reset_align.setEnabled(False)
-            if hasattr(self, 'reset_align_btn'):
-                self.reset_align_btn.setEnabled(False)
+    def _on_volume_loaded_body(self, data, error):
+        if hasattr(self, '_progress_timer'):
+            self._progress_timer.stop()
+        if hasattr(self, 'progress') and self.progress is not None:
+            self.progress.setValue(100)  # Ensure bar reaches 100%
+            self.progress.close()
+        if error:
+            # Drop pending Batch Review replay so next load is clean
+            self._pending_batch_replay = None
+            self._pending_mask_bump = ""
+            self._pending_mask_void = ""
+            QMessageBox.critical(self, "Error", f"Failed to load volume: {error}")
+            return
 
-            # Invalidate caches from previous volume
-            self._cached_slice_actors = {}
-            if hasattr(self, '_persistent_crosshair'):
-                self._persistent_crosshair = {'axial': {}, 'coronal': {}, 'sagittal': {}}
+        # Reset alignment backups and camera init state
+        self.original_volume_data = None
+        self._camera_initialized = False
+        self.original_class1_data = None
+        self.original_class2_data = None
+        self.original_labeled_class1_data = None
+        self.original_labeled_class2_data = None
 
-            # Clear all segmentation/class overlays from the previous volume.
-            # A new input volume must always start clean — no stale masks from a
-            # different-shaped result should survive into the new session.
-            self.segmentation_data = None
-            self.class1_data = None
-            self.class2_data = None
-            self.labeled_class1_data = None
-            self.labeled_class2_data = None
+        if hasattr(self, 'btn_reset_align'):
+            self.btn_reset_align.setEnabled(False)
+        if hasattr(self, 'reset_align_btn'):
+            self.reset_align_btn.setEnabled(False)
 
-            from inno3d.core.volume_store import (
-                VolumeArrayProxy,
-                VolumeStore,
-                large_volume_engine_enabled,
-                store_from_dense_array,
-                wrap_volume_for_viewer,
-            )
+        # Invalidate caches from previous volume
+        self._cached_slice_actors = {}
+        if hasattr(self, '_persistent_crosshair'):
+            self._persistent_crosshair = {'axial': {}, 'coronal': {}, 'sagittal': {}}
 
-            prev_store = getattr(self, "volume_store", None)
-            if prev_store is not None and hasattr(prev_store, "close"):
-                try:
-                    prev_store.close()
-                except Exception:
-                    pass
-            self.volume_store = None
+        # Clear all segmentation/class overlays from the previous volume.
+        # A new input volume must always start clean — no stale masks from a
+        # different-shaped result should survive into the new session.
+        self.segmentation_data = None
+        self.class1_data = None
+        self.class2_data = None
+        self.labeled_class1_data = None
+        self.labeled_class2_data = None
 
+        from inno3d.core.volume_store import (
+            VolumeArrayProxy,
+            VolumeStore,
+            large_volume_engine_enabled,
+            store_from_dense_array,
+            wrap_volume_for_viewer,
+        )
+
+        prev_store = getattr(self, "volume_store", None)
+        if prev_store is not None and hasattr(prev_store, "close"):
+            try:
+                prev_store.close()
+            except Exception:
+                pass
+        self.volume_store = None
+
+        wt = getattr(self, "_online_mpr_walltime", None)
+        with online_walltime_phase(wt, "store_wrap"):
             if isinstance(data, VolumeStore):
                 store, proxy = wrap_volume_for_viewer(data)
                 self.volume_store = store
@@ -890,7 +903,12 @@ class VolumeIOMixin:
                     try:
                         sp = getattr(self, "spacing", None) or (1.0, 1.0, 1.0)
                         self.volume_store = store_from_dense_array(
-                            data, spacing=(float(sp[0]), float(sp[1]), float(sp[2]))
+                            data,
+                            spacing=(float(sp[0]), float(sp[1]), float(sp[2])),
+                            # Online first-paint latency: avoid forced contiguous copy
+                            # and avoid full-volume min/max scan in store wrapping.
+                            prefer_no_copy=True,
+                            sampled_value_range=True,
                         )
                         print(
                             f"[LVE] Dense VolumeStore wrapper for TIFF/folder "
@@ -899,23 +917,24 @@ class VolumeIOMixin:
                     except Exception as e:
                         print(f"[LVE] dense store wrap skipped: {e}")
 
-            z, y, x = data.shape
+        z, y, x = data.shape
 
-            # Initialize crosshair at center
-            self.crosshair_position = [x // 2, y // 2, z // 2]
+        # Initialize crosshair at center
+        self.crosshair_position = [x // 2, y // 2, z // 2]
 
-            # Update crosshair position sliders ranges
-            for axis, dim, ctr in [('x', x-1, x//2), ('y', y-1, y//2), ('z', z-1, z//2)]:
-                sl = getattr(self, f'crosshair_slider_{axis}', None)
-                if sl:
-                    sl.blockSignals(True)
-                    sl.setMaximum(dim)
-                    sl.setValue(ctr)
-                    sl.blockSignals(False)
+        # Update crosshair position sliders ranges
+        for axis, dim, ctr in [('x', x-1, x//2), ('y', y-1, y//2), ('z', z-1, z//2)]:
+            sl = getattr(self, f'crosshair_slider_{axis}', None)
+            if sl:
+                sl.blockSignals(True)
+                sl.setMaximum(dim)
+                sl.setValue(ctr)
+                sl.blockSignals(False)
 
-            # Fast min/max: avoid scanning the entire 32GB array.
-            total_voxels = int(getattr(data, "size", z * y * x))
-            with perf_phase("viewer.on_volume_loaded.minmax"):
+        # Fast min/max: avoid scanning the entire 32GB array.
+        total_voxels = int(getattr(data, "size", z * y * x))
+        with perf_phase("viewer.on_volume_loaded.minmax"):
+            with online_walltime_phase(wt, "minmax"):
                 store = getattr(self, "volume_store", None)
                 if store is not None:
                     data_min, data_max = store.metadata.value_range
@@ -930,14 +949,15 @@ class VolumeIOMixin:
                 else:
                     data_min = float(data.min())
                     data_max = float(data.max())
-            window = data_max - data_min
-            level = (data_max + data_min) / 2.0
+        window = data_max - data_min
+        level = (data_max + data_min) / 2.0
 
-            engine_tag = " [LVE]" if getattr(self, "volume_store", None) is not None else ""
-            self.info_label.setText(
-                f"Volume: ({z},{y},{x}) [{data_min}-{data_max}]{engine_tag}"
-            )
+        engine_tag = " [LVE]" if getattr(self, "volume_store", None) is not None else ""
+        self.info_label.setText(
+            f"Volume: ({z},{y},{x}) [{data_min}-{data_max}]{engine_tag}"
+        )
 
+        with online_walltime_phase(wt, "wl_setup"):
             # Update 3D W/L spinboxes + plotted/data range (Dragonfly Window Leveling)
             self._set_data_range_ui(data_min, data_max)
 
@@ -958,36 +978,30 @@ class VolumeIOMixin:
                 self.window_level[orientation] = (window, level)
             self._sync_mpr_wl_ui(int(data_min), int(data_max), data_min, data_max)
 
-            # Reset custom spacing when new volume is loaded
-            self.custom_spacing = None
-            if hasattr(self, 'spacing_x_spin'):
-                self.spacing_x_spin.setValue(self.spacing[0])
-                self.spacing_y_spin.setValue(self.spacing[1])
-                self.spacing_z_spin.setValue(self.spacing[2])
+        # Reset custom spacing when new volume is loaded
+        self.custom_spacing = None
+        if hasattr(self, 'spacing_x_spin'):
+            self.spacing_x_spin.setValue(self.spacing[0])
+            self.spacing_y_spin.setValue(self.spacing[1])
+            self.spacing_z_spin.setValue(self.spacing[2])
 
-            for orientation in ['axial', 'coronal', 'sagittal']:
-                self.camera_state[orientation] = None
+        for orientation in ['axial', 'coronal', 'sagittal']:
+            self.camera_state[orientation] = None
 
-            # Progressive MPR generation counters (large_volume_engine)
-            self._mpr_gen = {'axial': 0, 'coronal': 0, 'sagittal': 0}
-            self._mpr_applied_gen = {'axial': 0, 'coronal': 0, 'sagittal': 0}
-            self._mpr_interacting = False
-            self._mpr_refine_level = {'axial': 0, 'coronal': 0, 'sagittal': 0}
+        # Progressive MPR generation counters (large_volume_engine)
+        self._mpr_gen = {'axial': 0, 'coronal': 0, 'sagittal': 0}
+        self._mpr_applied_gen = {'axial': 0, 'coronal': 0, 'sagittal': 0}
+        self._mpr_interacting = False
+        self._mpr_refine_level = {'axial': 0, 'coronal': 0, 'sagittal': 0}
 
-            # ── Phase 4a: Adaptive performance tuning for large volumes ──────
-            data_gb = float(getattr(data, "nbytes", z * y * x * 2)) / (1024 ** 3)
-            if data_gb >= 4.0:
-                self._apply_large_volume_perf_settings(data_gb)
+        # ── Phase 4a: Adaptive performance tuning for large volumes ──────
+        data_gb = float(getattr(data, "nbytes", z * y * x * 2)) / (1024 ** 3)
+        if data_gb >= 4.0:
+            self._apply_large_volume_perf_settings(data_gb)
 
-            with perf_phase("viewer.on_volume_loaded.update_all_views"):
+        with perf_phase("viewer.on_volume_loaded.update_all_views"):
+            with online_walltime_phase(wt, "on_volume_loaded.update_all_views_total"):
                 self.update_all_views()
-
-        # Batch Review deep-link: apply mask TIFFs after volume is ready
-        try:
-            self._apply_pending_masks_if_any()
-        except Exception as e:
-            print(f"[Viewer] apply pending masks: {e}")
-
 
     def _apply_large_volume_perf_settings(self, data_gb):
         """Auto-tune rendering settings for large volumes (≥ 4 GB).
@@ -1018,26 +1032,44 @@ class VolumeIOMixin:
                 self.quality_combo.blockSignals(False)
         self._current_quality = target_quality
 
-        # ── 2. 3D volume render: legacy auto-disable vs LVE coarse-mip ───
+        # ── 2. 3D volume render: auto-disable only when coarse upload is unavailable ───
         lve_coarse_3d = False
+        budgeted_coarse_3d = False
         try:
-            from inno3d.core.volume_store import large_volume_engine_enabled
+            from inno3d.core.volume_store import (
+                large_volume_engine_enabled,
+                default_3d_upload_budget_bytes,
+                level_nbytes,
+            )
 
             lve_coarse_3d = (
                 large_volume_engine_enabled(self)
                 and getattr(self, "volume_store", None) is not None
             )
+            budget = int(default_3d_upload_budget_bytes())
+            store = getattr(self, "volume_store", None)
+            if store is not None:
+                full_bytes = int(level_nbytes(store.shape, store.dtype, 0))
+                budgeted_coarse_3d = full_bytes > budget
+            else:
+                vol = getattr(self, "volume_data", None)
+                if (
+                    vol is not None
+                    and getattr(vol, "ndim", 0) == 3
+                    and all(int(s) > 0 for s in getattr(vol, "shape", ()))
+                ):
+                    full_bytes = int(getattr(vol, "nbytes", 0) or 0)
+                    budgeted_coarse_3d = full_bytes > budget
         except Exception:
             lve_coarse_3d = False
+            budgeted_coarse_3d = False
 
         if data_gb >= 8.0:
-            if lve_coarse_3d:
-                # Prefer coarse pyramid upload over disabling 3D entirely.
-                # Do not call set_3d_volume_render_enabled(True) here — that would
-                # trigger render_3d before update_all_views; default stays ON.
+            if lve_coarse_3d or budgeted_coarse_3d:
+                # Prefer coarse/budgeted upload over disabling 3D entirely.
                 print(
-                    f"[LVE] Volume {data_gb:.1f} GB → 3D kept enabled "
-                    f"(coarse mip upload; not auto-disabled)"
+                    f"[PERF] Volume {data_gb:.1f} GB → 3D kept enabled "
+                    f"(budgeted coarse upload; not auto-disabled)"
                 )
             elif hasattr(self, 'set_3d_volume_render_enabled'):
                 self.set_3d_volume_render_enabled(False)
@@ -1089,10 +1121,11 @@ class VolumeIOMixin:
             coord_str = ""
 
             if orientation == "axial":
-                # XY: display X=X, Y=Y; slice = Z
+                # XY flipud: display X=X, VTK Y runs bottom→top along flipped Y index (Dragonfly/Fiji parity)
                 px = int(round(world_pos[0]))
-                py = int(round(world_pos[1]))
-                if 0 <= px < vol_x and 0 <= py < vol_y:
+                py_disp = int(round(world_pos[1]))
+                if 0 <= px < vol_x and 0 <= py_disp < vol_y:
+                    py = (vol_y - 1) - py_disp
                     actual_z = (
                         (vol_z - 1 - slice_idx)
                         if getattr(self, "reverse_z", False)
@@ -1102,13 +1135,11 @@ class VolumeIOMixin:
                     coord_str = f"X:{px} Y:{py} Z:{actual_z}"
             elif orientation == "coronal":
                 # XZ flipud: VTK Y runs bottom→top along flipped Z index
-                # (same mapping as render_slice + Teaching readout)
+                # (un-flip to match Teaching readout and crosshair Z picking)
                 px = int(round(world_pos[0]))
                 pz_disp = int(round(world_pos[1]))
                 if 0 <= px < vol_x and 0 <= pz_disp < vol_z:
-                    # flipud → display row 0 is high Z in array feed; VTK Y from
-                    # bottom matches flipped index when ViewUp=(0,1,0)
-                    pz = pz_disp
+                    pz = (vol_z - 1) - pz_disp
                     value = self.volume_data[pz, slice_idx, px]
                     coord_str = f"X:{px} Y:{slice_idx} Z:{pz}"
             else:
@@ -1152,35 +1183,55 @@ class VolumeIOMixin:
                 QMessageBox.critical(self, "Error", str(e))
     
     def update_all_views(self):
+        wt = getattr(self, "_online_mpr_walltime", None)
         with perf_phase("viewer.update_all_views.total"):
-            if self.volume_data is None:
-                return
+            with online_walltime_phase(wt, "update_all_views.total"):
+                if self.volume_data is None:
+                    return
 
-            z, y, x = self.volume_data.shape
+                z, y, x = self.volume_data.shape
 
-            self.axial_slice_slider.setMaximum(z - 1)
-            self.axial_slice_slider.setValue(z // 2)
-            self.current_slices['axial'] = z // 2
+                self.axial_slice_slider.setMaximum(z - 1)
+                self.axial_slice_slider.setValue(z // 2)
+                self.current_slices['axial'] = z // 2
 
-            # Coronal(Y): slices along Y axis, so max = y-1
-            self.coronal_slice_slider.setMaximum(y - 1)
-            self.coronal_slice_slider.setValue(y // 2)
-            self.current_slices['coronal'] = y // 2
+                # Coronal(Y): slices along Y axis, so max = y-1
+                self.coronal_slice_slider.setMaximum(y - 1)
+                self.coronal_slice_slider.setValue(y // 2)
+                self.current_slices['coronal'] = y // 2
 
-            # Sagittal(X): slices along X axis, so max = x-1
-            self.sagittal_slice_slider.setMaximum(x - 1)
-            self.sagittal_slice_slider.setValue(x // 2)
-            self.current_slices['sagittal'] = x // 2
+                # Sagittal(X): slices along X axis, so max = x-1
+                self.sagittal_slice_slider.setMaximum(x - 1)
+                self.sagittal_slice_slider.setValue(x // 2)
+                self.current_slices['sagittal'] = x // 2
 
-            # Init crosshair at center
-            self.crosshair_position = [x // 2, y // 2, z // 2]
-            for orientation in ['axial', 'coronal', 'sagittal']:
-                self.render_slice(orientation)
+                # Init crosshair at center
+                self.crosshair_position = [x // 2, y // 2, z // 2]
+                for orientation in ['axial', 'coronal', 'sagittal']:
+                    with online_walltime_phase(wt, f"render_slice.{orientation}"):
+                        self.render_slice(orientation)
 
-            with perf_phase("viewer.update_all_views.render_3d"):
-                self.render_3d()
-            with perf_phase("viewer.update_all_views.crosshair_3d"):
-                self.update_3d_crosshair()
+                # Online / 3D-off: skip GPU volume path so MPR paints first.
+                if hasattr(self, "is_3d_volume_render_enabled") and not self.is_3d_volume_render_enabled():
+                    with perf_phase("viewer.update_all_views.3d_placeholder"):
+                        try:
+                            self._teardown_3d_volume_actors()
+                        except Exception:
+                            pass
+                        try:
+                            self._show_3d_disabled_placeholder()
+                        except Exception:
+                            pass
+                        if getattr(self, "crosshair_enabled", False) and hasattr(self, "update_3d_crosshair"):
+                            try:
+                                self.update_3d_crosshair()
+                            except Exception:
+                                pass
+                else:
+                    with perf_phase("viewer.update_all_views.render_3d"):
+                        self.render_3d()
+                    with perf_phase("viewer.update_all_views.crosshair_3d"):
+                        self.update_3d_crosshair()
         
         # Show VIEW TOOLS host when volume is loaded
         # Online → collapsed rail by default (or user session pref); Manual → full sidebar
@@ -1195,6 +1246,14 @@ class VolumeIOMixin:
                 self.set_align_tools_expanded(True, remember=False)
         elif hasattr(self, "align_sidebar"):
             self.align_sidebar.setVisible(True)
+
+        # Let Online MPR panes paint before the rest of the Online pipeline continues.
+        if getattr(self, "_online_viewer_mode", False):
+            try:
+                from PyQt5.QtWidgets import QApplication
+                QApplication.processEvents()
+            except Exception:
+                pass
 
         # Force MPR tool strips (C1/C2/FS/Reset) back after Online dialogs hid them
         QTimer.singleShot(50, self._reposition_visible_overlays)
@@ -1213,6 +1272,19 @@ class VolumeIOMixin:
         if self.volume_data is None:
             return
 
+        # Progressive MPR: treat slider/wheel as interaction even when
+        # sliderPressed is not available (e.g. mouse wheel on slice bar).
+        if hasattr(self, "mark_mpr_interaction_start"):
+            self.mark_mpr_interaction_start()
+            end_timer = getattr(self, "_mpr_slider_end_timer", None)
+            if end_timer is None:
+                end_timer = QTimer(self)
+                end_timer.setSingleShot(True)
+                end_timer.setInterval(140)
+                end_timer.timeout.connect(self._end_mpr_slider_interaction)
+                self._mpr_slider_end_timer = end_timer
+            end_timer.start()
+
         if not hasattr(self, '_slice_update_pending'):
             self._slice_update_pending = {}
             self._slice_throttle_timer = QTimer(self)
@@ -1227,6 +1299,19 @@ class VolumeIOMixin:
             self._flush_slice_update()
             # Coalesce any events that arrive in the next frame
             self._slice_throttle_timer.start()
+
+    def _end_mpr_slider_interaction(self):
+        """Idle after last slider/wheel event → refine MPR to level-0."""
+        # Still holding the thumb: keep preview until sliderReleased.
+        for ori in ("axial", "coronal", "sagittal"):
+            sl = getattr(self, f"{ori}_slice_slider", None)
+            if sl is not None and hasattr(sl, "isSliderDown") and sl.isSliderDown():
+                end_timer = getattr(self, "_mpr_slider_end_timer", None)
+                if end_timer is not None:
+                    end_timer.start()
+                return
+        if hasattr(self, "mark_mpr_interaction_end"):
+            self.mark_mpr_interaction_end()
     
     def _flush_slice_update(self):
         """Apply latest pending slider values through updatePoint (single source of truth)."""

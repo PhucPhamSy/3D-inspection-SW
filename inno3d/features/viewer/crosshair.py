@@ -34,9 +34,10 @@ class CrosshairMixin:
             return None
 
         vol_z, vol_y, vol_x = self.volume_data.shape
+        # World Y on axial/coronal must match flipud slice display + _pick_voxel.
         if orientation == 'axial':
             cx_w = float(self.crosshair_position[0])
-            cy_w = float(self.crosshair_position[1])
+            cy_w = float((vol_y - 1) - self.crosshair_position[1])
             theta_h = math.radians(self.oblique_angles.get('coronal', 0.0))
             theta_v = math.radians(self.oblique_angles.get('sagittal', 0.0)) + math.pi / 2
         elif orientation == 'coronal':
@@ -178,7 +179,7 @@ class CrosshairMixin:
 
         if orientation == "axial":
             pickX = int(round(world[0]))
-            pickY = int(round(world[1]))
+            pickY = (vol_y - 1) - int(round(world[1]))
             if mode in ("center", "v", "place"):
                 newX = pickX
             if mode in ("center", "h", "place"):
@@ -401,7 +402,7 @@ class CrosshairMixin:
         # labels: h_pos, h_neg, v_pos, v_neg  →  +H, -H, +V, -V along axis directions
         if orientation == 'axial':
             cx_w = float(self.crosshair_position[0])
-            cy_w = float(self.crosshair_position[1])
+            cy_w = float((vol_y - 1) - self.crosshair_position[1])
             h_pos, h_neg = '+X', '-X'
             v_pos, v_neg = '+Y', '-Y'
             h_color = (1.0, 0.192, 0.192)     # Red   = X axis
@@ -853,13 +854,13 @@ class CrosshairMixin:
             
             z_sign = '-Z' if self.reverse_z else '+Z'
             
-            # Map world crosshair position to the specific plane orientations 
-            # Axial: VTK X = X, VTK Y = Y
+            # Map world crosshair position to the specific plane orientations
+            # Axial: VTK X = X, VTK Y = Y_flipped (matches np.flipud + pick)
             # Coronal: VTK X = X, VTK Y = Z_flipped
             # Sagittal: VTK X = Z, VTK Y = Y
             if orientation == 'axial':
                 cx_w = float(self.crosshair_position[0])
-                cy_w = float(self.crosshair_position[1])
+                cy_w = float((vol_y - 1) - self.crosshair_position[1])
                 h_label, v_label = '+X', '+Y'
                 h_color = (1.0, 0.192, 0.192)  # X: Red
                 v_color = (0.223, 1.0, 0.078)  # Y: Green
@@ -936,7 +937,8 @@ class CrosshairMixin:
                 v_color = (0.223, 1.0, 0.078)  # Y: Green
                 
                 h_label_pos, h_label_neg = '+X', '-X'
-                v_label_pos, v_label_neg = '-Y', '+Y'
+                # Display Y is flipped voxel-Y: same as update_2d_crosshair
+                v_label_pos, v_label_neg = '+Y', '-Y'
                 
                 theta_h = math.radians(self.oblique_angles.get('coronal', 0.0))
                 theta_v = math.radians(self.oblique_angles.get('sagittal', 0.0)) + math.pi / 2
