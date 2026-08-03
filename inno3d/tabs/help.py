@@ -2,6 +2,7 @@
 
 from PyQt5.QtCore import Qt, QSignalBlocker, pyqtSignal
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -11,6 +12,13 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from inno3d.app.settings import (
+    VOLUME_3D_BUDGET_MB_OPTIONS,
+    get_3d_upload_budget_mb,
+    get_large_volume_engine_enabled,
+    set_3d_upload_budget_mb,
+    set_large_volume_engine_enabled,
+)
 from inno3d.core.styles import SemiconductorTheme
 
 
@@ -20,6 +28,7 @@ class HelpTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._build_ui()
+        self._load_volume_settings()
         self._show_license()
         self.set_current_theme(SemiconductorTheme.CURRENT_THEME)
         self._apply_theme_styles()
@@ -62,6 +71,38 @@ class HelpTab(QWidget):
 
         root.addLayout(actions)
 
+        self.volume_settings_title = QLabel("Large Volume 3D Settings")
+        root.addWidget(self.volume_settings_title)
+
+        self.volume_settings_help = QLabel(
+            "Higher upload budget improves 3D smoothness but uses more memory and GPU resources."
+        )
+        self.volume_settings_help.setWordWrap(True)
+        root.addWidget(self.volume_settings_help)
+
+        volume_row = QHBoxLayout()
+        volume_row.setSpacing(8)
+
+        self.budget_label = QLabel("3D Upload Budget (MB)")
+        volume_row.addWidget(self.budget_label)
+
+        self.budget_combo = QComboBox()
+        self.budget_combo.setMinimumWidth(90)
+        for mb in VOLUME_3D_BUDGET_MB_OPTIONS:
+            self.budget_combo.addItem(str(mb), mb)
+        self.budget_combo.currentIndexChanged.connect(self._on_budget_combo_changed)
+        volume_row.addWidget(self.budget_combo)
+
+        self.lve_checkbox = QCheckBox("Enable Large Volume Engine")
+        self.lve_checkbox.stateChanged.connect(self._on_lve_checkbox_changed)
+        volume_row.addWidget(self.lve_checkbox)
+        volume_row.addStretch()
+        root.addLayout(volume_row)
+
+        self.volume_settings_notice = QLabel("")
+        self.volume_settings_notice.setWordWrap(True)
+        root.addWidget(self.volume_settings_notice)
+
         self.content_title = QLabel("")
         root.addWidget(self.content_title)
 
@@ -84,6 +125,18 @@ class HelpTab(QWidget):
         self.subtitle.setStyleSheet(f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 9pt;")
         self.theme_label.setStyleSheet(
             f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 9pt; font-weight: 700;"
+        )
+        self.volume_settings_title.setStyleSheet(
+            f"color: {SemiconductorTheme.TEXT_PRIMARY}; font-weight: 700; font-size: 9pt;"
+        )
+        self.volume_settings_help.setStyleSheet(
+            f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 8pt;"
+        )
+        self.budget_label.setStyleSheet(
+            f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 9pt;"
+        )
+        self.volume_settings_notice.setStyleSheet(
+            f"color: {SemiconductorTheme.ACCENT_PRIMARY}; font-size: 8pt;"
         )
         self.content_title.setStyleSheet(
             f"color: {SemiconductorTheme.TEXT_PRIMARY}; font-weight: 700; font-size: 10pt;"
@@ -115,6 +168,32 @@ class HelpTab(QWidget):
     def _on_theme_combo_changed(self, _index):
         theme = self.theme_combo.currentData() or "dark"
         self.theme_changed.emit(theme)
+
+    def _load_volume_settings(self):
+        mb = get_3d_upload_budget_mb()
+        idx = self.budget_combo.findData(mb)
+        if idx < 0:
+            idx = self.budget_combo.findData(VOLUME_3D_BUDGET_MB_OPTIONS[0])
+        with QSignalBlocker(self.budget_combo):
+            self.budget_combo.setCurrentIndex(max(0, idx))
+        with QSignalBlocker(self.lve_checkbox):
+            self.lve_checkbox.setChecked(get_large_volume_engine_enabled())
+
+    def _show_volume_settings_notice(self):
+        self.volume_settings_notice.setText(
+            "Saved. New values apply on the next volume load or 3D re-render."
+        )
+
+    def _on_budget_combo_changed(self, _index):
+        mb = self.budget_combo.currentData()
+        if mb is None:
+            return
+        set_3d_upload_budget_mb(int(mb))
+        self._show_volume_settings_notice()
+
+    def _on_lve_checkbox_changed(self, _state):
+        set_large_volume_engine_enabled(self.lve_checkbox.isChecked())
+        self._show_volume_settings_notice()
 
     def _set_active_title(self, title):
         self.content_title.setText(title)

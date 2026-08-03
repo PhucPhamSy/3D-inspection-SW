@@ -286,6 +286,106 @@ def process_slice_range(
     )
 
 
+def has_process_volume_buffer() -> bool:
+    """True when DLL exports EnhancedVolume_ProcessVolumeBuffer (v0.0.1+)."""
+    _check_dll()
+    return hasattr(_dll, "EnhancedVolume_ProcessVolumeBuffer")
+
+
+def process_volume_buffer(
+    input_u16,
+    output_u16=None,
+    start_slice: int = -1,
+    end_slice: int = -1,
+    callback=None,
+) -> int:
+    """Enhance a contiguous uint16 volume in RAM (ZYX C-order).
+
+    Requires BumpVoid_ISP_ENH.dll >= 0.0.1. Avoids temp TIFF slice export.
+
+    Parameters
+    ----------
+    input_u16 : np.ndarray
+        Shape (Z, Y, X), dtype uint16, C-contiguous preferred.
+    output_u16 : np.ndarray or None
+        Same shape/dtype. If None, an empty_like array is allocated and
+        returned via ``process_volume_buffer.result`` (see return note).
+        For in-place, pass the same array as ``input_u16``.
+    start_slice, end_slice : int
+        Half-open [start, end); -1,-1 = all Z.
+    callback : optional ctypes progress callback
+
+    Returns
+    -------
+    int
+        Number of slices enhanced, or -1 on error.
+
+    Notes
+    -----
+    The enhanced array is always written into ``output_u16`` (or the
+    allocated buffer). Callers should keep a reference to that array.
+    """
+    import numpy as np
+
+    _check_dll()
+    if not has_process_volume_buffer():
+        raise RuntimeError(
+            "EnhancedVolume_ProcessVolumeBuffer not in DLL "
+            "(need BumpVoid_ISP_ENH >= 0.0.1). Use process_folder instead."
+        )
+
+    src = np.asarray(input_u16)
+    if src.ndim != 3:
+        raise ValueError(f"expected 3D volume, got shape={src.shape}")
+    if src.dtype != np.uint16:
+        src = np.ascontiguousarray(src, dtype=np.uint16)
+    else:
+        src = np.ascontiguousarray(src)
+
+    if output_u16 is None:
+        dst = np.empty_like(src)
+    else:
+        dst = np.asarray(output_u16)
+        if dst.shape != src.shape:
+            raise ValueError(f"output shape {dst.shape} != input {src.shape}")
+        if dst.dtype != np.uint16:
+            raise ValueError("output must be uint16")
+        dst = np.ascontiguousarray(dst)
+
+    depth, height, width = [int(v) for v in src.shape]
+    # Keep references so GC cannot free buffers while native code runs
+    process_volume_buffer._pin_src = src
+    process_volume_buffer._pin_dst = dst
+    process_volume_buffer.result = dst
+
+    fn = _dll.EnhancedVolume_ProcessVolumeBuffer
+    fn.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        PROGRESS_CALLBACK,
+    ]
+    fn.restype = ctypes.c_int
+
+    cb = callback if callback else _progress_cb
+    return int(
+        fn(
+            src.ctypes.data_as(ctypes.c_void_p),
+            dst.ctypes.data_as(ctypes.c_void_p),
+            depth,
+            height,
+            width,
+            int(start_slice),
+            int(end_slice),
+            cb,
+        )
+    )
+
+
 def dispose():
     """Release the ONNX session and free GPU memory."""
     _check_dll()

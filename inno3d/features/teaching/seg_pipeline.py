@@ -463,8 +463,17 @@ class SegmentationPipelineMixin:
                 return # user cancelled
                 
         from inno3d.core.view_support import LoadVolumeThread
+        from inno3d.core.volume_store import large_volume_engine_enabled
         self.pending_load_path = file_path
-        self.load_thread = LoadVolumeThread(file_path, downsample_factor=1, raw_shape=raw_shape, raw_dtype=raw_dtype, raw_offset=raw_offset)
+        use_lve = large_volume_engine_enabled(self)
+        self.load_thread = LoadVolumeThread(
+            file_path,
+            downsample_factor=1,
+            raw_shape=raw_shape,
+            raw_dtype=raw_dtype,
+            raw_offset=raw_offset,
+            use_large_volume_engine=use_lve,
+        )
         
         self.progress = QProgressDialog("Loading volume...", "Cancel", 0, 100, self)
         self.progress.setWindowModality(Qt.WindowModal)
@@ -490,10 +499,56 @@ class SegmentationPipelineMixin:
             # Clear previous segmentations and stats before setting new data
             self.clear_masks()
             
-            self.volume_data = data
+            from inno3d.core.volume_store import (
+                VolumeStore,
+                large_volume_engine_enabled,
+                store_from_dense_array,
+                wrap_volume_for_viewer,
+            )
+
+            prev_store = getattr(self, "volume_store", None)
+            if prev_store is not None and hasattr(prev_store, "close"):
+                try:
+                    prev_store.close()
+                except Exception:
+                    pass
+            self.volume_store = None
+
+            if isinstance(data, VolumeStore):
+                store, proxy = wrap_volume_for_viewer(data)
+                self.volume_store = store
+                self.volume_data = proxy
+                data = proxy
+                print(
+                    f"[LVE] Teaching VolumeStore attached: {store.shape} {store.dtype}"
+                )
+            else:
+                self.volume_data = data
+                if large_volume_engine_enabled(self) and getattr(data, "ndim", 0) == 3:
+                    try:
+                        self.volume_store = store_from_dense_array(
+                            data,
+                            spacing=(
+                                float(self.spacing[0]),
+                                float(self.spacing[1]),
+                                float(self.spacing[2]),
+                            ),
+                        )
+                        print(
+                            f"[LVE] Teaching dense store wrapper: {tuple(data.shape)}"
+                        )
+                    except Exception as e:
+                        print(f"[LVE] Teaching dense store wrap skipped: {e}")
+
             self._3d_needs_initial_camera = True  # Reset camera for new data
             z, y, x = data.shape
             print(f"Final volume shape: {z}x{y}x{x}")
+
+            # Progressive MPR generation counters (large_volume_engine)
+            self._mpr_gen = {'axial': 0, 'coronal': 0, 'sagittal': 0}
+            self._mpr_applied_gen = {'axial': 0, 'coronal': 0, 'sagittal': 0}
+            self._mpr_interacting = False
+            self._mpr_refine_level = {'axial': 0, 'coronal': 0, 'sagittal': 0}
             
             # Update sliders
             self.current_slices = {'axial': z//2, 'coronal': y//2, 'sagittal': x//2}
@@ -530,23 +585,24 @@ class SegmentationPipelineMixin:
                 self.roi_z_end_spin.setRange(0, z)
                 self.roi_z_end_spin.setValue(z)
             
-            # Calculate window/level for proper 16-bit display
+            # Calculate window/level for proper display
             import numpy as np
-            if data.dtype == np.uint16:
-                # Use percentile-based window/level like Multi-planar tab
-                data_min = np.percentile(data, 1)
-                data_max = np.percentile(data, 99)
-                window = data_max - data_min
-                level = (data_max + data_min) / 2
-                print(f"Auto window/level: window={window:.1f}, level={level:.1f}")
-                
-                # Apply to all orientations
+            if getattr(self, "volume_store", None) is not None:
+                data_min, data_max = self.volume_store.metadata.value_range
+                window = float(data_max - data_min)
+                level = float((data_max + data_min) / 2.0)
+                print(f"[LVE] Teaching window/level from metadata: window={window:.1f}, level={level:.1f}")
                 for orientation in ['axial', 'coronal', 'sagittal']:
                     self.window_level[orientation] = (window, level)
             else:
-                # For 8-bit, use full range
+                # Match 3D Viewer: full data min/max range
+                data_min = float(data.min())
+                data_max = float(data.max())
+                window = float(data_max - data_min)
+                level = float((data_max + data_min) / 2.0)
+                print(f"Teaching window/level: window={window:.1f}, level={level:.1f}")
                 for orientation in ['axial', 'coronal', 'sagittal']:
-                    self.window_level[orientation] = (255, 127.5)
+                    self.window_level[orientation] = (window, level)
             
             # Ensure VTK interactors + wheel/crosshair observers are live
             # (also called from MainWindow.showEvent; safe to re-run)
@@ -576,7 +632,8 @@ class SegmentationPipelineMixin:
                 pass
 
             # ── Phase 4a: Adaptive performance tuning for Teaching tab ───
-            data_gb = data.nbytes / (1024 ** 3)
+            data_nbytes = float(getattr(data, "nbytes", z * y * x * 2))
+            data_gb = data_nbytes / (1024 ** 3)
             if data_gb >= 4.0:
                 throttle_label = '100ms' if data_gb >= 8 else '33ms'
                 quality_hint = 'Draft' if data_gb >= 8 else 'Standard'
@@ -3695,7 +3752,7 @@ class SegmentationPipelineMixin:
 
         return np.clip(rgb, 0, 255).astype(np.uint8)
 
-    def update_plane_view(self, orientation, preserve_camera=False):
+    def update_plane_view(self, orientation, preserve_camera=False, _mpr_force_level=None):
         """Update one MPR pane — parity with 3D Viewer ``render_slice``.
 
         Key parity fixes vs old Teaching path:
@@ -3703,12 +3760,15 @@ class SegmentationPipelineMixin:
           - nearest-neighbor interpolation (crisp mask pixels, no bilinear blur)
           - viewport-aspect camera fit (not crude max(h,w)*0.55)
           - use cached per-orientation window/level when available
+          - progressive MPR preview mip while interacting (LVE + volume_store)
         """
         if self.volume_data is None:
             return
 
         renderer = getattr(self, f"{orientation}_renderer")
         slice_idx = self.current_slices[orientation]
+        gen = self._bump_mpr_generation(orientation) if self._mpr_lve_active() else 0
+        actual_z = slice_idx
 
         # Save camera state before rebuild
         if preserve_camera and hasattr(self, "camera_states") and isinstance(
@@ -3722,45 +3782,78 @@ class SegmentationPipelineMixin:
                 "parallel_scale": camera.GetParallelScale(),
             }
 
-        actual_z = slice_idx
-        if orientation == "axial":
-            if getattr(self, "reverse_z", False):
-                actual_z = self.volume_data.shape[0] - 1 - slice_idx
-            slice_data = self.volume_data[actual_z, :, :]
-            bump_slice = (
-                self.bump_segmentation[actual_z, :, :]
-                if self.bump_segmentation is not None
-                else None
+        if self._mpr_lve_active():
+            if _mpr_force_level is not None:
+                level = int(_mpr_force_level)
+            elif self._mpr_is_interacting():
+                level = self._mpr_preview_level()
+            else:
+                level = 0
+            store = self.volume_store
+            level = store.best_available_level(level) if level > 0 else 0
+            slice_data, bump_slice, void_slice = self._extract_teaching_mpr_slices_from_store(
+                orientation, slice_idx, level
             )
-            void_slice = (
-                self.void_segmentation[actual_z, :, :]
-                if self.void_segmentation is not None
-                else None
-            )
-        elif orientation == "coronal":
-            slice_data = np.flipud(self.volume_data[:, slice_idx, :])
-            bump_slice = (
-                np.flipud(self.bump_segmentation[:, slice_idx, :])
-                if self.bump_segmentation is not None
-                else None
-            )
-            void_slice = (
-                np.flipud(self.void_segmentation[:, slice_idx, :])
-                if self.void_segmentation is not None
-                else None
-            )
+            if orientation == "axial":
+                if getattr(self, "reverse_z", False):
+                    actual_z = self.volume_data.shape[0] - 1 - slice_idx
+                else:
+                    actual_z = slice_idx
+            if level > 0:
+                self._schedule_mpr_idle_refine(orientation, gen)
+                if getattr(self, "_mpr_last_logged_level", None) != (orientation, level):
+                    self._mpr_last_logged_level = (orientation, level)
+                    print(f"[MPR] Teaching {orientation} preview level={level} (idle → refine L0)")
         else:
-            slice_data = np.transpose(self.volume_data[:, :, slice_idx])
-            bump_slice = (
-                np.transpose(self.bump_segmentation[:, :, slice_idx])
-                if self.bump_segmentation is not None
-                else None
-            )
-            void_slice = (
-                np.transpose(self.void_segmentation[:, :, slice_idx])
-                if self.void_segmentation is not None
-                else None
-            )
+            if orientation == "axial":
+                if getattr(self, "reverse_z", False):
+                    actual_z = self.volume_data.shape[0] - 1 - slice_idx
+                slice_data = np.flipud(self.volume_data[actual_z, :, :])
+                bump_slice = (
+                    np.flipud(self.bump_segmentation[actual_z, :, :])
+                    if self.bump_segmentation is not None
+                    else None
+                )
+                void_slice = (
+                    np.flipud(self.void_segmentation[actual_z, :, :])
+                    if self.void_segmentation is not None
+                    else None
+                )
+            elif orientation == "coronal":
+                slice_data = np.flipud(self.volume_data[:, slice_idx, :])
+                bump_slice = (
+                    np.flipud(self.bump_segmentation[:, slice_idx, :])
+                    if self.bump_segmentation is not None
+                    else None
+                )
+                void_slice = (
+                    np.flipud(self.void_segmentation[:, slice_idx, :])
+                    if self.void_segmentation is not None
+                    else None
+                )
+            else:
+                slice_data = np.transpose(self.volume_data[:, :, slice_idx])
+                bump_slice = (
+                    np.transpose(self.bump_segmentation[:, :, slice_idx])
+                    if self.bump_segmentation is not None
+                    else None
+                )
+                void_slice = (
+                    np.transpose(self.void_segmentation[:, :, slice_idx])
+                    if self.void_segmentation is not None
+                    else None
+                )
+
+        # Stale cancel: skip VTK upload if a newer generation started
+        if self._mpr_lve_active():
+            current = getattr(self, "_mpr_gen", {}).get(orientation, gen)
+            if current != gen:
+                return
+            applied = getattr(self, "_mpr_applied_gen", None)
+            if applied is None:
+                self._mpr_applied_gen = {"axial": 0, "coronal": 0, "sagittal": 0}
+                applied = self._mpr_applied_gen
+            applied[orientation] = gen
 
         h, w = slice_data.shape
         renderer.RemoveAllViewProps()
@@ -4286,12 +4379,31 @@ class SegmentationPipelineMixin:
             return False
 
     def set_volume_data(self, data, file_path=None):
-        """Set volume data programmatically  used by Online mode"""
-        if data is None: return
-        
-        if data.ndim == 2:
-            data = data[np.newaxis, :, :]
-            
+        """Set volume data programmatically — used by Online mode."""
+        if data is None:
+            return
+
+        from inno3d.core.volume_store import VolumeArrayProxy, VolumeStore, wrap_volume_for_viewer
+
+        # Accept Viewer store/proxy without forcing a second full dense materialization.
+        prev_store = getattr(self, "volume_store", None)
+        if prev_store is not None and hasattr(prev_store, "close"):
+            try:
+                prev_store.close()
+            except Exception:
+                pass
+        self.volume_store = None
+
+        if isinstance(data, VolumeStore):
+            store, proxy = wrap_volume_for_viewer(data)
+            self.volume_store = store
+            data = proxy
+        elif isinstance(data, VolumeArrayProxy):
+            self.volume_store = getattr(data, "store", None)
+        else:
+            if getattr(data, "ndim", 0) == 2:
+                data = data[np.newaxis, :, :]
+
         # Clear previous segmentations to prevent shape mismatch indexing errors
         self.bump_segmentation = None
         self.void_segmentation = None
@@ -4303,47 +4415,66 @@ class SegmentationPipelineMixin:
             self.selected_highlight_objects = []
         if hasattr(self, '_refresh_stats_table'):
             self._refresh_stats_table()
-            
+
         self.volume_data = data
         z, y, x = data.shape
-        
+
+        self._mpr_gen = {'axial': 0, 'coronal': 0, 'sagittal': 0}
+        self._mpr_applied_gen = {'axial': 0, 'coronal': 0, 'sagittal': 0}
+        self._mpr_interacting = False
+        self._mpr_refine_level = {'axial': 0, 'coronal': 0, 'sagittal': 0}
+
         # Update sliders
-        self.current_slices = {'axial': z//2, 'coronal': y//2, 'sagittal': x//2}
-        
+        self.current_slices = {'axial': z // 2, 'coronal': y // 2, 'sagittal': x // 2}
+
         self.axial_slice_slider.setMaximum(z - 1)
         self.axial_slice_slider.setValue(z // 2)
         self.axial_slice_label.setText(f"{z//2} / {z-1}")
-        
+
         self.coronal_slice_slider.setMaximum(y - 1)
         self.coronal_slice_slider.setValue(y // 2)
         self.coronal_slice_label.setText(f"{y//2} / {y-1}")
-        
+
         self.sagittal_slice_slider.setMaximum(x - 1)
         self.sagittal_slice_slider.setValue(x // 2)
         self.sagittal_slice_label.setText(f"{x//2} / {x-1}")
-        
+
         if file_path:
             self.input_path_input.setText(file_path)
             if self.config:
                 self.config.inputPath = file_path.encode('utf-8')
-        
+
         # Initialize ROI Z-range to cover the full volume by default
         if hasattr(self, 'roi_z_start_spin') and hasattr(self, 'roi_z_end_spin'):
             self.roi_z_start_spin.setRange(0, z - 1)
             self.roi_z_start_spin.setValue(0)
             self.roi_z_end_spin.setRange(0, z)
             self.roi_z_end_spin.setValue(z)
-        
-        # Auto window/level
-        if data.dtype == np.uint16:
-            data_min = np.percentile(data, 1)
-            data_max = np.percentile(data, 99)
-            self.window_level = {o: (data_max-data_min, (data_max+data_min)/2) for o in ['axial', 'coronal', 'sagittal']}
-        
-        # Refresh views
+
+        # Window/level — avoid full-volume min/max scan on large Online volumes.
+        store = getattr(self, "volume_store", None)
+        if store is not None:
+            data_min, data_max = store.metadata.value_range
+        elif isinstance(data, VolumeArrayProxy):
+            data_min, data_max = float(data.min()), float(data.max())
+        else:
+            total = int(getattr(data, "size", z * y * x))
+            if total > 10_000_000:
+                step = max(1, total // 2_000_000)
+                sampled = data.ravel()[::step]
+                data_min = float(sampled.min())
+                data_max = float(sampled.max())
+            else:
+                data_min = float(data.min())
+                data_max = float(data.max())
+        window = float(data_max - data_min)
+        level = float((data_max + data_min) / 2.0)
+        self.window_level = {o: (window, level) for o in ['axial', 'coronal', 'sagittal']}
+
+        # Refresh Teaching planes lightly (Online UI focuses on Viewer MPR).
         for o in ['axial', 'coronal', 'sagittal']:
             self.update_plane_view(o)
-        
+
         self.check_ready_state()
 
     def set_segmentation_results(

@@ -18,11 +18,12 @@ def test_labeled_slice_orientation():
     lab = np.zeros((4, 5, 6), dtype=np.int32)
     lab[1, 2, 3] = 7
     ax = labeled_slice_for_orientation(lab, "axial", 1)
+    # Axial display applies flipud (Y): storage y=2 → display row 2 when Y=5
     assert ax is not None and ax[2, 3] == 7
-    # reverse_z: display 0 → storage Z-1
+    # reverse_z: display slice 0 → storage Z-1; flipud moves y=0 → bottom row
     lab[-1, 0, 0] = 11
     ax_r = labeled_slice_for_orientation(lab, "axial", 0, reverse_z=True)
-    assert ax_r is not None and ax_r[0, 0] == 11
+    assert ax_r is not None and ax_r[4, 0] == 11
 
 
 def test_build_highlight_fill_and_outline():

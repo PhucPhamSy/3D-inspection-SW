@@ -28,6 +28,8 @@ from inno3d.core.enhanced_volume import (
     # Processing
     process_folder,
     process_slice_range,
+    has_process_volume_buffer,
+    process_volume_buffer,
     # Progress helper
     make_progress_callback,
 )
@@ -50,6 +52,8 @@ __all__ = [
     # Processing
     "process_folder",
     "process_slice_range",
+    "has_process_volume_buffer",
+    "process_volume_buffer",
     # Progress
     "make_progress_callback",
 ]

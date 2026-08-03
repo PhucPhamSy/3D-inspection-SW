@@ -1539,6 +1539,10 @@ class SegmentationUIMixin:
         slice_slider.setFixedHeight(16)
         slice_slider.setToolTip("Drag or scroll (step 1) to change slice")
         slice_slider.valueChanged.connect(lambda value, o=orientation: self.update_slice(o, value))
+        if hasattr(self, "mark_mpr_interaction_start"):
+            slice_slider.sliderPressed.connect(self.mark_mpr_interaction_start)
+        if hasattr(self, "mark_mpr_interaction_end"):
+            slice_slider.sliderReleased.connect(self.mark_mpr_interaction_end)
         slice_layout.addWidget(slice_slider, 1)
 
         slice_label = QLabel("50 / 100")
@@ -3170,14 +3174,11 @@ class SegmentationUIMixin:
             self._original_window_level = {o: self.window_level.get(o, (255, 127.5))
                                             for o in ['axial', 'coronal', 'sagittal']}
 
-        if cropped.dtype == np.uint16:
-            data_min = float(np.percentile(cropped, 1))
-            data_max = float(np.percentile(cropped, 99))
-            window = data_max - data_min
-            level = (data_max + data_min) / 2
-            wl = (window, level)
-        else:
-            wl = (255, 127.5)
+        data_min = float(cropped.min())
+        data_max = float(cropped.max())
+        window = float(data_max - data_min)
+        level = float((data_max + data_min) / 2.0)
+        wl = (window, level)
         for orientation in ['axial', 'coronal', 'sagittal']:
             self.window_level[orientation] = wl
 
@@ -3256,12 +3257,12 @@ class SegmentationUIMixin:
                     orientation, self.window_level.get(orientation, (255, 127.5))
                 )
             self._original_window_level = None
-        elif self.volume_data.dtype == np.uint16:
+        elif self.volume_data is not None:
             # Fallback: only compute if no cache
-            data_min = float(np.percentile(self.volume_data, 1))
-            data_max = float(np.percentile(self.volume_data, 99))
-            window = data_max - data_min
-            level = (data_max + data_min) / 2
+            data_min = float(self.volume_data.min())
+            data_max = float(self.volume_data.max())
+            window = float(data_max - data_min)
+            level = float((data_max + data_min) / 2.0)
             for orientation in ['axial', 'coronal', 'sagittal']:
                 self.window_level[orientation] = (window, level)
 
@@ -4667,6 +4668,7 @@ class SegmentationUIMixin:
             self._3d_c2_actor = None
 
         vol = self.volume_data
+        store = getattr(self, "volume_store", None)
         mode = (
             self._3d_mode_combo.currentText()
             if hasattr(self, "_3d_mode_combo")
@@ -4692,28 +4694,83 @@ class SegmentationUIMixin:
         else:
             render_data = vol
 
-        # Full resolution — same as viewer.py (no downsample)
-        z, y, x = render_data.shape
-
         # Spacing: identical to 3D Viewer MultiPlanarView (never invent voxel-size scale)
         self._sync_3d_spacing_from_viewer()
         spacing = self._get_3d_world_spacing()
 
+        # Teaching follows Viewer source-of-truth upload planning.
+        from inno3d.features.viewer.volume_3d import compute_viewer_3d_upload_plan
+
+        upload = compute_viewer_3d_upload_plan(
+            render_data,
+            spacing=(
+                float(spacing[0]),
+                float(spacing[1]),
+                float(spacing[2]),
+            ),
+            store=(store if mode != "Seg Only" else None),
+            host=self,
+            proxy_min_level=2,
+        )
+        vol_for_3d = upload["volume"]
+        level_3d = int(upload["level"])
+        used_coarse = bool(upload["used_lve_coarse"])
+        skipped_full_upload = bool(upload["skipped_full_upload"])
+        source_tag = upload["source"]
+
+        if source_tag == "store":
+            print(
+                f"[TEACHING 3D] coarse upload level={level_3d} "
+                f"shape={tuple(vol_for_3d.shape)} "
+                f"approx_bytes={upload['approx_bytes'] / (1024 ** 2):.1f} MiB "
+                f"(full_level0={upload['full_level0_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"budget={upload['budget_bytes'] / (1024 ** 2):.0f} MiB, "
+                f"full_upload_skipped={skipped_full_upload}, source=store)"
+            )
+        elif used_coarse:
+            print(
+                f"[TEACHING 3D] auto-coarse level={level_3d} "
+                f"shape={tuple(vol_for_3d.shape)} "
+                f"approx_bytes={upload['approx_bytes'] / (1024 ** 2):.1f} MiB "
+                f"(full_level0={upload['full_level0_bytes'] / (1024 ** 2):.1f} MiB, "
+                f"budget={upload['budget_bytes'] / (1024 ** 2):.0f} MiB, "
+                f"full_upload_skipped=True, source={source_tag})"
+            )
+        else:
+            print(
+                f"[TEACHING 3D] full upload level=0 shape={tuple(vol_for_3d.shape)} "
+                f"approx_bytes={upload['approx_bytes'] / (1024 ** 2):.1f} MiB "
+                f"(full_upload_skipped=False, source={source_tag})"
+            )
+
+        z, y, x = vol_for_3d.shape
+        factor = 1 << int(level_3d)
+        spacing_3d = upload["spacing_3d"]
+
         # Convert to VTK (using Fortran-order transpose like viewer)
         vtk_data = vtk.vtkImageData()
         vtk_data.SetDimensions(x, y, z)
-        vtk_data.SetSpacing(spacing[0], spacing[1], spacing[2])
+        vtk_data.SetSpacing(spacing_3d[0], spacing_3d[1], spacing_3d[2])
         vtk_data.SetOrigin(0.0, 0.0, 0.0)
 
-        data_fortran = np.transpose(render_data, (2, 1, 0))
-        flat = np.ascontiguousarray(data_fortran.flatten("F"))
-        if render_data.dtype == np.uint16:
-            vtk_arr = numpy_support.numpy_to_vtk(flat, deep=True, array_type=vtk.VTK_UNSIGNED_SHORT)
-        elif render_data.dtype == np.uint8:
-            vtk_arr = numpy_support.numpy_to_vtk(flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
+        src_dtype = vol_for_3d.dtype
+        xyz_f = np.asfortranarray(np.transpose(vol_for_3d, (2, 1, 0)))
+        flat = xyz_f.ravel(order="F")
+        if src_dtype == np.uint16:
+            vtk_type = vtk.VTK_UNSIGNED_SHORT
+        elif src_dtype == np.uint8:
+            vtk_type = vtk.VTK_UNSIGNED_CHAR
         else:
             flat = flat.astype(np.float32)
-            vtk_arr = numpy_support.numpy_to_vtk(flat, deep=True, array_type=vtk.VTK_FLOAT)
+            xyz_f = flat
+            vtk_type = vtk.VTK_FLOAT
+        if used_coarse:
+            self._teaching_vtk_numpy_pin = flat
+            vtk_arr = numpy_support.numpy_to_vtk(flat, deep=False, array_type=vtk_type)
+        else:
+            self._teaching_vtk_numpy_pin = None
+            vtk_arr = numpy_support.numpy_to_vtk(flat, deep=True, array_type=vtk_type)
+            del xyz_f
         vtk_data.GetPointData().SetScalars(vtk_arr)
         self._3d_vtk_data = vtk_data
 
@@ -4787,9 +4844,14 @@ class SegmentationUIMixin:
 
         renderer.AddVolume(volume_actor)
         self._3d_volume_actor = volume_actor
-        self._3d_ds = 1
-        self._3d_spacing = (spacing[0], spacing[1], spacing[2])
+        self._3d_ds = factor
+        self._3d_spacing = (spacing_3d[0], spacing_3d[1], spacing_3d[2])
         self._3d_original_spacing = (spacing[0], spacing[1], spacing[2])
+        print(
+            f"[PERF] Teaching 3D ready level={level_3d} upload_shape=({z},{y},{x}) "
+            f"spacing=({spacing_3d[0]:g},{spacing_3d[1]:g},{spacing_3d[2]:g}) "
+            f"full_upload_skipped={skipped_full_upload} source={source_tag}"
+        )
 
         # ── Seg Overlay: medical glass shells (shared with 3D Viewer) ──
         if mode == "Seg Overlay":

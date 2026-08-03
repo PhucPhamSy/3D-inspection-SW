@@ -50,7 +50,7 @@ def labeled_slice_for_orientation(
         actual = (Z - 1 - slice_idx) if reverse_z else slice_idx
         if not (0 <= actual < Z):
             return None
-        return labeled[actual, :, :]
+        return np.flipud(labeled[actual, :, :])
     if orientation == "coronal":
         if not (0 <= slice_idx < Y):
             return None

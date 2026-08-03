@@ -138,6 +138,8 @@ class SegmentationMPRMixin:
                     self._crosshair_drag_mode = ch_hit[1]
                     self._crosshair_hover = ch_hit
                     self._is_dragging_crosshair = True
+                    if hasattr(self, "mark_mpr_interaction_start"):
+                        self.mark_mpr_interaction_start()
                     self.handle_crosshair_click(orientation, event.pos(), mode=ch_hit[1])
                     self.update_2d_crosshair(orientation)
                     return True
@@ -147,6 +149,8 @@ class SegmentationMPRMixin:
                 if getattr(self, '_is_dragging_crosshair', False):
                     self._is_dragging_crosshair = False
                     self._crosshair_drag_mode = None
+                    if hasattr(self, "mark_mpr_interaction_end"):
+                        self.mark_mpr_interaction_end()
                     return True
 
             elif event.type() == QEvent.Wheel:
@@ -196,7 +200,8 @@ class SegmentationMPRMixin:
             
             coord_str = ""
             if orientation == 'axial':
-                px, py = int(world_pos[0]), int(world_pos[1])
+                px = int(world_pos[0])
+                py = (vol_y - 1) - int(world_pos[1])
                 if 0 <= px < vol_x and 0 <= py < vol_y:
                     actual_z = (vol_z - 1 - slice_idx) if getattr(self, 'reverse_z', False) else slice_idx
                     value = self.volume_data[actual_z, py, px]
@@ -250,6 +255,147 @@ class SegmentationMPRMixin:
             self._3d_ch_debounce_timer_t.stop()
         self._3d_ch_debounce_timer_t.start()
 
+    # ── Progressive MPR (large_volume_engine) — Viewer parity ───────────
+
+    def _mpr_lve_active(self) -> bool:
+        from inno3d.core.volume_store import large_volume_engine_enabled
+
+        return (
+            large_volume_engine_enabled(self)
+            and getattr(self, "volume_store", None) is not None
+        )
+
+    def _mpr_is_interacting(self) -> bool:
+        return bool(
+            getattr(self, "_mpr_interacting", False)
+            or getattr(self, "_is_dragging_crosshair", False)
+        )
+
+    def _mpr_preview_level(self) -> int:
+        if not self._mpr_is_interacting():
+            return 0
+        store = getattr(self, "volume_store", None)
+        if store is None:
+            return 0
+        for cand in (2, 1):
+            if store._level_available(cand) or cand == 1:
+                return cand
+        return 0
+
+    def _bump_mpr_generation(self, orientation: str) -> int:
+        gens = getattr(self, "_mpr_gen", None)
+        if gens is None:
+            self._mpr_gen = {"axial": 0, "coronal": 0, "sagittal": 0}
+            gens = self._mpr_gen
+        gens[orientation] = int(gens.get(orientation, 0)) + 1
+        return gens[orientation]
+
+    def _schedule_mpr_idle_refine(self, orientation: str, gen: int) -> None:
+        if not self._mpr_lve_active():
+            return
+        timers = getattr(self, "_mpr_refine_timers", None)
+        if timers is None:
+            self._mpr_refine_timers = {}
+            timers = self._mpr_refine_timers
+        old = timers.get(orientation)
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(100)
+
+        def _refine():
+            if not self._mpr_lve_active():
+                return
+            if self._mpr_is_interacting():
+                self._schedule_mpr_idle_refine(orientation, gen)
+                return
+            current = getattr(self, "_mpr_gen", {}).get(orientation, -1)
+            if current != gen:
+                return
+            self.update_plane_view(orientation, preserve_camera=True, _mpr_force_level=0)
+
+        timer.timeout.connect(_refine)
+        timers[orientation] = timer
+        timer.start()
+
+    def mark_mpr_interaction_start(self) -> None:
+        self._mpr_interacting = True
+
+    def mark_mpr_interaction_end(self) -> None:
+        self._mpr_interacting = False
+        if not self._mpr_lve_active():
+            return
+        for ori in ("axial", "coronal", "sagittal"):
+            gen = getattr(self, "_mpr_gen", {}).get(ori, 0)
+            self._schedule_mpr_idle_refine(ori, gen)
+
+    def _extract_teaching_mpr_slices_from_store(self, orientation, slice_idx, level: int):
+        """Level-aware volume slice + level-0 bump/void masks (Teaching parity)."""
+        from inno3d.core.volume_store import upsample_slice_nearest
+        from inno3d.services.volume_pyramid import level_downsample_factor
+
+        store = self.volume_store
+        z, y, x = store.shape
+        factor = level_downsample_factor(level)
+
+        if orientation == "axial":
+            actual_z = slice_idx
+            if getattr(self, "reverse_z", False):
+                actual_z = z - 1 - slice_idx
+            lvl_idx = actual_z // factor
+            slice_data = store.get_slice("axial", lvl_idx, level=level)
+            if level > 0:
+                slice_data = upsample_slice_nearest(slice_data, (y, x))
+            bump_slice = (
+                np.flipud(self.bump_segmentation[actual_z, :, :])
+                if self.bump_segmentation is not None
+                else None
+            )
+            void_slice = (
+                np.flipud(self.void_segmentation[actual_z, :, :])
+                if self.void_segmentation is not None
+                else None
+            )
+            return slice_data, bump_slice, void_slice
+
+        if orientation == "coronal":
+            lvl_idx = slice_idx // factor
+            slice_data = store.get_slice("coronal", lvl_idx, level=level)
+            if level > 0:
+                slice_data = upsample_slice_nearest(slice_data, (z, x))
+            bump_slice = (
+                np.flipud(self.bump_segmentation[:, slice_idx, :])
+                if self.bump_segmentation is not None
+                else None
+            )
+            void_slice = (
+                np.flipud(self.void_segmentation[:, slice_idx, :])
+                if self.void_segmentation is not None
+                else None
+            )
+            return slice_data, bump_slice, void_slice
+
+        lvl_idx = slice_idx // factor
+        slice_data = store.get_slice("sagittal", lvl_idx, level=level)
+        if level > 0:
+            slice_data = upsample_slice_nearest(slice_data, (y, z))
+        bump_slice = (
+            np.transpose(self.bump_segmentation[:, :, slice_idx])
+            if self.bump_segmentation is not None
+            else None
+        )
+        void_slice = (
+            np.transpose(self.void_segmentation[:, :, slice_idx])
+            if self.void_segmentation is not None
+            else None
+        )
+        return slice_data, bump_slice, void_slice
+
     def updatePoint(self, newX, newY, newZ):
         """Update crosshair + slices; only full re-render views whose slice changed."""
         if self.volume_data is None:
@@ -260,6 +406,12 @@ class SegmentationMPRMixin:
         newZ = max(0, min(int(newZ), vol_z - 1))
 
         oldX, oldY, oldZ = self.crosshair_position
+
+        if hasattr(self, "mark_mpr_interaction_start") and getattr(
+            self, "_is_dragging_crosshair", False
+        ):
+            self.mark_mpr_interaction_start()
+
         self.crosshair_position = [newX, newY, newZ]
 
         changed = {
@@ -359,9 +511,10 @@ class SegmentationMPRMixin:
         if renderer is None:
             return None
         vol_z, vol_y, vol_x = self.volume_data.shape
+        # Axial/coronal world Y must match np.flipud display + pick un-flip.
         if orientation == 'axial':
             cx_w = float(self.crosshair_position[0])
-            cy_w = float(self.crosshair_position[1])
+            cy_w = float((vol_y - 1) - self.crosshair_position[1])
         elif orientation == 'coronal':
             cx_w = float(self.crosshair_position[0])
             cy_w = float((vol_z - 1) - self.crosshair_position[2])
@@ -447,7 +600,7 @@ class SegmentationMPRMixin:
         vol_z, vol_y, vol_x = self.volume_data.shape
         if orientation == 'axial':
             cx_w = float(self.crosshair_position[0])
-            cy_w = float(self.crosshair_position[1])
+            cy_w = float((vol_y - 1) - self.crosshair_position[1])
             h_pos, h_neg = '+X', '-X'
             v_pos, v_neg = '+Y', '-Y'
             h_color = (1.0, 0.192, 0.192)
@@ -578,6 +731,8 @@ class SegmentationMPRMixin:
     def handle_crosshair_click(self, orientation, pos, mode='center'):
         """Dragonfly grab modes: center / h / v (same as 3D Viewer)."""
         try:
+            if hasattr(self, "mark_mpr_interaction_start"):
+                self.mark_mpr_interaction_start()
             widget = getattr(self, f'{orientation}_widget')
             renderer = getattr(self, f'{orientation}_renderer')
 
@@ -594,7 +749,7 @@ class SegmentationMPRMixin:
 
             if orientation == 'axial':
                 pickX = int(round(world_pos[0]))
-                pickY = int(round(world_pos[1]))
+                pickY = (vol_y - 1) - int(round(world_pos[1]))
                 if mode in ('center', 'v'):
                     newX = pickX
                 if mode in ('center', 'h'):
@@ -676,7 +831,7 @@ class SegmentationMPRMixin:
                 h_color = (1.0, 0.192, 0.192)  # X: Red
                 v_color = (0.223, 1.0, 0.078)  # Y: Green
                 cx_w = float(self.crosshair_position[0])
-                cy_w = float(self.crosshair_position[1])
+                cy_w = float((vol_y - 1) - self.crosshair_position[1])
             elif orientation == 'coronal':
                 labels = ['+X', '-X', '-Z', '+Z'] # Top 0 is -Z, Bottom Max is +Z
                 h_color = (1.0, 0.192, 0.192)  # X: Red
@@ -866,13 +1021,60 @@ class SegmentationMPRMixin:
     def update_slice(self, orientation, value):
         if self.volume_data is None:
             return
+
+        if hasattr(self, "mark_mpr_interaction_start"):
+            self.mark_mpr_interaction_start()
+            end_timer = getattr(self, "_mpr_slider_end_timer", None)
+            if end_timer is None:
+                end_timer = QTimer(self)
+                end_timer.setSingleShot(True)
+                end_timer.setInterval(140)
+                end_timer.timeout.connect(self._end_mpr_slider_interaction)
+                self._mpr_slider_end_timer = end_timer
+            end_timer.start()
+
+        if not hasattr(self, '_slice_update_pending'):
+            self._slice_update_pending = {}
+            self._slice_throttle_timer = QTimer(self)
+            self._slice_throttle_timer.setSingleShot(True)
+            self._slice_throttle_timer.setInterval(16)
+            self._slice_throttle_timer.timeout.connect(self._flush_slice_update)
+
+        self._slice_update_pending[orientation] = int(value)
+
+        if not self._slice_throttle_timer.isActive():
+            self._flush_slice_update()
+            self._slice_throttle_timer.start()
+
+    def _end_mpr_slider_interaction(self):
+        for ori in ("axial", "coronal", "sagittal"):
+            sl = getattr(self, f"{ori}_slice_slider", None)
+            if sl is not None and hasattr(sl, "isSliderDown") and sl.isSliderDown():
+                end_timer = getattr(self, "_mpr_slider_end_timer", None)
+                if end_timer is not None:
+                    end_timer.start()
+                return
+        if hasattr(self, "mark_mpr_interaction_end"):
+            self.mark_mpr_interaction_end()
+
+    def _flush_slice_update(self):
+        if not hasattr(self, '_slice_update_pending') or not self._slice_update_pending:
+            return
+
+        pending = self._slice_update_pending.copy()
+        self._slice_update_pending.clear()
+
         newX, newY, newZ = self.crosshair_position
-        if orientation == 'axial':
-            newZ = value
-        elif orientation == 'coronal':
-            newY = value
-        elif orientation == 'sagittal':
-            newX = value
-        
+        for orientation, val in pending.items():
+            if orientation == 'axial':
+                newZ = val
+            elif orientation == 'coronal':
+                newY = val
+            elif orientation == 'sagittal':
+                newX = val
+
         self.updatePoint(newX, newY, newZ)
+
+        if self._slice_update_pending:
+            self._slice_throttle_timer.start()
 

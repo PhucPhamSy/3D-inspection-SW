@@ -934,7 +934,8 @@ class EnhancementThread(QThread):
     finished = pyqtSignal(bool, str)  # success, error_message
 
     def __init__(self, dll_dir, model_path, trt_cache_path, use_gpu, gpu_device_id,
-                 input_dir, output_dir, start_slice=-1, end_slice=-1):
+                 input_dir=None, output_dir=None, start_slice=-1, end_slice=-1,
+                 volume_u16=None):
         super().__init__()
         self.dll_dir = dll_dir
         self.model_path = model_path
@@ -945,6 +946,10 @@ class EnhancementThread(QThread):
         self.output_dir = output_dir
         self.start_slice = start_slice
         self.end_slice = end_slice
+        # Optional in-memory volume (ZYX uint16) — preferred when DLL >= 0.0.1
+        self.volume_u16 = volume_u16
+        self.enhanced_volume = None  # filled on buffer-path success
+        self.used_buffer_api = False
 
     def run(self):
         try:
@@ -1004,6 +1009,56 @@ class EnhancementThread(QThread):
                     self.progress.emit(pct, message)
 
             cb = enhanced_volume.make_progress_callback(progress_cb)
+
+            # Prefer in-memory path (BumpVoid_ISP_ENH >= 0.0.1) — no temp TIFF export
+            use_buffer = (
+                self.volume_u16 is not None
+                and hasattr(enhanced_volume, "has_process_volume_buffer")
+                and enhanced_volume.has_process_volume_buffer()
+            )
+            if use_buffer:
+                import numpy as np
+                import tifffile
+
+                self.progress.emit(25, "Enhancing volume (in-memory buffer)...")
+                src = np.ascontiguousarray(self.volume_u16, dtype=np.uint16)
+                dst = np.empty_like(src)
+                result = enhanced_volume.process_volume_buffer(
+                    src,
+                    dst,
+                    start_slice=self.start_slice,
+                    end_slice=self.end_slice,
+                    callback=cb,
+                )
+                if result < 0:
+                    err = enhanced_volume.get_last_error()
+                    self.finished.emit(False, f"Enhancement failed: {err}")
+                    return
+                if result == 0:
+                    self.finished.emit(False, "Enhancement: No slices processed")
+                    return
+
+                self.enhanced_volume = dst
+                self.used_buffer_api = True
+                # Optional archive under Results (single multipage, not 2500 temp files)
+                if self.output_dir:
+                    try:
+                        os.makedirs(self.output_dir, exist_ok=True)
+                        out_path = os.path.join(self.output_dir, "Enhanced_Volume.tif")
+                        tifffile.imwrite(out_path, dst, imagej=True)
+                    except Exception as e:
+                        self.progress.emit(95, f"Archive write skipped: {e}")
+                self.progress.emit(100, f"Enhanced {result} slices (buffer)")
+                self.finished.emit(True, "")
+                return
+
+            if not self.input_dir or not self.output_dir:
+                self.finished.emit(
+                    False,
+                    "Enhancement: folder path required (DLL has no ProcessVolumeBuffer). "
+                    "Deploy BumpVoid_ISP_ENH >= 0.0.1 or provide input_dir.",
+                )
+                return
 
             self.progress.emit(25, "Enhancing volume slices...")
             if self.start_slice >= 0 and self.end_slice >= 0:
