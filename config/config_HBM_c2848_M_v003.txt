@@ -63,7 +63,7 @@ NG_THRESHOLD = 1.0
 
 # ── Enhancement (ONNX Model) ─────────────────
 ENHANCEMENT_ENABLED = true
-ENHANCED_MODEL_PATH = "E:\semiconductor\HBM_DEV_FOR_PROD\DEV\all_v2\V2\restormer_nano_e9900_dynamic_ir9_fp16.onnx"
+ENHANCED_MODEL_PATH = "E:\semiconductor\HBM_DEV_FOR_PROD\DEV\all_v2\V6\fast_enhance_prod_dynamic_ir9_fp16.onnx"
 ENHANCED_TRT_CACHE_PATH = ./TRT_Cache
 ENHANCED_USE_GPU = true
 ENHANCED_GPU_DEVICE_ID = 0

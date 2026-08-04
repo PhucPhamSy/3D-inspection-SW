@@ -73,6 +73,105 @@ def _log(msg):
     print(f"[ONLINE {ts}] {msg}")
 
 
+class _FdcMonitorWorker(QThread):
+    """Collect FDC stats + TCP send off the UI thread.
+
+    When Recon is not listening, a UI-thread connect() with 1.5s timeout
+    freezes hover/zoom/tab switches every interval — this worker prevents that.
+    """
+
+    log_message = pyqtSignal(str, object)  # msg, optional QColor / theme color
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = False
+        self._enabled = True
+        self._host = "127.0.0.1"
+        self._port = 8100
+        self._interval_sec = 1.0
+        self._timeout_sec = 0.35
+        self._sock = None
+        self._last_error_log_ts = 0.0
+        self._cfg_gen = 0
+
+    def configure(self, *, enabled, host, port, interval_sec, timeout_sec=0.35):
+        self._enabled = bool(enabled)
+        self._host = str(host or "127.0.0.1")
+        self._port = int(port)
+        self._interval_sec = max(0.5, float(interval_sec))
+        self._timeout_sec = max(0.15, float(timeout_sec))
+        self._cfg_gen += 1
+        # Force reconnect with new endpoint on next tick.
+        self._close_socket()
+
+    def stop(self):
+        self._stop = True
+        self._close_socket()
+
+    def _close_socket(self):
+        sock = self._sock
+        self._sock = None
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def _emit_log(self, msg, color=None):
+        try:
+            self.log_message.emit(str(msg), color)
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
+        while not self._stop:
+            cfg_gen = self._cfg_gen
+            enabled = self._enabled
+            host = self._host
+            port = self._port
+            interval_sec = self._interval_sec
+            timeout_sec = self._timeout_sec
+
+            if enabled and not self._stop:
+                try:
+                    self._send_once(host, port, timeout_sec)
+                except Exception as e:
+                    self._close_socket()
+                    now = time.time()
+                    if now - self._last_error_log_ts >= 10.0:
+                        self._last_error_log_ts = now
+                        self._emit_log(
+                            f"send failed to {host}:{port}: {e}",
+                            SemiconductorTheme.ACCENT_WARNING,
+                        )
+
+            # Sleep in small chunks; wake early on stop / reconfigure.
+            deadline = time.time() + interval_sec
+            while not self._stop and time.time() < deadline:
+                if self._cfg_gen != cfg_gen:
+                    break
+                self.msleep(50)
+
+    def _send_once(self, host, port, timeout_sec):
+        sock = self._sock
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout_sec)
+            sock.connect((host, port))
+            self._sock = sock
+            self._emit_log(f"connected to Recon {host}:{port}")
+
+        cpu, mem, disks = OnlineModeMixin._online_collect_fdc_monitor_values()
+        payload = OnlineModeMixin._online_build_fdc_monitor_packet(cpu, mem, disks)
+        sock.sendall(payload)
+
+
 class OnlineModeMixin:
     def _online_walltime_begin(self, received_path):
         """Start wall-time tracking for Online receive → first MPR paint."""
@@ -377,6 +476,12 @@ class OnlineModeMixin:
             self._online_append_log(text, color)
 
     def _online_close_fdc_socket(self):
+        worker = getattr(self, "_fdc_monitor_worker", None)
+        if worker is not None:
+            try:
+                worker._close_socket()
+            except Exception:
+                pass
         sock = getattr(self, "_fdc_monitor_socket", None)
         if sock is None:
             return
@@ -425,39 +530,11 @@ class OnlineModeMixin:
             disks.append(value)
         return cpu, mem, disks
 
-    def _online_send_fdc_monitor_packet(self):
-        """Send one periodic FDC monitor packet to Recon endpoint."""
-        host = getattr(self, "_fdc_monitor_host", "127.0.0.1")
-        port = int(getattr(self, "_fdc_monitor_port", 8100))
-        timeout_s = float(getattr(self, "_fdc_monitor_timeout_sec", 1.5))
-        try:
-            sock = getattr(self, "_fdc_monitor_socket", None)
-            if sock is None:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout_s)
-                sock.connect((host, port))
-                self._fdc_monitor_socket = sock
-                self._online_log_fdc(f"connected to Recon {host}:{port}")
-
-            cpu, mem, disks = self._online_collect_fdc_monitor_values()
-            payload = self._online_build_fdc_monitor_packet(cpu, mem, disks)
-            sock.sendall(payload)
-            self._fdc_last_send_ok_ts = time.time()
-        except Exception as e:
-            self._online_close_fdc_socket()
-            now = time.time()
-            last = float(getattr(self, "_fdc_last_error_log_ts", 0.0))
-            if now - last >= 10.0:
-                self._fdc_last_error_log_ts = now
-                self._online_log_fdc(
-                    f"send failed to {host}:{port}: {e}",
-                    SemiconductorTheme.ACCENT_WARNING,
-                )
-
-    def _online_on_fdc_timer(self):
-        if not bool(getattr(self, "_fdc_monitor_enabled", True)):
-            return
-        self._online_send_fdc_monitor_packet()
+    def _online_on_fdc_worker_log(self, msg, color=None):
+        """UI-thread log sink for background FDC worker messages."""
+        if color is None:
+            color = SemiconductorTheme.TEXT_SECONDARY
+        self._online_log_fdc(msg, color)
 
     def _online_start_fdc_monitor_sender(self):
         """Start always-on periodic FDC monitor sender (independent of Online mode)."""
@@ -465,34 +542,56 @@ class OnlineModeMixin:
         self._fdc_monitor_host = str(get_online_fdc_target_host())
         self._fdc_monitor_port = int(get_online_fdc_target_port())
         self._fdc_monitor_interval_sec = float(get_online_fdc_interval_sec())
-        self._fdc_monitor_timeout_sec = 1.5
+        # Short connect timeout — failures must not stall UI or the worker loop.
+        self._fdc_monitor_timeout_sec = 0.35
+
+        # Stop legacy UI-thread timer if an older session left one running.
+        timer = getattr(self, "_fdc_monitor_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
 
         if not self._fdc_monitor_enabled:
+            worker = getattr(self, "_fdc_monitor_worker", None)
+            if worker is not None:
+                worker.configure(
+                    enabled=False,
+                    host=self._fdc_monitor_host,
+                    port=self._fdc_monitor_port,
+                    interval_sec=self._fdc_monitor_interval_sec,
+                    timeout_sec=self._fdc_monitor_timeout_sec,
+                )
             self._online_log_fdc("disabled by config (ONLINE.fdc_enabled=false)")
             return
 
-        timer = getattr(self, "_fdc_monitor_timer", None)
-        if timer is None:
-            timer = QTimer(self)
-            timer.timeout.connect(self._online_on_fdc_timer)
-            self._fdc_monitor_timer = timer
-
-        interval_ms = max(500, int(round(self._fdc_monitor_interval_sec * 1000.0)))
-        if not timer.isActive():
-            timer.start(interval_ms)
+        worker = getattr(self, "_fdc_monitor_worker", None)
+        if worker is None or not worker.isRunning():
+            worker = _FdcMonitorWorker(self)
+            worker.log_message.connect(self._online_on_fdc_worker_log)
+            self._fdc_monitor_worker = worker
+            worker.configure(
+                enabled=True,
+                host=self._fdc_monitor_host,
+                port=self._fdc_monitor_port,
+                interval_sec=self._fdc_monitor_interval_sec,
+                timeout_sec=self._fdc_monitor_timeout_sec,
+            )
+            worker.start()
         else:
-            timer.setInterval(interval_ms)
+            worker.configure(
+                enabled=True,
+                host=self._fdc_monitor_host,
+                port=self._fdc_monitor_port,
+                interval_sec=self._fdc_monitor_interval_sec,
+                timeout_sec=self._fdc_monitor_timeout_sec,
+            )
 
         self._online_log_fdc(
-            f"always-on sender started: {self._fdc_monitor_host}:{self._fdc_monitor_port} "
+            f"always-on sender started (background): {self._fdc_monitor_host}:{self._fdc_monitor_port} "
             f"every {self._fdc_monitor_interval_sec:.1f}s"
         )
-        # Prime CPU counters and push first packet immediately.
-        try:
-            psutil.cpu_percent(interval=None)
-        except Exception:
-            pass
-        self._online_send_fdc_monitor_packet()
 
     def _online_stop_fdc_monitor_sender(self):
         """Stop periodic FDC monitor sender and close socket."""
@@ -502,6 +601,16 @@ class OnlineModeMixin:
                 timer.stop()
             except Exception:
                 pass
+
+        worker = getattr(self, "_fdc_monitor_worker", None)
+        if worker is not None:
+            try:
+                worker.stop()
+                worker.wait(1500)
+            except Exception:
+                pass
+            self._fdc_monitor_worker = None
+
         self._online_close_fdc_socket()
         self._online_log_fdc("always-on sender stopped")
 

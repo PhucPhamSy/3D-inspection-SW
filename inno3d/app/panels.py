@@ -253,10 +253,10 @@ class PanelsMixin:
         self.multiplanar_tab.clear_masks_btn = b_clear
         self.multiplanar_tab.crosshair_check = self.cross_btn
         
-        # Timer to update bullets
+        # Timer to update bullets (slow poll; polish only when load-state changes)
         self.bullet_timer = QTimer(self)
         self.bullet_timer.timeout.connect(self._update_sidebar_bullets)
-        self.bullet_timer.start(500)
+        self.bullet_timer.start(2000)
         
         return panel
 

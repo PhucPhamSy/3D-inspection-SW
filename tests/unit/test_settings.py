@@ -77,6 +77,56 @@ class TestGetOnlinePort:
                 assert settings.get_online_port() == 9000
 
 
+class TestOnlineFdcSettings:
+    def test_defaults(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ini = Path(tmpdir) / "app_config.ini"
+            with patch("inno3d.app.settings.app_config_ini_path", return_value=ini):
+                assert settings.get_online_fdc_enabled() is True
+                assert settings.get_online_fdc_target_host() == "127.0.0.1"
+                assert settings.get_online_fdc_target_port() == 8100
+                assert settings.get_online_fdc_interval_sec() == 1.0
+
+    def test_custom_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ini = Path(tmpdir) / "app_config.ini"
+            ini.write_text(
+                "[ONLINE]\n"
+                "fdc_enabled = false\n"
+                "fdc_target_host = 192.168.1.112\n"
+                "fdc_target_port = 8123\n"
+                "fdc_interval_sec = 2.5\n",
+                encoding="utf-8",
+            )
+            with patch("inno3d.app.settings.app_config_ini_path", return_value=ini):
+                assert settings.get_online_fdc_enabled() is False
+                assert settings.get_online_fdc_target_host() == "192.168.1.112"
+                assert settings.get_online_fdc_target_port() == 8123
+                assert settings.get_online_fdc_interval_sec() == 2.5
+
+    def test_interval_has_minimum_floor(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ini = Path(tmpdir) / "app_config.ini"
+            ini.write_text("[ONLINE]\nfdc_interval_sec = 0.1\n", encoding="utf-8")
+            with patch("inno3d.app.settings.app_config_ini_path", return_value=ini):
+                assert settings.get_online_fdc_interval_sec() == 0.5
+
+    def test_set_online_fdc_settings_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ini = Path(tmpdir) / "app_config.ini"
+            with patch("inno3d.app.settings.app_config_ini_path", return_value=ini):
+                settings.set_online_fdc_settings(
+                    enabled=True,
+                    target_host="192.168.1.112",
+                    target_port=8100,
+                    interval_sec=1.0,
+                )
+                assert settings.get_online_fdc_enabled() is True
+                assert settings.get_online_fdc_target_host() == "192.168.1.112"
+                assert settings.get_online_fdc_target_port() == 8100
+                assert settings.get_online_fdc_interval_sec() == 1.0
+
+
 class TestVolume3dSettings:
     def test_default_budget(self):
         with patch.dict("os.environ", {}, clear=False):

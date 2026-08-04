@@ -2,9 +2,11 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -24,11 +26,19 @@ public partial class Form1 : Form
 {
     private const int RECV_PACKET_SIZE = 520;
     private const int SEND_PACKET_SIZE = 528;
+    // CPU + MEM + Disk[A..J] = 12 * uint64 (ULONGLONG), little-endian
+    private const int FDC_PACKET_SIZE = 96;
+
+    private CancellationTokenSource? _fdcCts;
+    private Task? _fdcListenerTask;
+    private TcpListener? _fdcListener;
+    private int _fdcPacketCount;
 
     public Form1()
     {
         InitializeComponent();
         SetupGrid();
+        this.FormClosing += Form1_FormClosing;
     }
 
     private void SetupGrid()
@@ -59,6 +69,16 @@ public partial class Form1 : Form
         txtLog.ScrollToCaret();
     }
 
+    private void SetFdcPacketCount(int count)
+    {
+        if (InvokeRequired)
+        {
+            Invoke(new Action(() => SetFdcPacketCount(count)));
+            return;
+        }
+        lblFdcPackets.Text = $"Packets: {count}";
+    }
+
     private void btnBrowseFile_Click(object sender, EventArgs e)
     {
         using OpenFileDialog openFileDialog = new OpenFileDialog();
@@ -78,6 +98,234 @@ public partial class Form1 : Form
         {
             txtPath.Text = folderBrowserDialog.SelectedPath;
         }
+    }
+
+    private async void btnFdcListen_Click(object sender, EventArgs e)
+    {
+        try
+        {
+            if (_fdcListenerTask is null)
+            {
+                await StartFdcListenerAsync();
+                return;
+            }
+            await StopFdcListenerAsync("FDC listener stopped by user.");
+        }
+        catch (Exception ex)
+        {
+            Log($"FDC listener toggle failed: {ex.Message}", Color.Red);
+            lblStatus.Text = "FDC listener error.";
+        }
+    }
+
+    private async Task StartFdcListenerAsync()
+    {
+        if (_fdcListenerTask is not null)
+        {
+            return;
+        }
+
+        try
+        {
+            int port = (int)numFdcPort.Value;
+            _fdcPacketCount = 0;
+            SetFdcPacketCount(0);
+
+            _fdcCts = new CancellationTokenSource();
+            _fdcListener = new TcpListener(IPAddress.Any, port);
+            _fdcListener.Start();
+
+            btnFdcListen.Text = "Stop FDC Listener";
+            btnFdcListen.BackColor = Color.FromArgb(200, 60, 60);
+            lblStatus.Text = $"FDC listener started on 0.0.0.0:{port}";
+            Log($"FDC LISTENER STARTED on 0.0.0.0:{port}", Color.DeepSkyBlue);
+
+            CancellationToken token = _fdcCts.Token;
+            _fdcListenerTask = Task.Run(() => RunFdcListenerLoopAsync(token), token);
+            await Task.CompletedTask;
+        }
+        catch
+        {
+            try
+            {
+                _fdcCts?.Cancel();
+                _fdcListener?.Stop();
+            }
+            catch
+            {
+                // ignore cleanup errors
+            }
+            _fdcCts = null;
+            _fdcListener = null;
+            _fdcListenerTask = null;
+            btnFdcListen.Text = "Start FDC Listener";
+            btnFdcListen.BackColor = Color.FromArgb(36, 122, 213);
+            throw;
+        }
+    }
+
+    private async Task StopFdcListenerAsync(string reason)
+    {
+        CancellationTokenSource? cts = _fdcCts;
+        Task? listenerTask = _fdcListenerTask;
+        TcpListener? listener = _fdcListener;
+
+        _fdcCts = null;
+        _fdcListenerTask = null;
+        _fdcListener = null;
+
+        try
+        {
+            cts?.Cancel();
+        }
+        catch
+        {
+            // ignore cancellation edge cases
+        }
+        try
+        {
+            listener?.Stop();
+        }
+        catch
+        {
+            // ignore listener stop edge cases
+        }
+
+        if (listenerTask is not null)
+        {
+            try
+            {
+                await listenerTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // expected on normal stop
+            }
+            catch (ObjectDisposedException)
+            {
+                // expected when listener socket is closed
+            }
+            catch (Exception ex)
+            {
+                Log($"FDC listener stop warning: {ex.Message}", Color.Orange);
+            }
+        }
+
+        btnFdcListen.Text = "Start FDC Listener";
+        btnFdcListen.BackColor = Color.FromArgb(36, 122, 213);
+        lblStatus.Text = reason;
+        Log(reason, Color.Orange);
+    }
+
+    private async Task RunFdcListenerLoopAsync(CancellationToken token)
+    {
+        if (_fdcListener is null)
+        {
+            return;
+        }
+
+        while (!token.IsCancellationRequested)
+        {
+            TcpClient? client = null;
+            try
+            {
+                client = await _fdcListener.AcceptTcpClientAsync(token);
+                IPEndPoint? remote = client.Client.RemoteEndPoint as IPEndPoint;
+                Log(
+                    $"FDC client connected: {remote?.Address}:{remote?.Port}",
+                    Color.LightSkyBlue
+                );
+                await HandleFdcClientAsync(client, token);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    Log($"FDC listener error: {ex.Message}", Color.OrangeRed);
+                }
+            }
+            finally
+            {
+                try
+                {
+                    client?.Close();
+                }
+                catch
+                {
+                    // ignore socket close race
+                }
+            }
+        }
+    }
+
+    private async Task HandleFdcClientAsync(TcpClient client, CancellationToken token)
+    {
+        using NetworkStream stream = client.GetStream();
+        byte[] packet = new byte[FDC_PACKET_SIZE];
+
+        while (!token.IsCancellationRequested)
+        {
+            bool gotPacket = await ReadExactlyAsync(stream, packet, token);
+            if (!gotPacket)
+            {
+                Log("FDC client disconnected.", Color.DarkGray);
+                return;
+            }
+
+            // Scale confirmed by Mr Nam: 99.99% -> 9999 (percent * 100)
+            ulong cpuRaw = BitConverter.ToUInt64(packet, 0);
+            ulong memRaw = BitConverter.ToUInt64(packet, 8);
+            // Disk[0]=A ... Disk[9]=J; display only C..J
+            ulong[] disks = new ulong[10];
+            for (int i = 0; i < 10; i++)
+            {
+                disks[i] = BitConverter.ToUInt64(packet, 16 + i * 8);
+            }
+
+            int count = Interlocked.Increment(ref _fdcPacketCount);
+            SetFdcPacketCount(count);
+            // Match Mr Nam OutputDebugString style (raw ULONGLONG), plus human % for check.
+            Log(
+                $"FDC #{count:0000} "
+                + $"CPU={cpuRaw:D4} MEM={memRaw:D4} "
+                + $"C={disks[2]:D4} D={disks[3]:D4} E={disks[4]:D4} F={disks[5]:D4} "
+                + $"G={disks[6]:D4} H={disks[7]:D4} I={disks[8]:D4} J={disks[9]:D4} "
+                + $"| CPU={cpuRaw / 100.0:F2}% MEM={memRaw / 100.0:F2}% "
+                + $"C={disks[2] / 100.0:F2}% D={disks[3] / 100.0:F2}% "
+                + $"E={disks[4] / 100.0:F2}% F={disks[5] / 100.0:F2}%",
+                Color.LightGreen
+            );
+        }
+    }
+
+    private static async Task<bool> ReadExactlyAsync(
+        NetworkStream stream,
+        byte[] buffer,
+        CancellationToken token
+    )
+    {
+        int totalRead = 0;
+        while (totalRead < buffer.Length)
+        {
+            int read = await stream.ReadAsync(
+                buffer.AsMemory(totalRead, buffer.Length - totalRead),
+                token
+            );
+            if (read == 0)
+            {
+                return false;
+            }
+            totalRead += read;
+        }
+        return true;
     }
 
     private async void btnSend_Click(object sender, EventArgs e)
@@ -251,6 +499,22 @@ public partial class Form1 : Form
         {
             gridResults.Rows[rowIndex].Cells[5].Style.ForeColor = Color.Red;
             lblStatus.Text = "Transmission Failed!";
+        }
+    }
+
+    private void Form1_FormClosing(object? sender, FormClosingEventArgs e)
+    {
+        try
+        {
+            _fdcCts?.Cancel();
+            _fdcListener?.Stop();
+            _fdcCts = null;
+            _fdcListener = null;
+            _fdcListenerTask = null;
+        }
+        catch
+        {
+            // Keep close flow robust even if background listener races.
         }
     }
 }

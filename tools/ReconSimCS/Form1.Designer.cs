@@ -31,6 +31,11 @@ partial class Form1
         this.chkFlag2 = new System.Windows.Forms.CheckBox();
         this.chkFlag3 = new System.Windows.Forms.CheckBox();
         this.btnSend = new System.Windows.Forms.Button();
+        this.lblFdcTitle = new System.Windows.Forms.Label();
+        this.lblFdcPort = new System.Windows.Forms.Label();
+        this.numFdcPort = new System.Windows.Forms.NumericUpDown();
+        this.btnFdcListen = new System.Windows.Forms.Button();
+        this.lblFdcPackets = new System.Windows.Forms.Label();
         this.gridResults = new System.Windows.Forms.DataGridView();
         this.txtLog = new System.Windows.Forms.RichTextBox();
         this.statusStrip = new System.Windows.Forms.StatusStrip();
@@ -39,6 +44,7 @@ partial class Form1
         this.grpSettings.SuspendLayout();
         ((System.ComponentModel.ISupportInitialize)(this.numPort)).BeginInit();
         ((System.ComponentModel.ISupportInitialize)(this.numCounter)).BeginInit();
+        ((System.ComponentModel.ISupportInitialize)(this.numFdcPort)).BeginInit();
         ((System.ComponentModel.ISupportInitialize)(this.gridResults)).BeginInit();
         this.statusStrip.SuspendLayout();
         this.SuspendLayout();
@@ -61,9 +67,14 @@ partial class Form1
         this.grpSettings.Controls.Add(this.chkFlag2);
         this.grpSettings.Controls.Add(this.chkFlag3);
         this.grpSettings.Controls.Add(this.btnSend);
+        this.grpSettings.Controls.Add(this.lblFdcTitle);
+        this.grpSettings.Controls.Add(this.lblFdcPort);
+        this.grpSettings.Controls.Add(this.numFdcPort);
+        this.grpSettings.Controls.Add(this.btnFdcListen);
+        this.grpSettings.Controls.Add(this.lblFdcPackets);
         this.grpSettings.Location = new System.Drawing.Point(12, 12);
         this.grpSettings.Name = "grpSettings";
-        this.grpSettings.Size = new System.Drawing.Size(960, 220);
+        this.grpSettings.Size = new System.Drawing.Size(960, 285);
         this.grpSettings.TabIndex = 0;
         this.grpSettings.TabStop = false;
         this.grpSettings.Text = "Target Inspection PC & Input Volume Settings";
@@ -148,14 +159,46 @@ partial class Form1
         this.btnSend.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
         this.btnSend.Location = new System.Drawing.Point(150, 150);
         this.btnSend.Size = new System.Drawing.Size(800, 50);
-        this.btnSend.Text = "🚀 SEND TCP TRIGGER & BENCHMARK SPEED";
+        this.btnSend.Text = "SEND TCP TRIGGER & BENCHMARK SPEED";
         this.btnSend.UseVisualStyleBackColor = false;
         this.btnSend.Click += new System.EventHandler(this.btnSend_Click);
+
+        // lblFdcTitle
+        this.lblFdcTitle.Location = new System.Drawing.Point(15, 214);
+        this.lblFdcTitle.Size = new System.Drawing.Size(300, 23);
+        this.lblFdcTitle.Text = "FDC Monitor Receiver (from Inno3D):";
+
+        // lblFdcPort
+        this.lblFdcPort.Location = new System.Drawing.Point(15, 245);
+        this.lblFdcPort.Size = new System.Drawing.Size(130, 23);
+        this.lblFdcPort.Text = "Listen Port:";
+
+        // numFdcPort
+        this.numFdcPort.Location = new System.Drawing.Point(150, 242);
+        this.numFdcPort.Maximum = new decimal(new int[] { 65535, 0, 0, 0 });
+        this.numFdcPort.Minimum = new decimal(new int[] { 1, 0, 0, 0 });
+        this.numFdcPort.Size = new System.Drawing.Size(110, 27);
+        this.numFdcPort.Value = new decimal(new int[] { 8100, 0, 0, 0 });
+
+        // btnFdcListen
+        this.btnFdcListen.BackColor = System.Drawing.Color.FromArgb(36, 122, 213);
+        this.btnFdcListen.ForeColor = System.Drawing.Color.White;
+        this.btnFdcListen.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
+        this.btnFdcListen.Location = new System.Drawing.Point(280, 239);
+        this.btnFdcListen.Size = new System.Drawing.Size(210, 32);
+        this.btnFdcListen.Text = "Start FDC Listener";
+        this.btnFdcListen.UseVisualStyleBackColor = false;
+        this.btnFdcListen.Click += new System.EventHandler(this.btnFdcListen_Click);
+
+        // lblFdcPackets
+        this.lblFdcPackets.Location = new System.Drawing.Point(510, 245);
+        this.lblFdcPackets.Size = new System.Drawing.Size(220, 23);
+        this.lblFdcPackets.Text = "Packets: 0";
 
         // gridResults
         this.gridResults.AllowUserToAddRows = false;
         this.gridResults.AutoSizeColumnsMode = System.Windows.Forms.DataGridViewAutoSizeColumnsMode.Fill;
-        this.gridResults.Location = new System.Drawing.Point(12, 245);
+        this.gridResults.Location = new System.Drawing.Point(12, 310);
         this.gridResults.Name = "gridResults";
         this.gridResults.Size = new System.Drawing.Size(960, 200);
         this.gridResults.TabIndex = 1;
@@ -164,7 +207,7 @@ partial class Form1
         this.txtLog.BackColor = System.Drawing.Color.FromArgb(18, 18, 24);
         this.txtLog.ForeColor = System.Drawing.Color.LightGray;
         this.txtLog.Font = new System.Drawing.Font("Consolas", 9.5F);
-        this.txtLog.Location = new System.Drawing.Point(12, 455);
+        this.txtLog.Location = new System.Drawing.Point(12, 520);
         this.txtLog.Name = "txtLog";
         this.txtLog.ReadOnly = true;
         this.txtLog.Size = new System.Drawing.Size(960, 200);
@@ -174,13 +217,13 @@ partial class Form1
         // statusStrip
         this.lblStatus.Text = "Ready to transmit volume trigger.";
         this.statusStrip.Items.Add(this.lblStatus);
-        this.statusStrip.Location = new System.Drawing.Point(0, 665);
+        this.statusStrip.Location = new System.Drawing.Point(0, 725);
         this.statusStrip.Size = new System.Drawing.Size(984, 26);
 
         // Form1
         this.AutoScaleDimensions = new System.Drawing.SizeF(8F, 20F);
         this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-        this.ClientSize = new System.Drawing.Size(984, 691);
+        this.ClientSize = new System.Drawing.Size(984, 751);
         this.Controls.Add(this.grpSettings);
         this.Controls.Add(this.gridResults);
         this.Controls.Add(this.txtLog);
@@ -192,6 +235,7 @@ partial class Form1
         this.grpSettings.PerformLayout();
         ((System.ComponentModel.ISupportInitialize)(this.numPort)).EndInit();
         ((System.ComponentModel.ISupportInitialize)(this.numCounter)).EndInit();
+        ((System.ComponentModel.ISupportInitialize)(this.numFdcPort)).EndInit();
         ((System.ComponentModel.ISupportInitialize)(this.gridResults)).EndInit();
         this.statusStrip.ResumeLayout(false);
         this.statusStrip.PerformLayout();
@@ -215,6 +259,11 @@ partial class Form1
     private System.Windows.Forms.CheckBox chkFlag2;
     private System.Windows.Forms.CheckBox chkFlag3;
     private System.Windows.Forms.Button btnSend;
+    private System.Windows.Forms.Label lblFdcTitle;
+    private System.Windows.Forms.Label lblFdcPort;
+    private System.Windows.Forms.NumericUpDown numFdcPort;
+    private System.Windows.Forms.Button btnFdcListen;
+    private System.Windows.Forms.Label lblFdcPackets;
     private System.Windows.Forms.DataGridView gridResults;
     private System.Windows.Forms.RichTextBox txtLog;
     private System.Windows.Forms.StatusStrip statusStrip;

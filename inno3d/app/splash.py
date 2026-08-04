@@ -16,7 +16,7 @@ import os
 import subprocess
 
 import psutil
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import (
     QBrush,
     QColor,
@@ -296,6 +296,75 @@ class CustomTitleBar(QWidget):
         self._toggle_maximize()
 
 
+class _HardwareStatsWorker(QThread):
+    """Sample CPU/RAM/GPU off the UI thread so nvidia-smi cannot freeze the app."""
+
+    stats_ready = pyqtSignal(float, float, object, object)  # cpu, ram, gpu|None, vram|None
+
+    def __init__(self, interval_ms=1000, parent=None):
+        super().__init__(parent)
+        self._interval_ms = max(200, int(interval_ms))
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        # Prime cpu_percent so the first real sample is meaningful.
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
+        creationflags = (
+            subprocess.CREATE_NO_WINDOW
+            if hasattr(subprocess, "CREATE_NO_WINDOW")
+            else 0
+        )
+
+        while not self._stop:
+            cpu = 0.0
+            ram = 0.0
+            gpu = None
+            vram = None
+            try:
+                cpu = float(psutil.cpu_percent(interval=None))
+                ram = float(psutil.virtual_memory().percent)
+            except Exception:
+                pass
+
+            try:
+                smi = subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used,memory.total",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    creationflags=creationflags,
+                    timeout=0.5,
+                    text=True,
+                )
+                parts = smi.strip().split(",")
+                gpu = float(parts[0].strip())
+                vram = (
+                    float(parts[1].strip())
+                    / max(float(parts[2].strip()), 1.0)
+                    * 100.0
+                )
+            except Exception:
+                pass
+
+            if not self._stop:
+                self.stats_ready.emit(cpu, ram, gpu, vram)
+
+            # Sleep in small chunks so stop() is responsive.
+            remaining = self._interval_ms
+            while remaining > 0 and not self._stop:
+                step = min(50, remaining)
+                self.msleep(step)
+                remaining -= step
+
+
 class HardwareTrackingWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -305,6 +374,8 @@ class HardwareTrackingWidget(QWidget):
 
         self.setObjectName("HardwareTracker")
         self.sensor_title_labels = []
+        # Only re-apply stylesheets when severity band changes (avoids Qt polish churn).
+        self._style_bands = {}
 
         self.cpu_val, self.cpu_bar = self._create_sensor("CPU", layout)
         self.ram_val, self.ram_bar = self._create_sensor("RAM", layout)
@@ -313,9 +384,9 @@ class HardwareTrackingWidget(QWidget):
 
         self.refresh_theme()
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._update_stats)
-        self.timer.start(1000)
+        self._worker = _HardwareStatsWorker(interval_ms=1000, parent=self)
+        self._worker.stats_ready.connect(self._on_stats_ready)
+        self._worker.start()
 
     def _create_sensor(self, title, parent_layout):
         container = QVBoxLayout()
@@ -364,43 +435,45 @@ class HardwareTrackingWidget(QWidget):
             title_lbl.setStyleSheet(
                 f"color: {title_color}; font-size: 7.5pt; font-weight: 800; letter-spacing: 1px;"
             )
+        # Force bar/label styles to rebuild under the new theme.
+        self._style_bands.clear()
 
-    def _update_stats(self):
-        try:
-            cpu = psutil.cpu_percent()
-            ram = psutil.virtual_memory().percent
+    def stop(self):
+        """Stop background sampling (call on app shutdown if needed)."""
+        worker = getattr(self, "_worker", None)
+        if worker is None:
+            return
+        worker.stop()
+        worker.wait(1500)
+        self._worker = None
 
-            self._apply_val(cpu, self.cpu_val, self.cpu_bar)
-            self._apply_val(ram, self.ram_val, self.ram_bar)
+    def closeEvent(self, event):
+        self.stop()
+        super().closeEvent(event)
 
-            try:
-                smi = subprocess.check_output(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=utilization.gpu,memory.used,memory.total",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                    if hasattr(subprocess, "CREATE_NO_WINDOW")
-                    else 0,
-                    timeout=0.5,
-                    text=True,
-                )
-                parts = smi.strip().split(",")
-                gpu = float(parts[0].strip())
-                vram = float(parts[1].strip()) / max(float(parts[2].strip()), 1) * 100.0
+    def _on_stats_ready(self, cpu, ram, gpu, vram):
+        self._apply_val(cpu, self.cpu_val, self.cpu_bar, "cpu")
+        self._apply_val(ram, self.ram_val, self.ram_bar, "ram")
+        if gpu is not None:
+            self._apply_val(float(gpu), self.gpu_val, self.gpu_bar, "gpu")
+        if vram is not None:
+            self._apply_val(float(vram), self.gpu_vram_val, self.gpu_vram_bar, "vram")
 
-                self._apply_val(gpu, self.gpu_val, self.gpu_bar)
-                self._apply_val(vram, self.gpu_vram_val, self.gpu_vram_bar)
-            except Exception:
-                pass
+    @staticmethod
+    def _band(val):
+        if val > 85:
+            return "error"
+        if val > 65:
+            return "warn"
+        return "ok"
 
-        except Exception:
-            pass
-
-    def _apply_val(self, val, lbl, bar):
+    def _apply_val(self, val, lbl, bar, cache_key):
         lbl.setText(f"{val:04.1f}%")
         bar.setValue(int(val))
+        band = self._band(val)
+        if self._style_bands.get(cache_key) == band:
+            return
+        self._style_bands[cache_key] = band
         bar.setStyleSheet(self._bar_style(val))
         lbl.setStyleSheet(self._text_style(val))
 

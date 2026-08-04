@@ -106,6 +106,65 @@ def get_online_port() -> int:
         return 8000
 
 
+def get_online_fdc_enabled() -> bool:
+    """Whether periodic FDC monitor push is enabled (default true)."""
+    raw = _read_ini().get("ONLINE", "fdc_enabled", fallback="true").strip().lower()
+    return raw in _TRUE_VALUES
+
+
+def get_online_fdc_target_host() -> str:
+    """Recon host/IP that receives periodic FDC monitor packets."""
+    host = _read_ini().get("ONLINE", "fdc_target_host", fallback="127.0.0.1").strip()
+    return host or "127.0.0.1"
+
+
+def get_online_fdc_target_port() -> int:
+    """Recon TCP port for periodic FDC monitor packets (default 8100)."""
+    try:
+        return int(_read_ini().get("ONLINE", "fdc_target_port", fallback="8100"))
+    except (ValueError, TypeError):
+        return 8100
+
+
+def get_online_fdc_interval_sec() -> float:
+    """Periodic interval (seconds) for FDC monitor push (default 1.0s)."""
+    try:
+        val = float(_read_ini().get("ONLINE", "fdc_interval_sec", fallback="1.0"))
+    except (ValueError, TypeError):
+        val = 1.0
+    return max(0.5, val)
+
+
+def set_online_fdc_settings(
+    *,
+    enabled: bool | None = None,
+    target_host: str | None = None,
+    target_port: int | None = None,
+    interval_sec: float | None = None,
+) -> None:
+    """Persist FDC monitor settings to app_config.ini [ONLINE]."""
+    values: dict[str, str] = {}
+    if enabled is not None:
+        values["fdc_enabled"] = "true" if enabled else "false"
+    if target_host is not None:
+        host = str(target_host).strip() or "127.0.0.1"
+        values["fdc_target_host"] = host
+    if target_port is not None:
+        try:
+            port = int(target_port)
+        except (TypeError, ValueError):
+            port = 8100
+        values["fdc_target_port"] = str(max(1, min(65535, port)))
+    if interval_sec is not None:
+        try:
+            interval = float(interval_sec)
+        except (TypeError, ValueError):
+            interval = 1.0
+        values["fdc_interval_sec"] = str(max(0.5, interval))
+    if values:
+        _write_ini_section("ONLINE", values)
+
+
 # ──────────────────────────────────────
 # [VOLUME_3D]
 # ──────────────────────────────────────

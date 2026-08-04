@@ -54,18 +54,18 @@ import time
 
 
 class OnlineToggleSwitch(QAbstractButton):
-    """Left/right sliding switch with ON/OFF labels above track."""
+    """Compact left/right sliding switch (Offline ← → Online labels live beside it)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(76, 42)
+        self.setFixedSize(44, 22)
         self._colors = {}
         self.apply_theme()
 
     def sizeHint(self):
-        return QSize(76, 42)
+        return QSize(44, 22)
 
     def apply_theme(self):
         is_light = SemiconductorTheme.is_light()
@@ -75,15 +75,12 @@ class OnlineToggleSwitch(QAbstractButton):
             "off_border": QColor("#7f98b4") if is_light else QColor("#43597a"),
             "on_border": QColor("#10d88a") if not is_light else QColor("#1a8f5f"),
             "knob": QColor("#f7fbff") if is_light else QColor("#ecf4ff"),
-            "label_active": QColor("#0a5f3d") if is_light else QColor("#bcf7d9"),
-            "label_inactive": QColor("#5d738c") if is_light else QColor("#7f94ad"),
             "focus": QColor("#22aed1"),
         }
         self.update()
 
     def _track_rect(self):
-        base = self.rect().adjusted(1, 1, -1, -1)
-        return QRectF(float(base.x()), float(base.y() + 18), float(base.width()), float(base.height() - 18))
+        return QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
 
     def _knob_rect(self, track_rect):
         margin = 2.0
@@ -94,27 +91,12 @@ class OnlineToggleSwitch(QAbstractButton):
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        base = self.rect().adjusted(1, 1, -1, -1)
         track_rect = self._track_rect()
 
         bg = self._colors["on_bg"] if self.isChecked() else self._colors["off_bg"]
         border = self._colors["on_border"] if self.isChecked() else self._colors["off_border"]
         if self.underMouse():
             border = self._colors["focus"]
-
-        font = p.font()
-        font.setPointSizeF(7.8)
-        font.setBold(True)
-        p.setFont(font)
-        label_y = float(base.y() + 1)
-        label_h = 14.0
-        off_rect = QRectF(float(base.x() + 4), label_y, float(base.width() / 2.0 - 6), label_h)
-        on_rect = QRectF(float(base.x() + base.width() / 2.0), label_y, float(base.width() / 2.0 - 6), label_h)
-
-        p.setPen(self._colors["label_inactive"] if self.isChecked() else self._colors["label_active"])
-        p.drawText(off_rect, Qt.AlignVCenter | Qt.AlignLeft, "OFF")
-        p.setPen(self._colors["label_active"] if self.isChecked() else self._colors["label_inactive"])
-        p.drawText(on_rect, Qt.AlignVCenter | Qt.AlignRight, "ON")
 
         radius = track_rect.height() / 2.0
         p.setPen(QPen(border, 1.6))
@@ -200,6 +182,7 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
         self.segmentation_tab.inspection_done.connect(self._on_seg_inspection_done)
         self.segmentation_tab.apply_online_roi_signal.connect(self._on_apply_online_roi)
         self.help_tab.theme_changed.connect(self.on_theme_changed)
+        self.help_tab.fdc_settings_changed.connect(self._on_fdc_settings_changed)
         self.help_tab.set_current_theme(SemiconductorTheme.CURRENT_THEME)
         if hasattr(self.batch_review_tab, "open_in_viewer"):
             self.batch_review_tab.open_in_viewer.connect(self._on_batch_review_open_run)
@@ -261,6 +244,7 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
         sidebar_layout.addWidget(lbl_info)
         
         # --- Online Toggle (above navigation) ---
+        # Layout: Offline [switch] Online — knob left=Offline, right=Online
         # Outer frame gets cyan glow when Online is ON (#8 chrome)
         online_container = QWidget()
         online_container.setObjectName("onlineModeFrame")
@@ -271,19 +255,23 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
         online_row = QWidget()
         online_layout = QHBoxLayout(online_row)
         online_layout.setContentsMargins(5, 2, 5, 2)
-        online_layout.setSpacing(8)
-        
-        online_label = QLabel("ONLINE")
-        online_label.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {SemiconductorTheme.TEXT_SECONDARY};")
-        self.online_label = online_label
-        online_layout.addWidget(online_label)
-        
+        online_layout.setSpacing(6)
+
+        self.online_offline_label = QLabel("Offline")
+        self.online_online_label = QLabel("Online")
+        for lbl in (self.online_offline_label, self.online_online_label):
+            lbl.setAlignment(Qt.AlignVCenter | Qt.AlignHCenter)
+
         self.online_toggle = OnlineToggleSwitch()
         self.online_toggle.clicked.connect(self.toggle_online)
         self.online_toggle.toggled.connect(self._sync_online_toggle_hint)
         self._sync_online_toggle_hint(self.online_toggle.isChecked())
+
+        online_layout.addStretch(1)
+        online_layout.addWidget(self.online_offline_label)
         online_layout.addWidget(self.online_toggle)
-        online_layout.addStretch()
+        online_layout.addWidget(self.online_online_label)
+        online_layout.addStretch(1)
         online_outer.addWidget(online_row)
 
         self.online_container = online_container
@@ -528,6 +516,25 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
         self.current_tab_index = 0
         self.switch_tab(0) # Init first tab
         self._apply_dynamic_theme_styles()
+        # FDC heartbeat is always-on (independent from Online toggle state).
+        try:
+            self._online_start_fdc_monitor_sender()
+        except Exception as e:
+            print(f"[ONLINE] FDC sender init failed: {e}")
+
+    def _on_fdc_settings_changed(self):
+        """Reload always-on FDC sender after Help-tab Save & Apply."""
+        try:
+            if hasattr(self, "_online_stop_fdc_monitor_sender"):
+                self._online_stop_fdc_monitor_sender()
+            if hasattr(self, "_online_start_fdc_monitor_sender"):
+                self._online_start_fdc_monitor_sender()
+            host = getattr(self, "_fdc_monitor_host", "?")
+            port = getattr(self, "_fdc_monitor_port", "?")
+            if hasattr(self, "status_label") and self.status_label is not None:
+                self.status_label.setText(f"FDC settings applied → {host}:{port}")
+        except Exception as e:
+            print(f"[ONLINE] FDC settings apply failed: {e}")
 
     def set_app_sidebar_expanded(self, expanded, remember=True):
         """Expand / collapse the left app menu (Online frees space for MPR).
@@ -626,35 +633,43 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
             self.online_toggle.apply_theme()
 
     def _sync_online_toggle_hint(self, checked):
-        """Keep inline hint explicit about which side to click next."""
+        """Highlight active side label and keep tooltip in sync with knob position."""
         if not hasattr(self, "online_toggle"):
             return
         if checked:
-            self.online_toggle.setToolTip("Online mode is ON. Slide right to switch OFF.")
+            self.online_toggle.setToolTip("Online mode is ON. Slide left for Offline.")
         else:
-            self.online_toggle.setToolTip("Online mode is OFF. Slide left to switch ON.")
+            self.online_toggle.setToolTip("Online mode is OFF. Slide right for Online.")
+        # Side labels: active side bold+accent, inactive muted
+        self._style_online_side_labels(checked)
+
+    def _style_online_side_labels(self, online_active):
+        """Offline (left) / Online (right) — emphasize the active mode."""
+        accent = SemiconductorTheme.ACCENT_PRIMARY
+        muted = SemiconductorTheme.TEXT_SECONDARY
+        active_ss = f"font-size: 8.5pt; font-weight: bold; color: {accent};"
+        inactive_ss = f"font-size: 8.5pt; font-weight: 600; color: {muted};"
+        if hasattr(self, "online_offline_label"):
+            self.online_offline_label.setStyleSheet(inactive_ss if online_active else active_ss)
+        if hasattr(self, "online_online_label"):
+            self.online_online_label.setStyleSheet(active_ss if online_active else inactive_ss)
 
     def _apply_online_chrome(self, active):
-        """Cyan glow frame around ONLINE block when Online is ON."""
+        """Cyan glow frame around Offline/Online switch when Online is ON."""
         if not hasattr(self, "online_container"):
             return
-        accent = SemiconductorTheme.ACCENT_PRIMARY
         if active:
             self.online_container.setStyleSheet(
-                f"""
-                QWidget#onlineModeFrame {{
+                """
+                QWidget#onlineModeFrame {
                     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                         stop:0 rgba(34, 174, 209, 0.14),
                         stop:1 rgba(34, 174, 209, 0.03));
                     border: 1px solid rgba(34, 174, 209, 0.45);
                     border-radius: 10px;
-                }}
+                }
                 """
             )
-            if hasattr(self, "online_label"):
-                self.online_label.setStyleSheet(
-                    f"font-size: 9pt; font-weight: bold; color: {accent};"
-                )
         else:
             self.online_container.setStyleSheet(
                 """
@@ -665,10 +680,7 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
                 }
                 """
             )
-            if hasattr(self, "online_label"):
-                self.online_label.setStyleSheet(
-                    f"font-size: 9pt; font-weight: bold; color: {SemiconductorTheme.TEXT_SECONDARY};"
-                )
+        self._style_online_side_labels(bool(active))
 
     def _set_online_input_locked(self, locked):
         """Disable manual OPEN load while Online controls input (#3)."""
@@ -930,24 +942,28 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
         if hasattr(self, 'visualizer_tab'):
             safe_hide(self.visualizer_tab, 'vtk_widget')
 
-        # 2. SHOW current tab's widgets
+        # 2. SHOW current tab's widgets (Render deferred — sync multi-pane Render freezes UI)
+        show_widgets = []
         if index == 0: # viewer
             for o in ['axial', 'sagittal', 'coronal']:
                 w = getattr(self.multiplanar_tab, f'{o}_widget')
                 w.setVisible(True)
-                w.GetRenderWindow().Render()
+                show_widgets.append(w)
             self.multiplanar_tab.view_3d_widget.setVisible(True)
-            self.multiplanar_tab.view_3d_widget.GetRenderWindow().Render()
+            show_widgets.append(self.multiplanar_tab.view_3d_widget)
         elif index == 1: # segmentation
             for o in ['axial', 'coronal', 'sagittal']:
                 w = getattr(self.segmentation_tab, f'{o}_widget')
                 w.setVisible(True)
-                w.GetRenderWindow().Render()
+                show_widgets.append(w)
         elif index == 2 and hasattr(self, 'visualizer_tab'):
             w = self.visualizer_tab.vtk_widget
             w.setVisible(True)
-            w.GetRenderWindow().Render()
+            show_widgets.append(w)
         # index == 3: Analysis tab — no VTK widgets, nothing to show/hide
+
+        if show_widgets:
+            QTimer.singleShot(0, lambda widgets=show_widgets: self._render_tab_vtk_widgets(widgets))
 
         # Update labels and state
         tab_names = [
@@ -968,6 +984,18 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
                 pass
         
         self.current_tab_index = index
+
+    def _render_tab_vtk_widgets(self, widgets):
+        """Deferred VTK paints after tab switch so the stack can swap first."""
+        for w in widgets or []:
+            try:
+                if w is None or not w.isVisible():
+                    continue
+                rw = w.GetRenderWindow()
+                if rw is not None:
+                    rw.Render()
+            except Exception:
+                pass
 
     def _ai_set_view_mode(self, mode):
         """Toggle AI tab XY Only / Multi-Planar from sidebar"""
@@ -1088,6 +1116,9 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
     def closeEvent(self, event):
         """Cleanly shut down VTK and background threads to prevent wglMakeCurrent errors."""
         try:
+            if hasattr(self, "_online_stop_fdc_monitor_sender"):
+                self._online_stop_fdc_monitor_sender()
+
             # 1. Clean up MultiPlanarView VTK widgets
             if hasattr(self, 'multiplanar_tab') and self.multiplanar_tab:
                 for w_name in ['axial_widget', 'coronal_widget', 'sagittal_widget', 'view_3d_widget']:
@@ -1108,6 +1139,10 @@ class MainWindow(OnlineModeMixin, PanelsMixin, QMainWindow):
                     self.visualizer_tab.vtk_widget.Finalize()
 
             # 4. Stop background threads
+            if hasattr(self, "hw_monitor") and self.hw_monitor is not None:
+                if hasattr(self.hw_monitor, "stop"):
+                    self.hw_monitor.stop()
+
             if hasattr(self, 'ai_3d_tab') and self.ai_3d_tab:
                 if hasattr(self.ai_3d_tab, 'train_worker') and self.ai_3d_tab.train_worker:
                     self.ai_3d_tab.train_worker.stop()
