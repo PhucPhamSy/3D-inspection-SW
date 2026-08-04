@@ -246,8 +246,10 @@ class AlignSidebarMixin:
                 # No volume — keep hidden
                 if hasattr(self, "align_tools_host"):
                     self.align_tools_host.setVisible(False)
-            # Offline: restore 3D volume so B2B gap / MES surface review works
-            self.set_3d_volume_render_enabled(True, sync_button=True)
+            # Do NOT force-enable GPU 3D on Online OFF.
+            # Online FOVs are often multi-GB; enabling 3D here rebuilds the full
+            # volume on the UI thread and feels like a heavy stutter. Keep current
+            # 3D state (usually OFF from Online ON); user re-enables via 3D btn.
 
         QTimer.singleShot(50, self._reposition_visible_overlays)
 

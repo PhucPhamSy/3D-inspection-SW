@@ -429,7 +429,7 @@ class Volume3dMixin:
             text.SetInput(
                 "3D OFF\n"
                 "Toggle  3D  under C2 to render volume\n"
-                "(B2B gap / MES pick auto-enable when needed)"
+                "(MES/B2B actions stay MPR-only while OFF)"
             )
             tp = text.GetTextProperty()
             tp.SetFontSize(16)

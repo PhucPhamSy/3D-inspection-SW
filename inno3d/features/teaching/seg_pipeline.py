@@ -38,6 +38,7 @@ from inno3d.core.styles import SemiconductorTheme
 from inno3d.core.view_support import LoadVolumeThread, RawImportDialog
 from inno3d.features.shared.mes_mapping import (
     MesPickDebounce,
+    build_label_to_stats_index as _shared_build_label_to_stats_index,
     centroid_nav_xyz as _shared_centroid_nav_xyz,
     highlights_from_stats_indices as _shared_highlights_from_stats_indices,
     label_at_volume_xyz as _shared_label_at_volume_xyz,
@@ -533,6 +534,10 @@ class SegmentationPipelineMixin:
                                 float(self.spacing[1]),
                                 float(self.spacing[2]),
                             ),
+                            # Match Viewer/Online wrap: avoid forced contiguous
+                            # copy and avoid full-volume min/max at first paint.
+                            prefer_no_copy=True,
+                            sampled_value_range=True,
                         )
                         print(
                             f"[LVE] Teaching dense store wrapper: {tuple(data.shape)}"
@@ -611,17 +616,9 @@ class SegmentationPipelineMixin:
             except Exception as e:
                 print(f"[Teaching] init_vtk_widgets on load: {e}")
 
-            # Render views
-            print("Rendering planes...")
-            for orientation in ['axial', 'coronal', 'sagittal']:
-                try:
-                    print(f"  Rendering {orientation}...")
-                    self.update_plane_view(orientation)
-                    print(f"  {orientation} rendered successfully")
-                except Exception as e:
-                    print(f"  ERROR rendering {orientation}: {e}")
-                    import traceback
-                    traceback.print_exc()
+            # Render views with axial-first first paint, then defer non-axial.
+            print("Rendering planes (axial first)...")
+            self._render_teaching_initial_planes()
 
             # Center crosshair for navigation parity with Viewer
             try:
@@ -669,6 +666,56 @@ class SegmentationPipelineMixin:
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Error", error_msg)
+
+    def _cancel_teaching_deferred_mpr_paint(self):
+        """Cancel pending coronal/sagittal deferred first-paint work."""
+        timer = getattr(self, "_teaching_deferred_mpr_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._teaching_deferred_mpr_token = int(
+            getattr(self, "_teaching_deferred_mpr_token", 0)
+        ) + 1
+
+    def _schedule_teaching_deferred_mpr_paint(self):
+        """Schedule deferred coronal+sagittal first paint."""
+        token = int(getattr(self, "_teaching_deferred_mpr_token", 0))
+        timer = getattr(self, "_teaching_deferred_mpr_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._run_teaching_deferred_mpr_paint)
+            self._teaching_deferred_mpr_timer = timer
+        self._teaching_deferred_mpr_scheduled_token = token
+        timer.start(10)
+
+    def _run_teaching_deferred_mpr_paint(self):
+        """Render deferred non-axial panes after axial first paint."""
+        if self.volume_data is None:
+            return
+        scheduled = int(getattr(self, "_teaching_deferred_mpr_scheduled_token", -1))
+        current = int(getattr(self, "_teaching_deferred_mpr_token", 0))
+        if scheduled != current:
+            return
+        for orientation in ("coronal", "sagittal"):
+            try:
+                self.update_plane_view(orientation)
+            except Exception as e:
+                print(f"[Teaching] deferred {orientation} render failed: {e}")
+
+    def _render_teaching_initial_planes(self):
+        """Axial-first paint for responsive first touch on Teaching load."""
+        self._cancel_teaching_deferred_mpr_paint()
+        try:
+            self.update_plane_view("axial")
+            print("  axial rendered successfully")
+        except Exception as e:
+            print(f"  ERROR rendering axial: {e}")
+            import traceback
+            traceback.print_exc()
+        self._schedule_teaching_deferred_mpr_paint()
 
     def populate_parameters_from_config(self):
         """Populate UI widgets from loaded config"""
@@ -2202,6 +2249,12 @@ class SegmentationPipelineMixin:
                     return row
         return None
 
+    def _rebuild_mes_label_index(self):
+        """Rebuild ``label -> object_stats index`` map for O(1) MES pick lookup."""
+        self._mes_label_to_stats_idx = _shared_build_label_to_stats_index(
+            getattr(self, "object_stats", None)
+        )
+
     def _apply_mes_pick_label(self, lab, xyz=None, source="mpr"):
         """Sticky multi-toggle MES row + MPR/3D highlight (shared label map)."""
         try:
@@ -2216,11 +2269,17 @@ class SegmentationPipelineMixin:
             return False
 
         _z_off = int(getattr(self, "_measurement_start_slice", 0) or 0)
+        idx_map = getattr(self, "_mes_label_to_stats_idx", None)
+        if idx_map is None:
+            self._rebuild_mes_label_index()
+            idx_map = getattr(self, "_mes_label_to_stats_idx", None)
         stats_idx = _shared_stats_index_for_label(
             self.object_stats,
             lab,
             labeled=getattr(self, "labeled_class1_data", None),
             z_offset=_z_off,
+            allow_centroid_fallback=False,
+            label_index=idx_map,
         )
         if stats_idx is None:
             print(f"[MES pick] Teaching label={lab} not in object_stats source={source}")
@@ -3358,6 +3417,7 @@ class SegmentationPipelineMixin:
                     f"Total Bump: {total_c1:,.0f} \u03bcm\u00b3 | "
                     f"Total Void: {total_c2:,.0f} \u03bcm\u00b3"
                 )
+            self._rebuild_mes_label_index()
         finally:
             # One-shot column widths (not per-cell ResizeToContents)
             try:
@@ -4378,8 +4438,12 @@ class SegmentationPipelineMixin:
             print(f"[SegmentationTab] Failed to load config from {config_path}: {e}")
             return False
 
-    def set_volume_data(self, data, file_path=None):
-        """Set volume data programmatically — used by Online mode."""
+    def set_volume_data(self, data, file_path=None, *, paint_mpr=True):
+        """Set volume data programmatically — used by Online mode.
+
+        paint_mpr=False skips Teaching MPR first paint (Online Viewer already paints;
+        cold memmap re-touch here used to stall Online first-MPR by tens of seconds).
+        """
         if data is None:
             return
 
@@ -4427,17 +4491,16 @@ class SegmentationPipelineMixin:
         # Update sliders
         self.current_slices = {'axial': z // 2, 'coronal': y // 2, 'sagittal': x // 2}
 
-        self.axial_slice_slider.setMaximum(z - 1)
-        self.axial_slice_slider.setValue(z // 2)
-        self.axial_slice_label.setText(f"{z//2} / {z-1}")
-
-        self.coronal_slice_slider.setMaximum(y - 1)
-        self.coronal_slice_slider.setValue(y // 2)
-        self.coronal_slice_label.setText(f"{y//2} / {y-1}")
-
-        self.sagittal_slice_slider.setMaximum(x - 1)
-        self.sagittal_slice_slider.setValue(x // 2)
-        self.sagittal_slice_label.setText(f"{x//2} / {x-1}")
+        for sl, maximum, value, label in (
+            (self.axial_slice_slider, z - 1, z // 2, self.axial_slice_label),
+            (self.coronal_slice_slider, y - 1, y // 2, self.coronal_slice_label),
+            (self.sagittal_slice_slider, x - 1, x // 2, self.sagittal_slice_label),
+        ):
+            sl.blockSignals(True)
+            sl.setMaximum(maximum)
+            sl.setValue(value)
+            sl.blockSignals(False)
+            label.setText(f"{value} / {maximum}")
 
         if file_path:
             self.input_path_input.setText(file_path)
@@ -4471,9 +4534,8 @@ class SegmentationPipelineMixin:
         level = float((data_max + data_min) / 2.0)
         self.window_level = {o: (window, level) for o in ['axial', 'coronal', 'sagittal']}
 
-        # Refresh Teaching planes lightly (Online UI focuses on Viewer MPR).
-        for o in ['axial', 'coronal', 'sagittal']:
-            self.update_plane_view(o)
+        if paint_mpr:
+            self._render_teaching_initial_planes()
 
         self.check_ready_state()
 

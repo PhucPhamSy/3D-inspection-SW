@@ -577,10 +577,6 @@ class MultiPlanarView(VolumeIOMixin, AlignSidebarMixin, SliceViewMixin, StatsPan
         Always visits every known overlay — not only layout-visible keys — so
         Online progress dialogs cannot leave strips permanently hidden.
         """
-        try:
-            QApplication.processEvents()
-        except Exception:
-            pass
         visible = getattr(self, "_layout_visible_keys", None)
         if not visible:
             visible = set(getattr(self, "_grid_cells", {}).keys()) or {
@@ -600,7 +596,17 @@ class MultiPlanarView(VolumeIOMixin, AlignSidebarMixin, SliceViewMixin, StatsPan
                     overlay.update_position()
                 except Exception:
                     pass
-            if vtk_w is not None:
+            should_render = key in visible
+            if (
+                should_render
+                and key == "view_3d"
+                and hasattr(self, "is_3d_volume_render_enabled")
+                and not self.is_3d_volume_render_enabled()
+            ):
+                # 3D OFF placeholder is static; skip expensive render churn while
+                # users resize splitters/layout in Online mode.
+                should_render = False
+            if should_render and vtk_w is not None:
                 try:
                     rw = vtk_w.GetRenderWindow()
                     if rw is not None:
@@ -1003,12 +1009,6 @@ class MultiPlanarView(VolumeIOMixin, AlignSidebarMixin, SliceViewMixin, StatsPan
         so cameras fit the new viewport sizes — same action as the per-pane
         refresh button on the overlay strip.
         """
-        # Ensure new cell sizes are committed before ResetCamera
-        try:
-            QApplication.processEvents()
-        except Exception:
-            pass
-
         self._activate_layout_pane_resets()
 
         for key in getattr(self, "_layout_visible_keys", set()):
@@ -1017,7 +1017,14 @@ class MultiPlanarView(VolumeIOMixin, AlignSidebarMixin, SliceViewMixin, StatsPan
                 vtk_w = getattr(self, "view_3d_widget", None)
             else:
                 vtk_w = getattr(self, f"{key}_widget", None)
-            if vtk_w is not None:
+            should_render = True
+            if (
+                key == "view_3d"
+                and hasattr(self, "is_3d_volume_render_enabled")
+                and not self.is_3d_volume_render_enabled()
+            ):
+                should_render = False
+            if should_render and vtk_w is not None:
                 try:
                     rw = vtk_w.GetRenderWindow()
                     if rw is not None:

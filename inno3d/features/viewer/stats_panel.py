@@ -41,6 +41,7 @@ from inno3d.features.shared.b2b_gap_3d import (
 from inno3d.features.shared.mes_highlight_3d import MESHighlightOverlay
 from inno3d.features.shared.mes_mapping import (
     MesPickDebounce,
+    build_label_to_stats_index as _shared_build_label_to_stats_index,
     centroid_nav_xyz as _shared_centroid_nav_xyz,
     label_at_stat_centroid as _shared_label_at_stat_centroid,
     label_at_volume_xyz as _shared_label_at_volume_xyz,
@@ -713,6 +714,8 @@ class StatsPanelMixin:
         table.blockSignals(True)
         table.setRowCount(0)
         table.setRowCount(len(self.object_stats))
+        # Fast MPR/3D pick → row: rebuild after every table fill.
+        self._rebuild_mes_label_index()
 
         for row, stat in enumerate(self.object_stats):
             is_ng = (
@@ -1169,8 +1172,13 @@ class StatsPanelMixin:
             print("[B2B] 3D gap skipped: no renderer/volume")
             return
 
-        if not self.ensure_3d_volume_render_for_overlay(reason="b2b_gap"):
-            print("[B2B] 3D gap skipped: could not enable 3D volume")
+        # Respect explicit 3D OFF (Online default and user choice): table actions
+        # must not force-enable/rebuild volume rendering.
+        if (
+            not self.is_3d_volume_render_enabled()
+            or getattr(self, "volume_actor", None) is None
+        ):
+            print("[B2B] 3D gap skipped: 3D render disabled")
             return
 
         if hasattr(self, "_clear_mes_3d_highlight"):
@@ -1297,9 +1305,14 @@ class StatsPanelMixin:
             self._clear_mes_3d_highlight(render=True)
             return
 
-        if not self.is_3d_volume_render_enabled() or getattr(self, "volume_actor", None) is None:
-            if not self.ensure_3d_volume_render_for_overlay(reason="mes_pick"):
-                return
+        # Respect explicit 3D OFF (Online default and user choice): MES mapping
+        # should stay MPR-only and never force a 3D rebuild.
+        if (
+            not self.is_3d_volume_render_enabled()
+            or getattr(self, "volume_actor", None) is None
+        ):
+            self._clear_mes_3d_highlight(render=False, restore_context=True)
+            return
 
         ov = self._get_mes_highlight_overlay()
         ov.update(
@@ -1680,13 +1693,26 @@ class StatsPanelMixin:
                     return row
         return None
 
+    def _rebuild_mes_label_index(self):
+        """Rebuild ``label → object_stats index`` for O(1) MPR/3D picks."""
+        self._mes_label_to_stats_idx = _shared_build_label_to_stats_index(
+            getattr(self, "object_stats", None)
+        )
+
     def _stats_index_for_label(self, label):
         """Map labeled_class1 id → index in ``object_stats`` (shared)."""
+        idx_map = getattr(self, "_mes_label_to_stats_idx", None)
+        if idx_map is None:
+            self._rebuild_mes_label_index()
+            idx_map = getattr(self, "_mes_label_to_stats_idx", None)
+        # Pick path: prefer explicit label cache; avoid O(n) centroid scans.
         return _shared_stats_index_for_label(
             getattr(self, "object_stats", None),
             label,
             labeled=getattr(self, "labeled_class1_data", None),
             z_offset=int(getattr(self, "_measurement_start_slice", 0) or 0),
+            allow_centroid_fallback=False,
+            label_index=idx_map,
         )
 
     def is_mes_multi_select(self):
@@ -1818,10 +1844,13 @@ class StatsPanelMixin:
             return
 
         selected_visual = self._mes_selected_visual_rows()
+        prev_selected = list(getattr(self, "selected_highlight_objects", []) or [])
         self.selected_highlight_objects = []
         target_stat = None
         current_item = table.currentItem()
         target_visual = current_item.row() if current_item is not None else -1
+        z_off = int(getattr(self, "_measurement_start_slice", 0) or 0)
+        labeled = getattr(self, "labeled_class1_data", None)
 
         for visual_row in selected_visual:
             stats_idx = self._stats_index_from_visual_row(visual_row)
@@ -1830,18 +1859,10 @@ class StatsPanelMixin:
             if stats_idx < 0 or stats_idx >= len(self.object_stats or []):
                 continue
             stat = self.object_stats[stats_idx]
-            try:
-                label = int(stat.get("label", 0))
-            except (TypeError, ValueError):
-                label = 0
-            if label <= 0 and getattr(self, "labeled_class1_data", None) is not None:
-                try:
-                    lab = self._label_at_stat_centroid(stat)
-                    if lab > 0:
-                        label = lab
-                        stat["label"] = lab
-                except Exception:
-                    pass
+            # Prefer explicit label (fast). Centroid fallback only when missing.
+            label = _shared_resolve_stat_label(
+                stat, labeled=labeled, z_offset=z_off
+            )
             if label > 0:
                 self.selected_highlight_objects.append((1, label))
             # Prefer current row for camera jump; else first selected
@@ -1852,17 +1873,25 @@ class StatsPanelMixin:
         if navigate_stat is not None:
             target_stat = navigate_stat
 
-        if navigate and target_stat is not None:
+        selection_changed = prev_selected != self.selected_highlight_objects
+        did_navigate = bool(navigate and target_stat is not None)
+        if did_navigate:
             self._navigate_to_object_stat(target_stat)
 
         if self.volume_data is not None:
-            for ori in ["axial", "coronal", "sagittal"]:
-                try:
-                    self.render_slice(ori, preserve_camera=True)
-                except Exception:
-                    pass
+            # CRITICAL: when selection changes, always refresh MPR panes.
+            # updatePoint() may no-op if already at the centroid, which would
+            # leave cyan highlights stale (MPR→MES felt "broken").
+            if selection_changed or not did_navigate:
+                for ori in ["axial", "coronal", "sagittal"]:
+                    try:
+                        self.render_slice(ori, preserve_camera=True)
+                    except Exception:
+                        pass
             try:
-                self._update_mes_3d_highlight()
+                # Keep 3D update cheap/no-op when selection does not change.
+                if selection_changed or did_navigate:
+                    self._update_mes_3d_highlight()
             except Exception:
                 pass
         elif not self.selected_highlight_objects:
@@ -2138,7 +2167,10 @@ class StatsPanelMixin:
         if xyz is None:
             return False
         x, y, z = xyz
-        lab = self._label_at_volume_xyz(x, y, z)
+        # Prefer exact voxel first; small neighborhood only on miss (pick latency).
+        lab = self._label_at_volume_xyz(x, y, z, search_rad=1)
+        if lab <= 0:
+            lab = self._label_at_volume_xyz(x, y, z, search_rad=3)
         if lab <= 0:
             if hasattr(self, "set_stats_info"):
                 try:

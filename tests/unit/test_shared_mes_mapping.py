@@ -48,6 +48,44 @@ def test_stats_index_and_resolve_label():
     assert stats[1]["label"] == 3
 
 
+def test_label_index_fast_path_skips_centroid():
+    from inno3d.features.shared.mes_mapping import build_label_to_stats_index
+
+    labeled = np.zeros((4, 4, 4), dtype=np.int32)
+    labeled[1, 1, 1] = 9
+    stats = [
+        {"label": 1, "centroid_z": 0, "centroid_y": 0, "centroid_x": 0},
+        {
+            "label": 0,
+            "centroid_z": 1,
+            "centroid_y": 1,
+            "centroid_x": 1,
+            "z_min": 1,
+            "z_max": 1,
+            "y_min": 1,
+            "y_max": 1,
+            "x_min": 1,
+            "x_max": 1,
+        },
+    ]
+    idx = build_label_to_stats_index(stats)
+    assert idx == {1: 0}
+    # With cache + no centroid fallback, unlabeled row is not discovered
+    assert (
+        stats_index_for_label(
+            stats, 9, labeled=labeled, allow_centroid_fallback=False, label_index=idx
+        )
+        is None
+    )
+    # Explicit labels still resolve via cache
+    assert (
+        stats_index_for_label(
+            stats, 1, allow_centroid_fallback=False, label_index=idx
+        )
+        == 0
+    )
+
+
 def test_centroid_nav_and_bbox():
     st = {
         "label": 2,

@@ -309,7 +309,7 @@ def run_boundary_analysis(
                 gr, gc = stat.get("grid_row", None), stat.get("grid_col", None)
                 try:
                     if gr is not None and gc is not None and gr != "?" and gc != "?":
-                        # Pass MES grid indices as-is (unified 0-based top-left XY)
+                        # Pass MES grid indices as-is (1-based (row,col); (1,1)=top-left)
                         grid_rows[lbl_val] = int(gr)
                         grid_cols[lbl_val] = int(gc)
                 except Exception:

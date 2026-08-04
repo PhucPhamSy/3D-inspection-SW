@@ -36,3 +36,13 @@ class TestOnlineMprWalltimeReport:
     def test_online_walltime_phase_noop_when_report_none(self):
         with online_walltime_phase(None, "ignored"):
             pass
+
+    def test_deferred_render_phases_are_reported(self):
+        report = OnlineMprWalltimeReport()
+        report.record("render_slice.axial", 0.01)
+        report.record("render_slice.coronal_deferred", 0.02)
+        report.record("render_slice.sagittal_deferred", 0.03)
+        text = "\n".join(report._format_lines())
+        assert "render_slice.axial" in text
+        assert "render_slice.coronal_deferred" in text
+        assert "render_slice.sagittal_deferred" in text

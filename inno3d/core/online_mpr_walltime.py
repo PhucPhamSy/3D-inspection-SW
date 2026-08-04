@@ -52,6 +52,10 @@ class OnlineMprWalltimeReport:
         with self._lock:
             self._marks[name] = offset
 
+    def get_mark(self, name: str) -> Optional[float]:
+        with self._lock:
+            return self._marks.get(name)
+
     def record(self, name: str, duration_s: float) -> None:
         with self._lock:
             self._durations[name] = duration_s
@@ -156,6 +160,8 @@ class OnlineMprWalltimeReport:
             "render_slice.axial",
             "render_slice.coronal",
             "render_slice.sagittal",
+            "render_slice.coronal_deferred",
+            "render_slice.sagittal_deferred",
             "render_slice_axial",
             "render_slice_coronal",
             "render_slice_sagittal",
@@ -173,9 +179,19 @@ class OnlineMprWalltimeReport:
             [
                 "",
                 "--- End-to-end ---",
-                f"receive_to_first_mpr_ready: {_fmt_seconds(total)}",
+                (
+                    f"receive_to_first_mpr_ready: "
+                    f"{_fmt_seconds(float(marks['first_mpr_ready']))}"
+                    if "first_mpr_ready" in marks
+                    else f"receive_to_report_write: {_fmt_seconds(total)}"
+                ),
             ]
         )
+        if "first_mpr_ready" in marks:
+            lines.append(
+                f"report_write_elapsed: {_fmt_seconds(total)} "
+                f"(includes work after first MPR; not first-paint latency)"
+            )
         return lines
 
 

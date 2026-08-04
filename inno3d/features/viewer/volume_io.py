@@ -1191,25 +1191,54 @@ class VolumeIOMixin:
 
                 z, y, x = self.volume_data.shape
 
-                self.axial_slice_slider.setMaximum(z - 1)
-                self.axial_slice_slider.setValue(z // 2)
+                # blockSignals: setValue would otherwise fire update_slice for each
+                # plane and cold-touch the whole memmap before axial-first paint.
+                for name, maximum, value in (
+                    ("axial_slice_slider", z - 1, z // 2),
+                    ("coronal_slice_slider", y - 1, y // 2),
+                    ("sagittal_slice_slider", x - 1, x // 2),
+                ):
+                    sl = getattr(self, name, None)
+                    if sl is None:
+                        continue
+                    sl.blockSignals(True)
+                    sl.setMaximum(maximum)
+                    sl.setValue(value)
+                    sl.blockSignals(False)
+
                 self.current_slices['axial'] = z // 2
 
                 # Coronal(Y): slices along Y axis, so max = y-1
-                self.coronal_slice_slider.setMaximum(y - 1)
-                self.coronal_slice_slider.setValue(y // 2)
                 self.current_slices['coronal'] = y // 2
 
                 # Sagittal(X): slices along X axis, so max = x-1
-                self.sagittal_slice_slider.setMaximum(x - 1)
-                self.sagittal_slice_slider.setValue(x // 2)
                 self.current_slices['sagittal'] = x // 2
 
                 # Init crosshair at center
                 self.crosshair_position = [x // 2, y // 2, z // 2]
-                for orientation in ['axial', 'coronal', 'sagittal']:
-                    with online_walltime_phase(wt, f"render_slice.{orientation}"):
-                        self.render_slice(orientation)
+                online_axial_first = bool(
+                    getattr(self, "_online_viewer_mode", False)
+                    and getattr(self, "_online_defer_non_axial_first_paint", False)
+                )
+
+                # A new update_all_views invalidates any stale deferred first-paint work.
+                self._cancel_online_deferred_mpr_paint()
+
+                if online_axial_first:
+                    # Online first-load path: paint axial immediately for fast first-touch
+                    # responsiveness, then defer non-axial panes to idle/next tick.
+                    with online_walltime_phase(wt, "render_slice.axial"):
+                        self.render_slice("axial")
+                    self._schedule_online_deferred_mpr_paint(wt)
+                    # One-shot gate: keep later update_all_views calls synchronous.
+                    self._online_defer_non_axial_first_paint = False
+                    # Critical: do NOT processEvents here — that drains the deferred
+                    # coronal/sagittal timers and stalls first-paint on cold sagittal I/O.
+                    self._online_skip_process_events_once = True
+                else:
+                    for orientation in ['axial', 'coronal', 'sagittal']:
+                        with online_walltime_phase(wt, f"render_slice.{orientation}"):
+                            self.render_slice(orientation)
 
                 # Online / 3D-off: skip GPU volume path so MPR paints first.
                 if hasattr(self, "is_3d_volume_render_enabled") and not self.is_3d_volume_render_enabled():
@@ -1247,8 +1276,12 @@ class VolumeIOMixin:
         elif hasattr(self, "align_sidebar"):
             self.align_sidebar.setVisible(True)
 
-        # Let Online MPR panes paint before the rest of the Online pipeline continues.
-        if getattr(self, "_online_viewer_mode", False):
+        # Avoid processEvents while deferred coronal/sagittal first-paint is queued.
+        # Cold memmap sagittal (~60s) used to get pulled into this call and inflate
+        # on_volume_loaded / first_mpr_ready wall-time.
+        skip_pe = bool(getattr(self, "_online_skip_process_events_once", False))
+        self._online_skip_process_events_once = False
+        if getattr(self, "_online_viewer_mode", False) and not skip_pe:
             try:
                 from PyQt5.QtWidgets import QApplication
                 QApplication.processEvents()
@@ -1258,7 +1291,80 @@ class VolumeIOMixin:
         # Force MPR tool strips (C1/C2/FS/Reset) back after Online dialogs hid them
         QTimer.singleShot(50, self._reposition_visible_overlays)
         QTimer.singleShot(200, self._reposition_visible_overlays)
-    
+
+    def _schedule_online_deferred_mpr_paint(self, wt):
+        """Schedule deferred non-axial panes for Online first paint.
+
+        Coronal and sagittal are staggered so a long cold sagittal memmap read
+        cannot block coronal, and neither is pulled into axial first-paint via
+        processEvents.
+        """
+        token = int(getattr(self, "_online_deferred_mpr_token", 0))
+        self._online_deferred_mpr_wt = wt
+        self._online_deferred_mpr_scheduled_token = token
+
+        # Coronal first (usually cheaper than sagittal on ZYX memmap).
+        timer_c = getattr(self, "_online_deferred_coronal_timer", None)
+        if timer_c is None:
+            timer_c = QTimer(self)
+            timer_c.setSingleShot(True)
+            timer_c.timeout.connect(self._run_online_deferred_coronal_paint)
+            self._online_deferred_coronal_timer = timer_c
+        timer_c.start(30)
+
+        # Sagittal later — worst cold-cache access pattern on TIFF memmap.
+        timer_s = getattr(self, "_online_deferred_sagittal_timer", None)
+        if timer_s is None:
+            timer_s = QTimer(self)
+            timer_s.setSingleShot(True)
+            timer_s.timeout.connect(self._run_online_deferred_sagittal_paint)
+            self._online_deferred_sagittal_timer = timer_s
+        timer_s.start(80)
+
+    def _cancel_online_deferred_mpr_paint(self):
+        """Cancel deferred Online first-paint coronal/sagittal render work."""
+        for attr in (
+            "_online_deferred_mpr_timer",
+            "_online_deferred_coronal_timer",
+            "_online_deferred_sagittal_timer",
+        ):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+        self._online_deferred_mpr_token = int(getattr(self, "_online_deferred_mpr_token", 0)) + 1
+
+    def _online_deferred_token_valid(self) -> bool:
+        scheduled = int(getattr(self, "_online_deferred_mpr_scheduled_token", -1))
+        current = int(getattr(self, "_online_deferred_mpr_token", 0))
+        return scheduled == current and self.volume_data is not None
+
+    def _run_online_deferred_coronal_paint(self):
+        if not self._online_deferred_token_valid():
+            return
+        wt = getattr(self, "_online_deferred_mpr_wt", None)
+        try:
+            with online_walltime_phase(wt, "render_slice.coronal_deferred"):
+                self.render_slice("coronal")
+        except Exception:
+            pass
+
+    def _run_online_deferred_sagittal_paint(self):
+        if not self._online_deferred_token_valid():
+            return
+        wt = getattr(self, "_online_deferred_mpr_wt", None)
+        try:
+            with online_walltime_phase(wt, "render_slice.sagittal_deferred"):
+                self.render_slice("sagittal")
+        except Exception:
+            pass
+
+    def _run_online_deferred_mpr_paint(self):
+        """Legacy combined deferred paint (kept for any external callers)."""
+        self._run_online_deferred_coronal_paint()
+        self._run_online_deferred_sagittal_paint()    
     def update_slice(self, orientation, value):
         """Slider moved → update crosshair axis for that plane (full linked sync).
 
@@ -1925,7 +2031,7 @@ class VolumeIOMixin:
     def _index_label_text(self, stat, has_grid):
         """Single identity string: Bump (R,C) or MES # — never both + R# header."""
         if has_grid:
-            return f"{stat['grid_row']},{stat['grid_col']}"
+            return f"({stat['grid_row']},{stat['grid_col']})"
         return str(stat.get("row_id", stat.get("label", "")))
 
     def _draw_axial_labels(
@@ -1933,6 +2039,7 @@ class VolumeIOMixin:
     ):
         """XY: one (R,C) plate per bump at centroid — no R#/C# edge rails."""
         selected_labels = selected_labels or set()
+        vol_y = self.volume_data.shape[1] if self.volume_data is not None else 1
         seen = set()
         for stat, _z_off in visible_stats:
             if has_grid:
@@ -1950,10 +2057,12 @@ class VolumeIOMixin:
                 continue
             cx = float(stat["centroid_x"])
             cy = float(stat["centroid_y"])
+            # Axial MPR uses np.flipud: VTK Y = (vol_y-1) - voxel_y (same as crosshair).
+            cy_display = float((vol_y - 1) - cy)
             # Slight inset from geometric edge so labels on rim bumps stay on the pad
             caption = vtk.vtkTextActor3D()
             caption.SetInput(text)
-            caption.SetPosition(cx, cy, 0.55)
+            caption.SetPosition(cx, cy_display, 0.55)
             sc = label_scale * (1.15 if is_sel else 1.0)
             caption.SetScale(sc, sc, sc)
             self._style_index_text_prop(

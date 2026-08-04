@@ -28,10 +28,17 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import QThread, Qt, pyqtSignal
+import psutil
+from PyQt5.QtCore import QThread, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import *
 from skimage import io
 
+from inno3d.app.settings import (
+    get_online_fdc_enabled,
+    get_online_fdc_interval_sec,
+    get_online_fdc_target_host,
+    get_online_fdc_target_port,
+)
 from inno3d.core.styles import SemiconductorTheme
 from inno3d.core.online_mpr_walltime import (
     OnlineMprWalltimeReport,
@@ -87,7 +94,15 @@ class OnlineModeMixin:
         if note:
             wt.set_meta(f"note_{phase_name}", str(note))
 
-    def _online_walltime_finalize_first_mpr(self):
+    def _online_walltime_finalize_if_current(self, expected_wt, *, mark_ready=False):
+        """Finalize only if *expected_wt* is still the active Online report."""
+        if expected_wt is None:
+            return
+        if getattr(self, "_online_mpr_walltime", None) is not expected_wt:
+            return
+        self._online_walltime_finalize_first_mpr(mark_ready=mark_ready)
+
+    def _online_walltime_finalize_first_mpr(self, *, mark_ready=True):
         """Seal receive → first MPR timing and write final report."""
         wt = getattr(self, "_online_mpr_walltime", None)
         if wt is None:
@@ -105,11 +120,15 @@ class OnlineModeMixin:
                 )
             except Exception:
                 pass
-        wt.mark("first_mpr_ready")
+        if mark_ready:
+            wt.mark("first_mpr_ready")
         report_path = wt.write_report(output_dir=Path(__file__).resolve().parents[3] / "output")
         if report_path is not None:
-            total_s = wt.elapsed_total()
-            msg = f"[WALLTIME] first MPR ready in {total_s:.2f}s → {report_path}"
+            # Prefer the true first-MPR milestone; elapsed_total() includes work after paint.
+            ready_s = wt.get_mark("first_mpr_ready")
+            if ready_s is None:
+                ready_s = wt.elapsed_total()
+            msg = f"[WALLTIME] first MPR ready in {ready_s:.2f}s → {report_path}"
             print(f"[ONLINE] {msg}")
             if hasattr(self, "_online_append_log") and self._online_append_log:
                 self._online_append_log(msg, SemiconductorTheme.TEXT_SECONDARY)
@@ -349,8 +368,143 @@ class OnlineModeMixin:
         # Update navigation buttons state (Title Bar)
         for i, btn in enumerate(self.title_bar.nav_btns):
             btn.setChecked(i == index)
-    
-    
+
+    def _online_log_fdc(self, msg, color=SemiconductorTheme.TEXT_SECONDARY):
+        """Best-effort log sink for always-on FDC monitor sender."""
+        text = f"[FDC] {msg}"
+        _log(text)
+        if hasattr(self, "_online_append_log") and self._online_append_log:
+            self._online_append_log(text, color)
+
+    def _online_close_fdc_socket(self):
+        sock = getattr(self, "_fdc_monitor_socket", None)
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except Exception:
+            pass
+        self._fdc_monitor_socket = None
+
+    @staticmethod
+    def _online_build_fdc_monitor_packet(cpu, memory, disk_values):
+        """Encode Recon FDC packet as little-endian ULONGLONG sequence.
+
+        Confirmed by Mr Nam (2026-08-04):
+          - Field type: uint64 / ULONGLONG (%04llu)
+          - Scale: 99.99% -> 9999 (percent * 100)
+          - Disk array: A..J (10 entries); A/B stay 0, display C..J
+          - Packet: CPU + MEM + Disk[10] = 12 * uint64 = 96 bytes
+        """
+        vals = [int(cpu), int(memory)] + [int(v) for v in (disk_values or [])[:10]]
+        while len(vals) < 12:
+            vals.append(0)
+        vals = [max(0, min(10000, int(v))) for v in vals[:12]]
+        return struct.pack("<12Q", *vals)
+
+    @staticmethod
+    def _online_collect_fdc_monitor_values():
+        """Collect CPU/MEM and disk A..J usage (percent * 100 as ULONGLONG)."""
+        cpu = int(round(psutil.cpu_percent(interval=None) * 100.0))
+        mem = int(round(psutil.virtual_memory().percent * 100.0))
+        disks = []
+        for drive in "ABCDEFGHIJ":
+            # A/B are reserved in Recon sample code (always 0).
+            if drive in ("A", "B"):
+                disks.append(0)
+                continue
+            root = f"{drive}:\\"
+            value = 0
+            try:
+                if os.path.exists(root):
+                    usage = shutil.disk_usage(root)
+                    if usage.total > 0:
+                        value = int(round((usage.used * 10000.0) / usage.total))
+            except Exception:
+                value = 0
+            disks.append(value)
+        return cpu, mem, disks
+
+    def _online_send_fdc_monitor_packet(self):
+        """Send one periodic FDC monitor packet to Recon endpoint."""
+        host = getattr(self, "_fdc_monitor_host", "127.0.0.1")
+        port = int(getattr(self, "_fdc_monitor_port", 8100))
+        timeout_s = float(getattr(self, "_fdc_monitor_timeout_sec", 1.5))
+        try:
+            sock = getattr(self, "_fdc_monitor_socket", None)
+            if sock is None:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout_s)
+                sock.connect((host, port))
+                self._fdc_monitor_socket = sock
+                self._online_log_fdc(f"connected to Recon {host}:{port}")
+
+            cpu, mem, disks = self._online_collect_fdc_monitor_values()
+            payload = self._online_build_fdc_monitor_packet(cpu, mem, disks)
+            sock.sendall(payload)
+            self._fdc_last_send_ok_ts = time.time()
+        except Exception as e:
+            self._online_close_fdc_socket()
+            now = time.time()
+            last = float(getattr(self, "_fdc_last_error_log_ts", 0.0))
+            if now - last >= 10.0:
+                self._fdc_last_error_log_ts = now
+                self._online_log_fdc(
+                    f"send failed to {host}:{port}: {e}",
+                    SemiconductorTheme.ACCENT_WARNING,
+                )
+
+    def _online_on_fdc_timer(self):
+        if not bool(getattr(self, "_fdc_monitor_enabled", True)):
+            return
+        self._online_send_fdc_monitor_packet()
+
+    def _online_start_fdc_monitor_sender(self):
+        """Start always-on periodic FDC monitor sender (independent of Online mode)."""
+        self._fdc_monitor_enabled = bool(get_online_fdc_enabled())
+        self._fdc_monitor_host = str(get_online_fdc_target_host())
+        self._fdc_monitor_port = int(get_online_fdc_target_port())
+        self._fdc_monitor_interval_sec = float(get_online_fdc_interval_sec())
+        self._fdc_monitor_timeout_sec = 1.5
+
+        if not self._fdc_monitor_enabled:
+            self._online_log_fdc("disabled by config (ONLINE.fdc_enabled=false)")
+            return
+
+        timer = getattr(self, "_fdc_monitor_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.timeout.connect(self._online_on_fdc_timer)
+            self._fdc_monitor_timer = timer
+
+        interval_ms = max(500, int(round(self._fdc_monitor_interval_sec * 1000.0)))
+        if not timer.isActive():
+            timer.start(interval_ms)
+        else:
+            timer.setInterval(interval_ms)
+
+        self._online_log_fdc(
+            f"always-on sender started: {self._fdc_monitor_host}:{self._fdc_monitor_port} "
+            f"every {self._fdc_monitor_interval_sec:.1f}s"
+        )
+        # Prime CPU counters and push first packet immediately.
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+        self._online_send_fdc_monitor_packet()
+
+    def _online_stop_fdc_monitor_sender(self):
+        """Stop periodic FDC monitor sender and close socket."""
+        timer = getattr(self, "_fdc_monitor_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._online_close_fdc_socket()
+        self._online_log_fdc("always-on sender stopped")
+
     def toggle_online(self):
         """Toggle Online mode ON/OFF"""
         import time as _time
@@ -755,61 +909,91 @@ class OnlineModeMixin:
             if hasattr(self, "set_online_app_sidebar_layout"):
                 self.set_online_app_sidebar_layout(False)
 
-            # Force viewer overlays and VTK widgets to repaint cleanly after Online mode UI changes.
-            for orientation in ['axial', 'coronal', 'sagittal']:
-                overlay = getattr(self.multiplanar_tab, f'{orientation}_overlay_group', None)
-                if overlay is not None:
-                    if getattr(overlay, 'slider_bar', None) is not None:
+            # Re-enable navigation immediately (do not wait on VTK)
+            for btn in self.title_bar.nav_btns:
+                btn.setEnabled(True)
+
+            self._online_processing = False
+            self.status_label.setText("ONLINE: Disconnected - Manual mode")
+
+            # --- Restore previous config (defer file I/O so layout can settle) ---
+            QTimer.singleShot(0, self._finish_online_off_restore)
+
+            # Defer MPR/overlay refresh until after splitter/sidebar thrash settles.
+            # Sync triple render_slice + forced render_3d here used to freeze the UI.
+            QTimer.singleShot(80, self._refresh_viewer_after_online_off)
+
+            self.online_config_folder = None
+
+    def _finish_online_off_restore(self):
+        """Restore Teaching paths/config after Online OFF (runs off the toggle hot path)."""
+        seg_tab = getattr(self, "segmentation_tab", None)
+        if seg_tab is None:
+            return
+        try:
+            if getattr(self, "_old_manual_config", None) and os.path.exists(self._old_manual_config):
+                seg_tab.load_config_file(self._old_manual_config)
+            self._old_manual_config = None
+        except Exception:
+            self._old_manual_config = None
+
+        try:
+            manual_state = getattr(self, "_manual_online_state", None)
+            if not manual_state:
+                return
+            online_source = getattr(self, "_online_source_file", "")
+            restored_input = online_source or manual_state.get("input_path_text", "")
+            restored_output = (
+                manual_state.get("output_path_text", "")
+                or (seg_tab.output_path_input.text().strip() if hasattr(seg_tab, "output_path_input") else "")
+            )
+            if hasattr(seg_tab, "input_path_input"):
+                seg_tab.input_path_input.setText(restored_input)
+            if hasattr(seg_tab, "output_path_input"):
+                seg_tab.output_path_input.setText(restored_output)
+            if getattr(seg_tab, "config", None) is not None:
+                if restored_input:
+                    seg_tab.config.inputPath = restored_input.encode("utf-8")
+                elif manual_state.get("config_input_path") is not None:
+                    seg_tab.config.inputPath = manual_state["config_input_path"]
+                if restored_output:
+                    seg_tab.config.outputDir = restored_output.encode("utf-8")
+                elif manual_state.get("config_output_dir") is not None:
+                    seg_tab.config.outputDir = manual_state["config_output_dir"]
+            else:
+                seg_tab._pending_input_path = restored_input or None
+            self._manual_online_state = None
+        except Exception:
+            self._manual_online_state = None
+
+    def _refresh_viewer_after_online_off(self):
+        """Lightweight post-Offline paint: overlays + MPR; 3D only if still enabled."""
+        mpv = getattr(self, "multiplanar_tab", None)
+        if mpv is None:
+            return
+        for orientation in ("axial", "coronal", "sagittal"):
+            overlay = getattr(mpv, f"{orientation}_overlay_group", None)
+            if overlay is not None:
+                try:
+                    if getattr(overlay, "slider_bar", None) is not None:
                         overlay.slider_bar.hide()
                     overlay.adjustSize()
                     overlay.update_position()
-                try:
-                    self.multiplanar_tab.render_slice(orientation, preserve_camera=True)
                 except Exception:
                     pass
+            if getattr(mpv, "volume_data", None) is None:
+                continue
             try:
-                self.multiplanar_tab.render_3d()
+                mpv.render_slice(orientation, preserve_camera=True)
             except Exception:
                 pass
-            self.multiplanar_tab.update()
-            self.multiplanar_tab.repaint()
-            
-            # Re-enable navigation
-            for btn in self.title_bar.nav_btns:
-                btn.setEnabled(True)
-            
-            self._online_processing = False
-            self.status_label.setText("ONLINE: Disconnected - Manual mode")
-            
-            # --- Restore previous config ---
-            if hasattr(self, '_old_manual_config') and self._old_manual_config:
-                if os.path.exists(self._old_manual_config):
-                    seg_tab.load_config_file(self._old_manual_config)
-                self._old_manual_config = None
-
-            if hasattr(self, '_manual_online_state') and self._manual_online_state:
-                manual_state = self._manual_online_state
-                online_source = getattr(self, '_online_source_file', '')
-                restored_input = online_source or manual_state.get('input_path_text', '')
-                restored_output = manual_state.get('output_path_text', '') or seg_tab.output_path_input.text().strip()
-                if hasattr(seg_tab, 'input_path_input'):
-                    seg_tab.input_path_input.setText(restored_input)
-                if hasattr(seg_tab, 'output_path_input'):
-                    seg_tab.output_path_input.setText(restored_output)
-                if getattr(seg_tab, 'config', None) is not None:
-                    if restored_input:
-                        seg_tab.config.inputPath = restored_input.encode('utf-8')
-                    elif manual_state.get('config_input_path') is not None:
-                        seg_tab.config.inputPath = manual_state['config_input_path']
-                    if restored_output:
-                        seg_tab.config.outputDir = restored_output.encode('utf-8')
-                    elif manual_state.get('config_output_dir') is not None:
-                        seg_tab.config.outputDir = manual_state['config_output_dir']
-                else:
-                    seg_tab._pending_input_path = restored_input or None
-                self._manual_online_state = None
-            
-            self.online_config_folder = None
+        # Never force a GPU volume rebuild here — that was the Offline stutter.
+        try:
+            if hasattr(mpv, "is_3d_volume_render_enabled") and mpv.is_3d_volume_render_enabled():
+                if hasattr(mpv, "view_3d_widget") and mpv.view_3d_widget is not None:
+                    mpv.view_3d_widget.GetRenderWindow().Render()
+        except Exception:
+            pass
     
     def load_online_wafer_context(self, payload):
         """Push Wafer/Chip/FOV map from CT host / DB into the 3D Viewer CONTEXT panel.
@@ -1375,23 +1559,47 @@ class OnlineModeMixin:
                     except Exception:
                         pass
 
-                # Display volume in Viewer (MPR). processEvents lets panes paint before Teaching sync.
-                mpv.on_volume_loaded(data, error)
+                # Online first-load paint strategy: render axial first, then defer
+                # coronal/sagittal to next UI tick for memmap first-touch latency.
                 try:
-                    QApplication.processEvents()
+                    if hasattr(mpv, "_cancel_online_deferred_mpr_paint"):
+                        mpv._cancel_online_deferred_mpr_paint()
+                    mpv._online_defer_non_axial_first_paint = True
                 except Exception:
                     pass
-                self._online_walltime_finalize_first_mpr()
 
-                # Also set in segmentation tab for pipeline / manual cropping
+                # Display volume in Viewer (MPR). Mark first MPR as soon as axial
+                # returns — do NOT processEvents here (that used to drain deferred
+                # sagittal and stall ~60s on cold 11GB memmap).
+                mpv.on_volume_loaded(data, error)
+                if wt is not None:
+                    wt.mark("first_mpr_ready")
+                    # Finalize after coronal can land; do not wait for sagittal.
+                    QTimer.singleShot(
+                        120,
+                        lambda _wt=wt: self._online_walltime_finalize_if_current(
+                            _wt, mark_ready=False
+                        ),
+                    )
+
+                # Sync Teaching volume for pipeline/crop — skip Teaching MPR paint so a
+                # cold memmap does not re-touch coronal/sagittal before Viewer first paint
+                # finishes (and before the wall-time report is finalized).
                 src_label = getattr(self, '_online_source_file', None) or (
                     str(self._online_volume_files[0])
                     if getattr(self, '_online_volume_files', None) else None
                 )
-                self.segmentation_tab.set_volume_data(
-                    getattr(mpv, "volume_data", data),
-                    src_label,
-                )
+                try:
+                    self.segmentation_tab.set_volume_data(
+                        getattr(mpv, "volume_data", data),
+                        src_label,
+                        paint_mpr=False,
+                    )
+                except TypeError:
+                    self.segmentation_tab.set_volume_data(
+                        getattr(mpv, "volume_data", data),
+                        src_label,
+                    )
 
                 # Clamp/remap layers to actual loaded Z depth (safety after crop)
                 if mpv.volume_data is not None:
@@ -1431,7 +1639,7 @@ class OnlineModeMixin:
             self._run_online_enhancement()
         else:
             self._start_online_segmentation()
-    
+
     def _get_online_volume_for_enhance(self):
         """Return (Z,Y,X) ndarray already loaded for this FOV, or None."""
         for src in (
@@ -2553,12 +2761,22 @@ class OnlineModeMixin:
                 mpv.object_stats = mes_stats
                 # Full-volume absolute Z (process_memory start_slice=0)
                 mpv._measurement_start_slice = 0
-                # Visualize only AFTER FAR (DLL already applied)
+                if hasattr(mpv, "_rebuild_mes_label_index"):
+                    try:
+                        mpv._rebuild_mes_label_index()
+                    except Exception:
+                        pass
+                # Visualize only AFTER FAR (DLL already applied). Keep Online 3D OFF.
                 if hasattr(mpv, "update_all_views"):
                     try:
                         for ori in ("axial", "coronal", "sagittal"):
                             mpv.render_slice(ori, preserve_camera=True)
-                        mpv.render_3d()
+                        if (
+                            hasattr(mpv, "is_3d_volume_render_enabled")
+                            and mpv.is_3d_volume_render_enabled()
+                            and hasattr(mpv, "render_3d")
+                        ):
+                            mpv.render_3d()
                     except Exception:
                         pass
                 if hasattr(mpv, "populate_object_stats_table"):

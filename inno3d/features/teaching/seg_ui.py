@@ -3582,7 +3582,7 @@ class SegmentationUIMixin:
 
     def _index_label_text(self, stat, has_grid):
         if has_grid:
-            return f"{stat['grid_row']},{stat['grid_col']}"
+            return f"({stat['grid_row']},{stat['grid_col']})"
         return str(stat.get("row_id", stat.get("label", "")))
 
     def _draw_axial_labels(
@@ -3590,6 +3590,7 @@ class SegmentationUIMixin:
     ):
         """XY: one (R,C) plate per bump at centroid — no R#/C# edge rails."""
         selected_labels = selected_labels or set()
+        vol_y = self.volume_data.shape[1] if self.volume_data is not None else 1
         seen = set()
         for stat, _z_off in visible_stats:
             if has_grid:
@@ -3607,9 +3608,11 @@ class SegmentationUIMixin:
                 continue
             cx = float(stat["centroid_x"])
             cy = float(stat["centroid_y"])
+            # Axial MPR uses np.flipud: VTK Y = (vol_y-1) - voxel_y (same as crosshair).
+            cy_display = float((vol_y - 1) - cy)
             caption = vtk.vtkTextActor3D()
             caption.SetInput(text)
-            caption.SetPosition(cx, cy, 0.55)
+            caption.SetPosition(cx, cy_display, 0.55)
             sc = label_scale * (1.15 if is_sel else 1.0)
             caption.SetScale(sc, sc, sc)
             self._style_index_text_prop(
@@ -4143,7 +4146,7 @@ class SegmentationUIMixin:
         """Map selected boundary gap onto the 3D Volume only (not MPR).
 
         Gap is a true 3D spatial distance — MPR slices make it hard to interpret.
-        Auto-enables Teaching 3D view when needed.
+        Does not auto-enable Teaching 3D when user keeps 3D OFF.
 
         Coordinates: CSV Src/Dst voxel Z are **layer-local** (same as Viewer Online).
         Must add ``_b2b_layer_z_offset(row)`` before drawing or markers sit at wrong Z.
@@ -4173,15 +4176,10 @@ class SegmentationUIMixin:
             except (TypeError, ValueError):
                 return default
 
-        # Ensure 3D volume panel is on + spacing synced from Viewer (B2B world coords)
+        # Keep spacing synced from Viewer (B2B world coords) when available.
         self._sync_3d_spacing_from_viewer()
-        if not getattr(self, '_3d_view_active', False):
-            if hasattr(self, '_3d_enable_check'):
-                self._3d_enable_check.blockSignals(True)
-                self._3d_enable_check.setChecked(True)
-                self._3d_enable_check.blockSignals(False)
-            self._toggle_teaching_3d(True)
-        else:
+        is_3d_active = bool(getattr(self, '_3d_view_active', False))
+        if is_3d_active:
             # Re-render so vtk spacing / Seg Overlay masks match current masks
             try:
                 self._render_teaching_3d()
@@ -4217,6 +4215,13 @@ class SegmentationUIMixin:
                     f"localSRC=({_iv('Src_voxel_Z')},{_iv('Src_voxel_Y')},{_iv('Src_voxel_X')}) "
                     f"→ globalSRC={src} globalDST={dst}"
                 )
+                if not is_3d_active:
+                    if hasattr(self, 'bnd_info_label'):
+                        self.bnd_info_label.setText(
+                            f"Selected gap {layer} {src_rc}→{dst_rc} ({direction}) {eucl}µm"
+                            " · 3D is OFF (enable 3D to display gap overlay)"
+                        )
+                    return
 
                 self._draw_boundary_gap_line(
                     src_voxel=src,
@@ -4240,6 +4245,13 @@ class SegmentationUIMixin:
             eucl = r.get('min_gap_euclidean_um', '?')
             bump = r.get('Bump_id', '')
             label = f"{bump} min-gap {eucl}µm".strip()
+            if not is_3d_active:
+                if hasattr(self, 'bnd_info_label'):
+                    self.bnd_info_label.setText(
+                        f"Selected min-gap {label} (Z+{z_offset})"
+                        " · 3D is OFF (enable 3D to display gap overlay)"
+                    )
+                return
             self._draw_boundary_gap_line(
                 src_voxel=(vz, vy, vx),
                 dst_voxel=(vz, vy, vx + 1),

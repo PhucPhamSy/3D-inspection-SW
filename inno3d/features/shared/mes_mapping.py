@@ -140,12 +140,35 @@ def resolve_stat_label(
     return 0
 
 
+def build_label_to_stats_index(
+    object_stats: Optional[Sequence[Dict[str, Any]]],
+) -> Dict[int, int]:
+    """O(n) map ``label → object_stats index`` from explicit ``stat['label']`` only.
+
+    Used for fast MPR/3D pick → MES row lookup. Skips centroid fallbacks so pick
+    stays O(1) after the table is built.
+    """
+    out: Dict[int, int] = {}
+    if not object_stats:
+        return out
+    for i, st in enumerate(object_stats):
+        try:
+            lab = int(st.get("label", 0))
+        except (TypeError, ValueError):
+            continue
+        if lab > 0 and lab not in out:
+            out[lab] = i
+    return out
+
+
 def stats_index_for_label(
     object_stats: Optional[Sequence[Dict[str, Any]]],
     label: Any,
     *,
     labeled=None,
     z_offset: int = 0,
+    allow_centroid_fallback: bool = True,
+    label_index: Optional[Dict[int, int]] = None,
 ) -> Optional[int]:
     """Map labeled_class1 id → index in ``object_stats``."""
     if not label or not object_stats:
@@ -156,6 +179,13 @@ def stats_index_for_label(
         return None
     if label <= 0:
         return None
+    if label_index is not None:
+        idx = label_index.get(label)
+        if idx is not None:
+            return idx
+        # Cache miss: do not fall back to per-row centroid scans on pick path.
+        if not allow_centroid_fallback:
+            return None
     for i, st in enumerate(object_stats):
         try:
             lab = int(st.get("label", 0))
@@ -163,7 +193,7 @@ def stats_index_for_label(
             lab = 0
         if lab == label:
             return i
-        if lab <= 0 and labeled is not None:
+        if allow_centroid_fallback and lab <= 0 and labeled is not None:
             lab2 = label_at_stat_centroid(labeled, st, z_offset=z_offset)
             if lab2 == label:
                 st["label"] = lab2

@@ -248,8 +248,9 @@ def _sample_value_range_zyx(
 ) -> Tuple[float, float]:
     """Fast approximate min/max for very large dense arrays.
 
-    Uses a regular 3D stride sample to avoid a full 10+ GB scan during Online
-    first-paint. Falls back to exact min/max when the volume is already small.
+    Prefers a few full XY planes near mid-Z (axial-friendly sequential reads)
+    so cold memmap / page-cache warmup does not random-stride the whole file.
+    Falls back to exact min/max when the volume is already small.
     """
     if data.size == 0:
         return 0.0, 0.0
@@ -257,9 +258,15 @@ def _sample_value_range_zyx(
     if int(data.size) <= max_samples:
         return float(np.min(data)), float(np.max(data))
     z, y, x = (int(v) for v in data.shape)
-    stride = int(np.ceil((float(z * y * x) / float(max_samples)) ** (1.0 / 3.0)))
-    stride = max(1, stride)
-    sampled = data[::stride, ::stride, ::stride]
+    plane = max(1, int(y) * int(x))
+    n_planes = max(1, min(int(z), int(max_samples // plane) or 1))
+    if n_planes <= 1:
+        zi = int(z) // 2
+        sampled = data[zi : zi + 1]
+    else:
+        # Evenly spaced Z planes through the stack (still mostly sequential per plane).
+        zs = np.linspace(0, z - 1, num=n_planes, dtype=np.int64)
+        sampled = data[zs]
     if sampled.size == 0:
         sampled = data.reshape(-1)[:1]
     return float(np.min(sampled)), float(np.max(sampled))

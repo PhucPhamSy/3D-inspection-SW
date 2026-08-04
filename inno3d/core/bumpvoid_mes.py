@@ -389,12 +389,13 @@ def reindex_grid_top_left(
     """
     Unified indexing for MES Object Stats + B2B Boundary (Teaching-style, 1-based).
 
-    Convention (user / Online):
-      - Index starts at **(1,1)**
-      - **(1,1)** = top-left of the **XY** face:
-          row increases with image Y (down the axial plane)
-          col increases with image X (to the right)
-      - Sort: centroid_y ascending (top→bottom), then centroid_x ascending (left→right)
+    Samsung / production convention:
+      - Index starts at **(row, col) = (1,1)** — not (0,0)
+      - **(1,1)** = **top-left** of the axial XY view (visual top-left)
+      - On Viewer/Teaching axial MPR, ``np.flipud`` maps **low voxel-Y → top of
+        screen**, high voxel-Y → bottom. Therefore row 1 = smallest centroid_y.
+      - col increases with voxel-X (left → right)
+      - Sort: centroid_y ascending (top→bottom), then centroid_x ascending
       - Row grouping: |Δcy| < 0.7 * mean(object height)  [Teaching]
       - Pitch Gap X / Gap Y recomputed after index assign
 
@@ -421,9 +422,10 @@ def reindex_grid_top_left(
     def _index_one_plane(layer_stats: List[Dict[str, Any]], layer_name: str) -> None:
         if not layer_stats:
             return
-        # Top to bottom (cy descending), left to right (cx ascending)
+        # Top→bottom on axial MPR = low voxel-Y → high voxel-Y (after flipud).
+        # Left→right = low voxel-X → high voxel-X.
         layer_stats.sort(
-            key=lambda s: (-float(s.get("centroid_y", 0)), float(s.get("centroid_x", 0)))
+            key=lambda s: (float(s.get("centroid_y", 0)), float(s.get("centroid_x", 0)))
         )
         rows: List[List[Dict[str, Any]]] = []
         current = [layer_stats[0]]
@@ -448,10 +450,10 @@ def reindex_grid_top_left(
         for r_idx, row_list in enumerate(rows):
             row_list.sort(key=lambda s: float(s.get("centroid_x", 0)))
             for c_idx, s in enumerate(row_list):
-                s["grid_row"] = r_idx + 1  # 1-based, top row = 1
+                s["grid_row"] = r_idx + 1  # 1-based, visual top row = 1
                 s["grid_col"] = c_idx + 1  # 1-based, left col = 1
                 # Unified display id for MES # and B2B Bump (R,C)
-                s["bump_id"] = f"{r_idx + 1},{c_idx + 1}"  # raw for B2B DLL / CSV
+                s["bump_id"] = f"{r_idx + 1},{c_idx + 1}"
                 s["pitch_x"] = 0.0
                 s["pitch_y"] = 0.0
                 if c_idx < len(row_list) - 1:
@@ -472,11 +474,11 @@ def reindex_grid_top_left(
                     if abs(
                         float(closest.get("centroid_x", 0)) - float(s.get("centroid_x", 0))
                     ) < w_mean * 1.5:
-                        # Rows are ordered top→bottom (high Y → low Y). Gap is the
+                        # Rows are ordered top→bottom (low Y → high Y). Gap is the
                         # empty band between this object (above) and the next row (below).
                         s["pitch_y"] = max(
                             0.0,
-                            (int(s.get("y_min", 0)) - int(closest.get("y_max", 0))) * vy,
+                            (int(closest.get("y_min", 0)) - int(s.get("y_max", 0))) * vy,
                         )
                 final.append(s)
 
@@ -499,6 +501,10 @@ def reindex_grid_top_left(
     # Assign sequential row_id
     for idx, s in enumerate(final):
         s["row_id"] = idx + 1
+        # Keep bump_id aligned with (row,col) for MES/B2B/MPR display
+        gr, gc = s.get("grid_row"), s.get("grid_col")
+        if gr is not None and gc is not None:
+            s["bump_id"] = f"{gr},{gc}"
 
     return final
 
