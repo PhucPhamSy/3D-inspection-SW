@@ -717,17 +717,11 @@ class StatsPanelMixin:
         # Fast MPR/3D pick → row: rebuild after every table fill.
         self._rebuild_mes_label_index()
 
+        from inno3d.core.bumpvoid_mes import object_ratio_is_ng
+
         for row, stat in enumerate(self.object_stats):
-            is_ng = (
-                stat["ratio"] >= ng_threshold
-                if stat.get("ratio") != float("inf")
-                else True
-            )
-            judgment = stat.get("judgment")
-            if judgment in (1, 8):
-                judgment_str = "NG" if judgment == 1 else "OK"
-            else:
-                judgment_str = "NG" if is_ng else "OK"
+            is_ng = object_ratio_is_ng(stat.get("ratio", 0.0), ng_threshold)
+            judgment_str = "NG" if is_ng else "OK"
             ratio_val = stat.get("ratio", 0)
             ratio_str = (
                 f"{ratio_val * 100:.3f}"
@@ -1569,8 +1563,11 @@ class StatsPanelMixin:
                 ])
                 for stat in self.object_stats:
                     ratio_str = f"{stat['ratio']*100:.3f}%" if stat['ratio'] != float('inf') else "N/A"
-                    is_ng = stat['ratio'] >= ng_threshold if stat['ratio'] != float('inf') else True
-                    judgment_str = "NG" if is_ng else "OK"
+                    from inno3d.core.bumpvoid_mes import object_ratio_is_ng
+
+                    judgment_str = (
+                        "NG" if object_ratio_is_ng(stat["ratio"], ng_threshold) else "OK"
+                    )
                     
                     writer.writerow([
                         stat.get('row_id', ''),
@@ -1900,6 +1897,12 @@ class StatsPanelMixin:
                     self._clear_mes_3d_highlight(render=True)
                 except Exception:
                     pass
+        # P0.3: Notify Displace mixin whenever the selection changes so pivot resets.
+        if selection_changed and hasattr(self, '_displace_on_selection_changed'):
+            try:
+                self._displace_on_selection_changed()
+            except Exception:
+                pass
 
     def _mes_pick_is_duplicate(self, lab):
         """True if same label was picked very recently (shared debounce)."""
@@ -2316,6 +2319,12 @@ class StatsPanelMixin:
                 self._update_mes_3d_highlight()
             except Exception:
                 pass
+        # P0.3: Notify Displace so pivot resets to new selection centroid.
+        if hasattr(self, '_displace_on_selection_changed'):
+            try:
+                self._displace_on_selection_changed()
+            except Exception:
+                pass
 
     # ── Excel Filter Support ──────────────────────────
     def _apply_excel_filters(self, col_index):
@@ -2366,6 +2375,12 @@ class StatsPanelMixin:
             self.b2b_table.blockSignals(False)
         self._clear_b2b_gap_actors()
         self._clear_mes_3d_highlight(render=True)
+        # P0.3: Notify Displace so gizmos are cleared when selection is cleared.
+        if hasattr(self, '_displace_on_selection_changed'):
+            try:
+                self._displace_on_selection_changed()
+            except Exception:
+                pass
         if self.volume_data is not None:
             for ori in ['axial', 'coronal', 'sagittal']:
                 self.render_slice(ori, preserve_camera=True)

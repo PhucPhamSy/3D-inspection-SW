@@ -2,9 +2,8 @@
 Online-mode CONTEXT panel: Wafer map (chip-in-wafer) + Chip map (FOV-in-chip).
 
 Visual design reference: Innometry wafer-map email / 25×25 draw code
-  · Bin 0 = Outside (grey) · 1 = Bad NG (red) · 8 = Good OK (green)
-  · Selected chip = reticle (cluster-centroid style)
-  · Active FOV on 9-point chip map = amber highlight
+  · Display color = (before → after) pair: Pending/OK/NG × Bypass/OK/NG (9 colors)
+  · Outside = near-black; selected chip = reticle; active FOV = amber rim
 
 Does not modify MPR/3D panes — sits left of the plane grid when Online is ON.
 """
@@ -39,13 +38,22 @@ from PyQt5.QtWidgets import (
 
 from inno3d.core.styles import SemiconductorTheme
 from inno3d.core.wafer_context import (
-    BIN_NG,
-    BIN_OK,
+    BIN_BYPASS,
     BIN_OUTSIDE,
     BIN_PENDING,
+    PAIR_BORDER,
+    PAIR_FILL,
+    STATE_BYPASS,
+    STATE_NG,
+    STATE_OK,
+    STATE_PEND,
     HostVolumePathInfo,
     NgCluster,
     WaferContext,
+    pair_border_hex,
+    pair_fill_hex,
+    pair_glyph,
+    pair_label,
 )
 
 
@@ -55,23 +63,87 @@ def _c(hex_or_name: str, alpha: int = 255) -> QColor:
     return col
 
 
-# Palette — high contrast for dark UI (Online CONTEXT + Batch Review share this canvas)
-# Outside vs Pending were too close (#5a6570 / #3a4a5c) → redesigned.
-_CLR_OUT = "#1a1f28"          # outside die (0) — near-black, barely a cell
-_CLR_OUT_BORDER = "#2a3340"   # faint edge for outside only
-_CLR_PENDING = "#5b7a9a"      # not inspected (2) — cool blue-slate, clearly "inside"
-_CLR_PENDING_BORDER = "#7a9bb8"
-_CLR_OK = "#2fd67b"           # final OK (8) — bright green
-_CLR_OK_DIM = "#1fa85c"
-_CLR_NG = "#f04444"           # final NG (1) — bright red
-_CLR_NG_DIM = "#b83030"
-_CLR_WAFER_BG = "#0c121c"     # substrate inside circle
-_CLR_WAFER_RIM = "#3dd6f5"    # bright cyan wafer rim (orientation readable)
+# Shared accents (Online CONTEXT + Batch Review)
+_CLR_OUT = "#1a1f28"
+_CLR_OUT_BORDER = "#2a3340"
+_CLR_WAFER_BG = "#0c121c"
+_CLR_WAFER_RIM = "#3dd6f5"
 _CLR_WAFER_RIM_DIM = "#1a4a5c"
-_CLR_RETICLE = "#22d3ee"      # selected chip reticle (cyan)
-_CLR_FOV_MARK = "#f5a623"     # FOV / amber
-_CLR_CLUSTER = "#3dd6f5"      # cluster boundary + centroid (email cyan)
-_CLR_CLUSTER_SEL = "#f5d76e"  # selected cluster highlight
+_CLR_RETICLE = "#22d3ee"
+_CLR_FOV_MARK = "#f5a623"
+_CLR_CLUSTER = "#3dd6f5"
+_CLR_CLUSTER_SEL = "#f5d76e"
+# Legacy aliases used by a few badge/FOV dim fills
+_CLR_PENDING = PAIR_FILL[(STATE_PEND, STATE_BYPASS)]
+_CLR_PENDING_BORDER = PAIR_BORDER[(STATE_PEND, STATE_BYPASS)]
+_CLR_OK = PAIR_FILL[(STATE_OK, STATE_OK)]
+_CLR_NG = PAIR_FILL[(STATE_NG, STATE_NG)]
+_CLR_CT_OK = PAIR_FILL[(STATE_PEND, STATE_OK)]
+_CLR_CT_NG = PAIR_FILL[(STATE_PEND, STATE_NG)]
+
+
+# Height reserved under wafer / FOV canvases for the 2-row pair legend.
+_PAIR_LEGEND_H = 42
+
+
+def _draw_pair_legend(
+    p: QPainter,
+    *,
+    y: float,
+    extras: Tuple[Tuple[str, str, str, bool], ...] = (),
+) -> None:
+    """Two-row before→after swatches (same on wafer map and FOV map).
+
+    extras: optional trailing row-1 items ``(fill, border, label, dashed)``.
+    Wafer uses Out + Clus; FOV uses Active (amber rim).
+    """
+    leg_font = QFont("Segoe UI", 6)
+    leg_font.setBold(True)
+    p.setFont(leg_font)
+    fm = QFontMetrics(leg_font)
+
+    def _swatch(lx: float, ly: float, fill: str, border: str, text: str, *, dashed: bool = False) -> float:
+        pen = QPen(_c(border), 1.0)
+        if dashed:
+            pen.setStyle(Qt.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush if dashed else _c(fill))
+        p.drawRoundedRect(QRectF(lx, ly + 1, 8, 8), 1.5, 1.5)
+        p.setPen(_c(SemiconductorTheme.TEXT_SECONDARY))
+        tw = max(22, fm.horizontalAdvance(text) + 2)
+        p.drawText(
+            QRectF(lx + 10, ly, tw, 11),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            text,
+        )
+        return lx + 10 + tw + 5
+
+    lx = 4.0
+    row1_y = y
+    for before, after, label in (
+        (STATE_PEND, STATE_BYPASS, "P→B"),
+        (STATE_OK, STATE_BYPASS, "O→B"),
+        (STATE_NG, STATE_BYPASS, "N→B"),
+    ):
+        lx = _swatch(
+            lx, row1_y, PAIR_FILL[(before, after)], PAIR_BORDER[(before, after)], label
+        )
+    for fill, border, label, dashed in extras:
+        lx = _swatch(lx + 2, row1_y, fill, border, label, dashed=dashed)
+
+    lx = 4.0
+    row2_y = y + 14
+    for before, after, label in (
+        (STATE_PEND, STATE_OK, "P→O"),
+        (STATE_OK, STATE_OK, "O→O"),
+        (STATE_NG, STATE_OK, "N→O"),
+        (STATE_PEND, STATE_NG, "P→N"),
+        (STATE_OK, STATE_NG, "O→N"),
+        (STATE_NG, STATE_NG, "N→N"),
+    ):
+        lx = _swatch(
+            lx, row2_y, PAIR_FILL[(before, after)], PAIR_BORDER[(before, after)], label
+        )
 
 
 def _draw_reticle(
@@ -155,7 +227,7 @@ def _draw_coord_badge(
     color: Optional[QColor] = None,
     font: Optional[QFont] = None,
 ) -> None:
-    """Dark pill with Col,Row — drawn *after* reticle so coordinates stay readable."""
+    """Dark pill with Row,Col — drawn *after* reticle so coordinates stay readable."""
     if not text:
         return
     p.save()
@@ -180,34 +252,58 @@ def _reticle_radius(cell: float, frac: float = 0.38, cap_px: float = 14.0) -> fl
     return max(3.5, min(cell * frac, cap_px))
 
 
+def _in_die_fov_rects(die_rect: QRectF) -> dict:
+    """P1–P9 rects (row-major) inset inside a die cell."""
+    inset = max(1.5, min(die_rect.width(), die_rect.height()) * 0.08)
+    inner = die_rect.adjusted(inset, inset, -inset, -inset)
+    gap = max(1.0, min(inner.width(), inner.height()) * 0.06)
+    side = (min(inner.width(), inner.height()) - 2 * gap) / 3.0
+    if side < 2.0:
+        return {}
+    total = 3 * side + 2 * gap
+    ox = inner.left() + (inner.width() - total) * 0.5
+    oy = inner.top() + (inner.height() - total) * 0.5
+    rects = {}
+    idx = 1
+    for r in range(3):
+        for c in range(3):
+            rects[idx] = QRectF(
+                ox + c * (side + gap), oy + r * (side + gap), side, side
+            )
+            idx += 1
+    return rects
+
+
 class _WaferMapCanvas(QWidget):
-    """Circular die map with zoom / pan and live Col·Row tracking.
+    """Circular die map with zoom / pan and live Row·Col tracking.
 
     Interaction
     -----------
-    · Wheel …………… zoom toward cursor (0.6× – 16×)
+    · Wheel …………… zoom toward cursor (0.6× – 20×)
     · Left-drag …… pan
-    · Left-click … select die (if not dragged)
+    · Left-click … select die; when zoomed in, click a P1–P9 cell → FOV
     · Middle / Right-drag … pan (same as left-drag)
     · Double-click … fit view (reset zoom + pan)
-    · Hover ……… Col / Row badge + tooltip
+    · Hover ……… Row / Col badge + tooltip
 
     Same widget is used by Online CONTEXT and Batch Review.
     """
 
     chip_clicked = pyqtSignal(int, int)  # col, row 1-based
+    fov_clicked = pyqtSignal(int, int, int)  # col, row, fov 1-based
     cluster_clicked = pyqtSignal(int)    # NgCluster.id
 
     # Axis band (col top / row left) — tight so wafer circle grows
     _AXIS_L = 22   # left for row numbers
     _AXIS_T = 18   # top for col numbers
     _AXIS_R = 6
-    _AXIS_B = 24   # bottom legend strip
+    _AXIS_B = _PAIR_LEGEND_H  # bottom: 2-row labeled pair swatches
 
     _ZOOM_MIN = 0.6
-    _ZOOM_MAX = 16.0
+    _ZOOM_MAX = 20.0
     _ZOOM_STEP = 1.15
     _DRAG_THRESH_PX = 4
+    _FOV_IN_DIE_MIN = 28.0  # die cell px → paint clickable P1–P9 inside
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -217,6 +313,8 @@ class _WaferMapCanvas(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self._hover: Optional[Tuple[int, int]] = None  # 0-based c,r
+        self._hover_fov: Optional[int] = None  # 1..9 when zoomed into die
+        self._press_fov: Optional[Tuple[int, int, int]] = None  # c0, r0, fov
 
         # View transform (zoom about base center + pan offset in screen px)
         self._zoom: float = 1.0
@@ -233,7 +331,7 @@ class _WaferMapCanvas(QWidget):
         self.setCursor(Qt.OpenHandCursor)
         self.setToolTip(
             "Wheel = zoom  ·  Drag = pan  ·  Click = select die\n"
-            "Double-click = fit view  ·  Hover = Col / Row"
+            "Zoom in to see P1–P9 inside the die  ·  Double-click = fit"
         )
 
     def set_context(self, ctx: Optional[WaferContext]) -> None:
@@ -247,8 +345,10 @@ class _WaferMapCanvas(QWidget):
         self._pan_y = 0.0
         self.update()
 
-    def zoom_to_selection(self, col: int = 0, row: int = 0, zoom: float = 3.0) -> None:
-        """Center view on a die (1-based). Used after Online path selection."""
+    def zoom_to_selection(
+        self, col: int = 0, row: int = 0, zoom: Optional[float] = 3.0
+    ) -> None:
+        """Center view on a die (1-based). ``zoom=None`` keeps the current scale."""
         if self._ctx is None:
             return
         n = int(self._ctx.map_size)
@@ -256,7 +356,11 @@ class _WaferMapCanvas(QWidget):
         r = int(row or self._ctx.selected_row) - 1
         if not (0 <= c < n and 0 <= r < n):
             return
-        self._zoom = max(self._ZOOM_MIN, min(self._ZOOM_MAX, float(zoom)))
+        if zoom is None:
+            z = float(self._zoom)
+        else:
+            z = float(zoom)
+        self._zoom = max(self._ZOOM_MIN, min(self._ZOOM_MAX, z))
         # Place die center at view center: pan offsets base center so die maps to mid
         base_cx, base_cy, _side = self._base_center_and_side()
         # die center in base (zoom=1, pan=0) coordinates
@@ -352,11 +456,14 @@ class _WaferMapCanvas(QWidget):
         p.setClipPath(wafer_clip, Qt.IntersectClip)
 
         show_glyph = cell >= 7.0
-        show_colrow = cell >= 14.0  # zoomed-in: print Col,Row on die
+        show_colrow = cell >= 14.0  # zoomed-in: print Row,Col on die
+        show_fov = cell >= self._FOV_IN_DIE_MIN  # P1–P9 inside die
         glyph_font = QFont("Segoe UI", max(5, min(11, int(cell * 0.55))))
         glyph_font.setBold(True)
         cr_font = QFont("Segoe UI", max(5, min(8, int(cell * 0.28))))
         cr_font.setBold(True)
+        fov_font = QFont("Segoe UI", max(5, min(8, int(cell * 0.12))))
+        fov_font.setBold(True)
 
         # Only iterate dies that can intersect the viewport (perf when zoomed)
         if cell > 0.5:
@@ -370,7 +477,10 @@ class _WaferMapCanvas(QWidget):
         for r in range(r0, r1 + 1):
             for c in range(c0, c1 + 1):
                 b = int(bins[r, c])
-                if b == BIN_OUTSIDE:
+                is_selected_die = (c == sel_c and r == sel_r)
+                # Host FOV can land on a die the txt marked Outside — still paint
+                # the active selection (Live Review always shows the inspected die).
+                if b == BIN_OUTSIDE and not is_selected_die:
                     continue
 
                 gap = max(0.4, cell * 0.08)
@@ -382,33 +492,64 @@ class _WaferMapCanvas(QWidget):
                 )
                 rad = 1.4 if cell > 8 else 0.6
 
-                if b == BIN_NG:
-                    p.setPen(QPen(_c("#7a1515"), 0.9))
-                    p.setBrush(_c(_CLR_NG))
-                    p.drawRoundedRect(rect, rad, rad)
-                    glyph = "1"
-                    gcol = _c("#1a0505")
-                elif b == BIN_OK:
-                    p.setPen(QPen(_c("#0d5c32"), 0.9))
-                    p.setBrush(_c(_CLR_OK))
-                    p.drawRoundedRect(rect, rad, rad)
-                    glyph = "8"
-                    gcol = _c("#04180c")
+                chip = None
+                if self._ctx is not None:
+                    chip = self._ctx.chip_at(c + 1, r + 1)
+                if chip is not None:
+                    fill_hex = pair_fill_hex(chip.original_bin, chip.final_bin)
+                    border_hex = pair_border_hex(chip.original_bin, chip.final_bin)
+                    glyph = chip.pair_glyph() or "·"
                 else:
-                    p.setPen(QPen(_c(_CLR_PENDING_BORDER, 200), 0.9))
-                    p.setBrush(_c(_CLR_PENDING))
-                    p.drawRoundedRect(rect, rad, rad)
-                    glyph = "·"
-                    gcol = _c("#d0e4f5")
+                    # bins-only fallback (no ChipCell): treat as Pending→state
+                    fill_hex = pair_fill_hex(BIN_PENDING, b)
+                    border_hex = pair_border_hex(BIN_PENDING, b)
+                    glyph = pair_glyph(BIN_PENDING, b) or "·"
+                gcol = _c("#041018")
+                if fill_hex in (
+                    PAIR_FILL[(STATE_PEND, STATE_BYPASS)],
+                    PAIR_FILL[(STATE_OK, STATE_BYPASS)],
+                ):
+                    gcol = _c("#e8f4ff")
 
-                is_selected_die = (c == sel_c and r == sel_r)
-                if show_glyph and glyph:
+                p.setPen(QPen(_c(border_hex), 0.9))
+                p.setBrush(_c(fill_hex))
+                p.drawRoundedRect(rect, rad, rad)
+
+                if show_fov and chip is not None:
+                    chip.ensure_points()
+                    active_fov = int(self._ctx.selected_fov or 0) if is_selected_die else 0
+                    for fi, fr in _in_die_fov_rects(rect).items():
+                        pt = chip.point(fi)
+                        judge = int(pt.judge) if pt else BIN_PENDING
+                        ffill = pair_fill_hex(chip.original_bin, judge)
+                        fbord = pair_border_hex(chip.original_bin, judge)
+                        is_act = fi == active_fov
+                        is_hov = (
+                            self._hover == (c, r) and self._hover_fov == fi
+                        )
+                        bw = 1.8 if is_act else (1.3 if is_hov else 0.8)
+                        bcol = _c(_CLR_FOV_MARK if is_act else fbord)
+                        p.setPen(QPen(bcol, bw))
+                        p.setBrush(_c(ffill))
+                        p.drawRoundedRect(fr, 1.2, 1.2)
+                        if fr.width() >= 12:
+                            p.setFont(fov_font)
+                            p.setPen(_c(SemiconductorTheme.TEXT_SECONDARY))
+                            p.drawText(
+                                fr.adjusted(1, 0, -1, -1),
+                                Qt.AlignLeft | Qt.AlignTop,
+                                f"P{fi}",
+                            )
+                        if judge != BIN_PENDING and fr.width() >= 16:
+                            gtxt = pair_glyph(chip.original_bin, judge) or ""
+                            if gtxt:
+                                p.setPen(_c("#041018"))
+                                p.drawText(fr, Qt.AlignCenter, gtxt)
+                elif show_glyph and glyph:
                     p.setFont(glyph_font)
                     p.setPen(gcol)
                     if show_colrow:
-                        # Bin glyph top-half, Col·Row bottom-half when zoomed.
-                        # Selected die: in-die Col·Row is skipped here; a floating
-                        # badge is painted last (after reticle) so it is never covered.
+                        # Pair glyph top-half, Row·Col bottom-half when zoomed.
                         p.drawText(
                             rect.adjusted(0, 0, 0, -rect.height() * 0.28 if not is_selected_die else 0),
                             Qt.AlignHCenter | Qt.AlignVCenter,
@@ -416,21 +557,21 @@ class _WaferMapCanvas(QWidget):
                         )
                         if not is_selected_die:
                             p.setFont(cr_font)
-                            p.setPen(_c("#e8f4ff" if b == BIN_PENDING else gcol))
+                            p.setPen(_c("#e8f4ff"))
                             p.drawText(
                                 rect.adjusted(1, rect.height() * 0.52, -1, -1),
                                 Qt.AlignHCenter | Qt.AlignTop,
-                                f"{c + 1},{r + 1}",
+                                f"{r + 1},{c + 1}",
                             )
                     else:
                         p.drawText(rect, Qt.AlignCenter, glyph)
 
-                if self._hover == (c, r):
+                if self._hover == (c, r) and not show_fov:
                     p.setPen(QPen(_c(_CLR_RETICLE, 220), 1.6))
                     p.setBrush(Qt.NoBrush)
                     p.drawRoundedRect(rect.adjusted(-0.5, -0.5, 0.5, 0.5), rad, rad)
 
-        # When zoomed in enough to show Col·Row, markers must not fill the die:
+        # When zoomed in enough to show Row·Col, markers must not fill the die:
         # use corner brackets + small open reticle (capped px) instead of solid ⊕.
         zoom_hi = show_colrow or cell >= 12.0
 
@@ -438,7 +579,10 @@ class _WaferMapCanvas(QWidget):
         sel_badge_pos: Optional[Tuple[float, float, str]] = None
         if 0 <= sel_c < n and 0 <= sel_r < n:
             b_sel = int(bins[sel_r, sel_c]) if bins is not None else BIN_OUTSIDE
-            if b_sel != BIN_OUTSIDE:
+            if b_sel != BIN_OUTSIDE or (
+                self._ctx is not None
+                and self._ctx.chip_at(sel_c + 1, sel_r + 1) is not None
+            ):
                 sx = ox + (sel_c + 0.5) * cell
                 sy = oy + (sel_r + 0.5) * cell
                 sel_rect = QRectF(
@@ -448,23 +592,25 @@ class _WaferMapCanvas(QWidget):
                     cell,
                 ).adjusted(-1.0, -1.0, 1.0, 1.0)
                 if zoom_hi:
-                    # Corner brackets keep OK/NG color + glyph + Col·Row free
+                    # Corner brackets keep die face free (FOV grid / glyph readable)
                     _draw_corner_brackets(p, sel_rect, _c(_CLR_RETICLE), 2.2, 0.26)
-                    ret_r = _reticle_radius(cell, frac=0.18, cap_px=11.0)
-                    _draw_reticle(
-                        p, sx, sy, ret_r, _c(_CLR_RETICLE, 200), 1.4, open_center=True
-                    )
-                    # FOV mark: small open ring only (no second solid cross)
-                    if self._ctx.selected_fov > 0:
+                    if not show_fov:
+                        ret_r = _reticle_radius(cell, frac=0.18, cap_px=11.0)
                         _draw_reticle(
-                            p,
-                            sx,
-                            sy,
-                            max(2.0, ret_r * 0.55),
-                            _c(_CLR_FOV_MARK, 220),
-                            1.2,
-                            open_center=True,
+                            p, sx, sy, ret_r, _c(_CLR_RETICLE, 200), 1.4, open_center=True
                         )
+                        if self._ctx.selected_fov > 0:
+                            _draw_reticle(
+                                p,
+                                sx,
+                                sy,
+                                max(2.0, ret_r * 0.55),
+                                _c(_CLR_FOV_MARK, 220),
+                                1.2,
+                                open_center=True,
+                            )
+                    else:
+                        ret_r = max(4.0, cell * 0.08)
                 else:
                     p.setPen(QPen(_c(_CLR_RETICLE), 2.0))
                     p.setBrush(Qt.NoBrush)
@@ -483,7 +629,7 @@ class _WaferMapCanvas(QWidget):
                 # Badge floats above die — painted last after clusters
                 if zoom_hi or cell >= 10.0:
                     badge_y = sy - max(ret_r + 10.0, cell * 0.42)
-                    sel_badge_pos = (sx, badge_y, f"{sel_c + 1},{sel_r + 1}")
+                    sel_badge_pos = (sx, badge_y, f"{sel_r + 1},{sel_c + 1}")
 
         # ── NG Cluster boundaries + centroids (email Cluster Boundary / ⊕) ──
         # Drawn after dies so dashed boxes and reticles sit on top.
@@ -515,11 +661,11 @@ class _WaferMapCanvas(QWidget):
                 cx_cl = ox + (cc0 + 0.5) * cell
                 cy_cl = oy + (cr0 + 0.5) * cell
                 # Skip extra centroid reticle when it is the already-selected die
-                # (selected marker is enough — double ⊕ was hiding Col·Row)
+                # (selected marker is enough — double ⊕ was hiding Row·Col)
                 same_as_sel = (cc0 == sel_c and cr0 == sel_r)
                 if not same_as_sel:
                     if zoom_hi:
-                        # Small open reticle — leave Col·Row / die color readable
+                        # Small open reticle — leave Row·Col / die color readable
                         _draw_reticle(
                             p,
                             cx_cl,
@@ -557,7 +703,7 @@ class _WaferMapCanvas(QWidget):
                         f"C{cl.id}",
                     )
 
-        # Col·Row badge on selected die — last paint so text is never under reticle
+        # Row·Col badge on selected die — last paint so text is never under reticle
         if sel_badge_pos is not None:
             bx, by, btxt = sel_badge_pos
             badge_font = QFont("Segoe UI", max(6, min(9, int(cell * 0.30))))
@@ -646,34 +792,17 @@ class _WaferMapCanvas(QWidget):
                 label,
             )
 
-        # ── Bottom legend + badges ──
-        leg_y = self.height() - self._AXIS_B + 3
-        leg_font = QFont("Segoe UI", 6)
-        leg_font.setBold(True)
-        p.setFont(leg_font)
-        items = [
-            (_CLR_OUT, _CLR_OUT_BORDER, "Out"),
-            (_CLR_PENDING, _CLR_PENDING_BORDER, "Pend"),
-            (_CLR_OK, "#0d5c32", "OK"),
-            (_CLR_NG, "#7a1515", "NG"),
-        ]
-        lx = 4.0
-        for fill, border, text in items:
-            p.setPen(QPen(_c(border), 1.0))
-            p.setBrush(_c(fill))
-            p.drawRoundedRect(QRectF(lx, leg_y + 2, 8, 8), 1.5, 1.5)
-            p.setPen(_c(SemiconductorTheme.TEXT_SECONDARY))
-            p.drawText(QRectF(lx + 10, leg_y, 28, 12), Qt.AlignLeft | Qt.AlignVCenter, text)
-            lx += 38
-        # Cluster legend swatch (dashed box icon)
-        p.setPen(QPen(_c(_CLR_CLUSTER), 1.2, Qt.DashLine))
-        p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(QRectF(lx, leg_y + 2, 8, 8), 1.5, 1.5)
-        p.setPen(_c(SemiconductorTheme.TEXT_SECONDARY))
-        p.drawText(QRectF(lx + 10, leg_y, 36, 12), Qt.AlignLeft | Qt.AlignVCenter, "Clus")
-        lx += 48
+        # ── Bottom legend: same 2-row pair swatches as FOV map ──
+        _draw_pair_legend(
+            p,
+            y=self.height() - self._AXIS_B + 3,
+            extras=(
+                (_CLR_OUT, _CLR_OUT_BORDER, "Out", False),
+                (_CLR_OUT, _CLR_CLUSTER, "Clus", True),
+            ),
+        )
 
-        # Zoom badge (left of status)
+        # Zoom badge (top-left)
         z_txt = f"{self._zoom:.1f}×"
         z_font = QFont("Segoe UI", 7)
         z_font.setBold(True)
@@ -689,16 +818,24 @@ class _WaferMapCanvas(QWidget):
         p.setPen(_c(SemiconductorTheme.PRIMARY_DEFAULT))
         p.drawText(QRectF(zx, zy, zw, zh), Qt.AlignCenter, z_txt)
 
-        # Selection / hover coordinate badge
+        # Selection / hover badge — top-right (must not cover bottom legend)
         badge = None
         if self._hover is not None:
             hc, hr = self._hover
-            b = int(bins[hr, hc]) if 0 <= hr < n and 0 <= hc < n else -1
-            bin_s = {0: "Out", 1: "NG", 2: "Pend", 8: "OK"}.get(b, "?")
-            badge = f"Col {hc + 1} · Row {hr + 1}  ({bin_s})"
+            chip_h = self._ctx.chip_at(hc + 1, hr + 1) if self._ctx else None
+            if chip_h is not None:
+                bin_s = chip_h.pair_label()
+            else:
+                b = int(bins[hr, hc]) if 0 <= hr < n and 0 <= hc < n else -1
+                bin_s = pair_label(BIN_PENDING, b) if b >= 0 else "?"
+            badge = f"Row {hr + 1} · Col {hc + 1}  ({bin_s})"
         elif sel_c >= 0 and sel_r >= 0:
-            b = int(bins[sel_r, sel_c]) if 0 <= sel_r < n and 0 <= sel_c < n else -1
-            bin_s = {0: "Out", 1: "NG", 2: "Pend", 8: "OK"}.get(b, "?")
+            chip_s = self._ctx.chip_at(sel_c + 1, sel_r + 1) if self._ctx else None
+            if chip_s is not None:
+                bin_s = chip_s.pair_label()
+            else:
+                b = int(bins[sel_r, sel_c]) if 0 <= sel_r < n and 0 <= sel_c < n else -1
+                bin_s = pair_label(BIN_PENDING, b) if b >= 0 else "?"
             fov = self._ctx.selected_fov
             extra = f"  ·  FOV P{fov}" if fov > 0 else ""
             badge = f"Sel ({sel_c + 1},{sel_r + 1}) {bin_s}{extra}"
@@ -706,11 +843,11 @@ class _WaferMapCanvas(QWidget):
             badge_font = QFont("Segoe UI", 7)
             badge_font.setBold(True)
             p.setFont(badge_font)
-            fm = QFontMetrics(badge_font)
-            tw = fm.horizontalAdvance(badge) + 12
-            th = fm.height() + 6
+            bfm = QFontMetrics(badge_font)
+            tw = bfm.horizontalAdvance(badge) + 12
+            th = bfm.height() + 6
             bx = self.width() - tw - 4
-            by = leg_y - 1
+            by = self._AXIS_T + 2
             p.setPen(QPen(_c(SemiconductorTheme.BORDER_DEFAULT), 1))
             p.setBrush(_c(SemiconductorTheme.BG_PANEL, 235))
             p.drawRoundedRect(QRectF(bx, by, tw, th), 4, 4)
@@ -734,6 +871,28 @@ class _WaferMapCanvas(QWidget):
             if int(self._ctx.bins[r, c]) == BIN_OUTSIDE:
                 return None
             return (c, r)
+        return None
+
+    def _hit_fov(self, pos) -> Optional[Tuple[int, int, int]]:
+        """When zoomed in, hit-test P1–P9 inside a die. Returns (c0, r0, fov)."""
+        die = self._hit(pos)
+        if die is None or self._ctx is None:
+            return None
+        n, _cx, _cy, _R, cell, ox, oy = self._layout_geom()
+        if cell < self._FOV_IN_DIE_MIN:
+            return None
+        c0, r0 = die
+        gap = max(0.4, cell * 0.08)
+        rect = QRectF(
+            ox + c0 * cell + gap * 0.5,
+            oy + r0 * cell + gap * 0.5,
+            cell - gap,
+            cell - gap,
+        )
+        pt = QPointF(pos.x(), pos.y())
+        for fi, fr in _in_die_fov_rects(rect).items():
+            if fr.contains(pt):
+                return c0, r0, fi
         return None
 
     def wheelEvent(self, event: QWheelEvent):
@@ -773,7 +932,12 @@ class _WaferMapCanvas(QWidget):
         if event.button() in (Qt.LeftButton, Qt.MiddleButton, Qt.RightButton):
             self._press_pos = QPoint(event.pos())
             self._press_pan = (self._pan_x, self._pan_y)
-            self._press_hit = self._hit(event.pos()) if event.button() == Qt.LeftButton else None
+            if event.button() == Qt.LeftButton:
+                self._press_hit = self._hit(event.pos())
+                self._press_fov = self._hit_fov(event.pos())
+            else:
+                self._press_hit = None
+                self._press_fov = None
             self._dragging = False
             self._pan_button = int(event.button())
             if event.button() in (Qt.MiddleButton, Qt.RightButton):
@@ -798,24 +962,38 @@ class _WaferMapCanvas(QWidget):
                 super().mouseMoveEvent(event)
                 return
 
-        # Hover tracking
+        # Hover tracking (die + optional in-die FOV)
         h = self._hit(event.pos())
-        if h != self._hover:
+        hf = self._hit_fov(event.pos())
+        hf_i = hf[2] if hf is not None else None
+        if h != self._hover or hf_i != self._hover_fov:
             self._hover = h
+            self._hover_fov = hf_i
             if h is not None:
                 c0, r0 = h
-                b = int(self._ctx.bins[r0, c0]) if self._ctx is not None else -1
-                bin_s = {0: "Outside", 1: "NG", 2: "Pending", 8: "OK"}.get(b, "?")
+                chip = self._ctx.chip_at(c0 + 1, r0 + 1) if self._ctx else None
+                if chip is not None:
+                    bin_s = chip.pair_label()
+                else:
+                    b = int(self._ctx.bins[r0, c0]) if self._ctx is not None else -1
+                    bin_s = pair_label(BIN_PENDING, b) if b >= 0 else "?"
+                extra = ""
+                if hf is not None and chip is not None:
+                    pt = chip.point(hf[2])
+                    extra = (
+                        f"\nFOV P{hf[2]}  ·  "
+                        f"{pair_label(chip.original_bin, int(pt.judge) if pt else BIN_PENDING)}"
+                    )
                 self.setToolTip(
-                    f"Chip  Col {c0 + 1}  ·  Row {r0 + 1}  (X,Y 1-based)\n"
-                    f"Final bin: {bin_s} ({b})\n"
+                    f"Chip  Row {r0 + 1}  ·  Col {c0 + 1}  (R,C 1-based)\n"
+                    f"Before→After: {bin_s}{extra}\n"
                     f"Wheel zoom · drag pan · double-click fit"
                 )
                 self.setCursor(Qt.PointingHandCursor)
             else:
                 self.setToolTip(
                     "Wheel = zoom  ·  Drag = pan  ·  Click = select die\n"
-                    "Double-click = fit view"
+                    "Zoom in to see P1–P9 inside the die  ·  Double-click = fit"
                 )
                 self.setCursor(Qt.OpenHandCursor)
             self.update()
@@ -827,9 +1005,13 @@ class _WaferMapCanvas(QWidget):
             # WaferContext.select_chip → selected_cluster_id (stay on clicked die).
             if not self._dragging and self._press_hit is not None:
                 c0, r0 = self._press_hit
-                self.chip_clicked.emit(c0 + 1, r0 + 1)
+                if self._press_fov is not None:
+                    self.fov_clicked.emit(c0 + 1, r0 + 1, int(self._press_fov[2]))
+                else:
+                    self.chip_clicked.emit(c0 + 1, r0 + 1)
         self._press_pos = None
         self._press_hit = None
+        self._press_fov = None
         self._dragging = False
         self._pan_button = None
         # restore cursor based on hover
@@ -848,9 +1030,10 @@ class _WaferMapCanvas(QWidget):
 
     def leaveEvent(self, event):
         self._hover = None
+        self._hover_fov = None
         self.setToolTip(
             "Wheel = zoom  ·  Drag = pan  ·  Click = select die\n"
-            "Double-click = fit view"
+            "Zoom in to see P1–P9 inside the die  ·  Double-click = fit"
         )
         if not self._dragging:
             self.setCursor(Qt.OpenHandCursor)
@@ -920,6 +1103,8 @@ class _ChipMapCanvas(QWidget):
 
     fov_clicked = pyqtSignal(int)  # 1..9
 
+    _LEGEND_H = _PAIR_LEGEND_H  # same 2-row pair legend as wafer map
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._ctx: Optional[WaferContext] = None
@@ -936,13 +1121,13 @@ class _ChipMapCanvas(QWidget):
         margin = 6
         gap = 5
         w = self.width() - 2 * margin
-        h = self.height() - 2 * margin
+        h = self.height() - 2 * margin - self._LEGEND_H
         cell_w = (w - 2 * gap) / 3.0
         cell_h = (h - 2 * gap) / 3.0
         side = min(cell_w, cell_h)
         total = 3 * side + 2 * gap
         ox = (self.width() - total) * 0.5
-        oy = (self.height() - total) * 0.5
+        oy = (self.height() - self._LEGEND_H - total) * 0.5
         rects = {}
         idx = 1
         for r in range(3):
@@ -973,26 +1158,19 @@ class _ChipMapCanvas(QWidget):
 
         for idx, rect in self._cell_rects().items():
             pt = chip.point(idx)
-            judge = pt.judge if pt else BIN_PENDING
+            judge = int(pt.judge) if pt else BIN_PENDING
             is_active = idx == active
 
+            fill_hex = pair_fill_hex(chip.original_bin, judge)
+            border_hex = pair_border_hex(chip.original_bin, judge)
+            fill = _c(fill_hex, 210)
+            border = _c(border_hex, 220)
+            bw = 1.4
+
             if is_active:
-                fill = _c("#2a5a70")
+                # Amber rim marks active FOV; keep pair status color as fill
                 border = _c(_CLR_FOV_MARK)
                 bw = 2.6
-            elif judge == BIN_NG:
-                fill = _c("#6a2020")
-                border = _c(_CLR_NG, 200)
-                bw = 1.4
-            elif judge == BIN_OK:
-                fill = _c("#1a4a32")
-                border = _c(_CLR_OK, 180)
-                bw = 1.4
-            else:
-                # Pending FOV — cooler slate, clearly not Outside/empty
-                fill = _c("#3d556e")
-                border = _c(_CLR_PENDING_BORDER, 180)
-                bw = 1.3
 
             p.setPen(QPen(border, bw))
             p.setBrush(fill)
@@ -1003,22 +1181,18 @@ class _ChipMapCanvas(QWidget):
             p.setPen(_c(SemiconductorTheme.TEXT_SECONDARY))
             p.drawText(rect.adjusted(5, 3, -4, -4), Qt.AlignLeft | Qt.AlignTop, f"P{idx}")
 
-            # Bin 8 / 1 / · (pending) — host final is only 8 or 1 after inspect
-            if judge == BIN_OK:
-                bin_txt, bin_col = "8", _c("#6dff9a")
-            elif judge == BIN_NG:
-                bin_txt, bin_col = "1", _c("#ff7a7a")
-            else:
-                bin_txt, bin_col = "·", _c(SemiconductorTheme.TEXT_DISABLED)
-            if is_active and judge in (BIN_OK, BIN_NG):
-                bin_col = _c(_CLR_FOV_MARK)
-            elif is_active:
-                bin_col = _c(_CLR_FOV_MARK)
-            big = QFont("Segoe UI", max(12, int(rect.height() * 0.38)))
-            big.setBold(True)
-            p.setFont(big)
-            p.setPen(bin_col)
-            p.drawText(rect, Qt.AlignCenter, bin_txt)
+            # Pair glyph only after CT (Pending is already clear from fill + chip header)
+            if judge != BIN_PENDING:
+                bin_txt = pair_glyph(chip.original_bin, judge) or ""
+                if bin_txt:
+                    bin_col = _c("#041018")
+                    if is_active:
+                        bin_col = _c(_CLR_FOV_MARK)
+                    big = QFont("Segoe UI", max(10, int(rect.height() * 0.28)))
+                    big.setBold(True)
+                    p.setFont(big)
+                    p.setPen(bin_col)
+                    p.drawText(rect, Qt.AlignCenter, bin_txt)
 
             if is_active:
                 # FOV pill at bottom
@@ -1041,6 +1215,15 @@ class _ChipMapCanvas(QWidget):
                 p.setBrush(Qt.NoBrush)
                 p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 5, 5)
 
+        # Same pair legend as wafer map (+ Active FOV rim instead of Out/Clus)
+        _draw_pair_legend(
+            p,
+            y=self.height() - self._LEGEND_H + 3,
+            extras=(
+                (_CLR_OUT, _CLR_FOV_MARK, "Active", True),
+            ),
+        )
+
         p.end()
 
     def _hit(self, pos) -> Optional[int]:
@@ -1056,10 +1239,11 @@ class _ChipMapCanvas(QWidget):
             if h is not None and self._ctx is not None:
                 chip = self._ctx.selected_chip()
                 pt = chip.point(h) if chip else None
-                j = "OK" if (pt and pt.judge == BIN_OK) else (
-                    "NG" if (pt and pt.judge == BIN_NG) else "?"
+                j = pair_label(
+                    chip.original_bin if chip else BIN_PENDING,
+                    int(pt.judge) if pt else BIN_PENDING,
                 )
-                self.setToolTip(f"FOV P{h}  ·  Judge {j}\nClick to open volume in MPR")
+                self.setToolTip(f"FOV P{h}  ·  {j}\nClick to open volume in MPR")
             self.update()
         super().mouseMoveEvent(event)
 
@@ -1134,6 +1318,7 @@ class ContextMapPanel(QWidget):
 
         self.wafer_canvas = _WaferMapCanvas()
         self.wafer_canvas.chip_clicked.connect(self._on_chip_clicked)
+        self.wafer_canvas.fov_clicked.connect(self._on_wafer_fov_clicked)
         root.addWidget(self.wafer_canvas, 5)  # more stretch → bigger wafer
 
         # Stats strip (Good / Bad / Yield / Cluster Count) — PDF-style summary
@@ -1155,7 +1340,7 @@ class ContextMapPanel(QWidget):
 
         self.cluster_table = QTableWidget(0, 4)
         self.cluster_table.setObjectName("ContextClusterTable")
-        self.cluster_table.setHorizontalHeaderLabels(["ID", "Size", "Ctr (X,Y)", "MaxR"])
+        self.cluster_table.setHorizontalHeaderLabels(["ID", "Size", "Ctr (R,C)", "MaxR"])
         self.cluster_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.cluster_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.cluster_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1371,9 +1556,10 @@ class ContextMapPanel(QWidget):
         )
         st = ctx.stats()
         n_cl = int(st.get("cluster_count", len(getattr(ctx, "clusters", None) or [])))
-        # Pending dies are not Good — new wafer shows Pend + Yield 0% until inspect
+        # Pending/Bypass dies are not Good — new wafer starts near 0% until inspect
         self.wafer_stats.setText(
-            f"<span style='color:#8fa3b8'><b>Pend {st.get('pending', 0)}</b></span>"
+            f"<span style='color:#8fa3b8'><b>Pending {st.get('pending', 0)}</b></span>"
+            f"  ·  <span style='color:#8fa3b8'><b>Bypass {st.get('bypass', 0)}</b></span>"
             f"  ·  <span style='color:#6dff9a'><b>OK {st['good']}</b></span>"
             f"  ·  <span style='color:#ff7a7a'><b>NG {st['bad']}</b></span>"
             f"  ·  Yield <span style='color:#22d3ee'><b>{ctx.yield_pct:.2f}%</b></span>"
@@ -1388,22 +1574,16 @@ class ContextMapPanel(QWidget):
             self.chip_meta.setText("Click a die on the wafer (⊕ reticle = selection)")
             self.fov_note.setText("Amber FOV = volume open in MPR")
         else:
-            # Match wafer-map FinalBin: NG if any FOV NG; OK only when all 9 FOVs OK;
-            # otherwise Pending (partial inspect must not look like chip OK).
-            if chip.chip_ng or chip.final_bin == BIN_NG:
-                judge, jcol = "NG", "#ff7a7a"
-            elif chip.final_bin == BIN_OK:
-                judge, jcol = "OK", "#6dff9a"
-            else:
-                judge, jcol = "Pend", "#8fa3b8"
+            pair = chip.pair_label()
+            fill = pair_fill_hex(chip.original_bin, chip.final_bin)
             self.chip_title.setText(
-                f"CHIP MAP  ·  Col {chip.col}  ·  Row {chip.row}"
+                f"CHIP MAP  ·  Row {chip.row}  ·  Col {chip.col}"
             )
             self.chip_meta.setText(
-                f"Chip (X={chip.col}, Y={chip.row})  ·  Final: "
-                f"<span style='color:{jcol}'><b>{judge}</b></span><br>"
+                f"Chip (R={chip.row}, C={chip.col})  ·  "
+                f"<span style='color:{fill}'><b>{pair}</b></span><br>"
                 f"9-Point  ·  Good {chip.good_count}/9  ·  Bad {chip.bad_count}/9"
-                f"{'  ·  Wafer green only after 9/9 OK' if judge == 'Pend' and chip.good_count > 0 else ''}"
+                f"{'  ·  Wafer result Bypass until 9/9 or any NG' if int(getattr(chip, 'final_bin', BIN_PENDING)) == BIN_BYPASS else ''}"
             )
             pt = ctx.selected_point()
             results_path = ctx.results_dir_for_selection() or "…/FOV/Results"
@@ -1425,8 +1605,8 @@ class ContextMapPanel(QWidget):
             if cl is not None:
                 self.cluster_setting.setText(
                     f"Selected Cluster : <span style='color:#3dd6f5'><b>{cl.id}</b></span>"
-                    f"  ·  Centroid Chip (X,Y) : "
-                    f"<span style='color:#f5d76e'><b>({cl.centroid_col},{cl.centroid_row})</b></span>"
+                    f"  ·  Centroid Chip (R,C) : "
+                    f"<span style='color:#f5d76e'><b>({cl.centroid_row},{cl.centroid_col})</b></span>"
                     f"<br><span style='color:#8fa3b8;font-size:7.5pt'>"
                     f"Size {cl.size} die  ·  MaxR {cl.max_radius:.2f}  ·  "
                     f"⊕ = cluster centroid (assigned chip)</span>"
@@ -1459,7 +1639,7 @@ class ContextMapPanel(QWidget):
             vals = [
                 str(cl.id),
                 str(cl.size),
-                f"({cl.centroid_col},{cl.centroid_row})",
+                f"({cl.centroid_row},{cl.centroid_col})",
                 f"{cl.max_radius:.2f}",
             ]
             for j, text in enumerate(vals):
@@ -1532,6 +1712,24 @@ class ContextMapPanel(QWidget):
             if self._ctx.selected_cluster_id > 0:
                 self.cluster_selected.emit(int(self._ctx.selected_cluster_id))
             self.selection_changed.emit()
+
+    def _on_wafer_fov_clicked(self, col: int, row: int, fov_index: int) -> None:
+        if self._ctx is None:
+            return
+        changed = False
+        if self._ctx.select_chip(int(col), int(row)):
+            changed = True
+        if self._ctx.select_fov(int(fov_index)):
+            changed = True
+        if not changed:
+            return
+        self.wafer_canvas.set_context(self._ctx)
+        self.chip_canvas.set_context(self._ctx)
+        self._refresh_labels()
+        self._refresh_cluster_table()
+        self.chip_selected.emit(int(col), int(row))
+        self.fov_selected.emit(int(fov_index))
+        self.selection_changed.emit()
 
     def focus_wafer_selection(self, zoom: float = 3.2) -> None:
         """Public: zoom/pan wafer map onto current selected die."""

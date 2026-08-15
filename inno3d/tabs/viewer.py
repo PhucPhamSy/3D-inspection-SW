@@ -47,6 +47,7 @@ from inno3d.features.viewer.mpr_render import MprRenderMixin
 from inno3d.features.viewer.volume_3d import Volume3dMixin
 from inno3d.features.viewer.window_level import WindowLevelMixin
 from inno3d.features.viewer.clip_box import ClipBoxMixin
+from inno3d.features.viewer.displace import DisplaceMixin
 from inno3d.features.viewer.stats_panel import StatsPanelMixin
 from inno3d.features.viewer.slice_view import SliceViewMixin
 from inno3d.features.viewer.volume_io import VolumeIOMixin
@@ -304,7 +305,7 @@ def _make_view_layout_icon(preset, size=36, selected=False):
     return QIcon(QPixmap.fromImage(img))
 
 
-class MultiPlanarView(VolumeIOMixin, AlignSidebarMixin, SliceViewMixin, StatsPanelMixin, WindowLevelMixin, ClipBoxMixin, Volume3dMixin, MprInputMixin, MprRenderMixin, MprNavMixin, CrosshairMixin, QWidget):
+class MultiPlanarView(VolumeIOMixin, AlignSidebarMixin, SliceViewMixin, StatsPanelMixin, WindowLevelMixin, ClipBoxMixin, DisplaceMixin, Volume3dMixin, MprInputMixin, MprRenderMixin, MprNavMixin, CrosshairMixin, QWidget):
     """Multi-Planar View with Crosshair Tracking.
 
     Navigation (zoom/pan/scroll) behaviour lives in MprNavMixin.
@@ -395,7 +396,7 @@ class MultiPlanarView(VolumeIOMixin, AlignSidebarMixin, SliceViewMixin, StatsPan
         self.crosshair_position = [0, 0, 0]  # X, Y, Z in volume coordinates
         self.crosshair_actors = {'axial': [], 'coronal': [], 'sagittal': []}
         self.crosshair_color = [1.0, 1.0, 0.0]  # Default yellow
-        self.ruler_color = [0.2, 0.9, 0.2]      # Default green
+        self.ruler_color = [1.0, 1.0, 1.0]      # Zeiss/XM-style default (white + dark outline)
         self.reverse_z = False  # Z direction toggle
         # Dragonfly-style hover / grab:
         #   _crosshair_hover = (orientation, 'center'|'h'|'v') or None
@@ -427,6 +428,33 @@ class MultiPlanarView(VolumeIOMixin, AlignSidebarMixin, SliceViewMixin, StatsPan
         
         self.rotate_mode = False
         self.last_mouse_pos = None
+
+        # ── Dragonfly-style Displace tool (object translate/rotate) ──
+        # State init per PLAN_DISPLACE_DRAGONFLY.md § State on __init__
+        self.displace_mode = False
+        self._displace_drag = None          # active drag state or None
+        self._displace_pending = None       # accumulated in-plane transform or None
+        self._displace_gizmo_actors = {}    # per orientation: list of VTK actor2D
+        self._displace_undo_stack = []      # undo snapshots (bbox crops)
+        self._displace_dynamic_3d = False   # Dynamic 3D refresh checkbox
+        self._displace_pivot = {}           # per orientation: (u, v) pivot voxel
+        self._displace_arm_len = {}         # per orientation: protractor arm length (px)
+        self._displace_hover = None         # {'kind', 'orientation'} while hovering a handle
+        self._displace_preview_mask = None  # temporary 2D preview overlay
+        self._displace_preview_ori  = None  # orientation for preview overlay
+        self._displace_target = 'volume'    # 'volume' (scene pose) | 'objects'
+        self._dataset_pose = None           # scene pose, lazy-init in displace.py
+        self._dataset_pose_undo = []        # pose undo stack
+        self._displace_pending_reslice_ori = None
+        self._displace_pending_tick = None  # ('gizmo'|'reslice', orientation)
+        self._displace_throttle_timer = QTimer(self)
+        self._displace_throttle_timer.setSingleShot(True)
+        self._displace_throttle_timer.setInterval(20)  # 20 ms ≈ 50 Hz
+        self._displace_throttle_timer.timeout.connect(self._displace_reslice_tick)
+        self._displace_3d_timer = QTimer(self)
+        self._displace_3d_timer.setSingleShot(True)
+        self._displace_3d_timer.setInterval(80)  # ~12 Hz for the 3D view
+        self._displace_3d_timer.timeout.connect(self._pose_apply_to_3d)
         
         # Oblique MPR rotation
         self.oblique_angles = {'axial': 0.0, 'coronal': 0.0, 'sagittal': 0.0}
