@@ -55,6 +55,7 @@ from inno3d.features.analysis.domain import (
     EmbeddedChart,
 )
 from inno3d.features.analysis.homology_page import HomologyPage
+from inno3d.core.privileged_auth import prompt_privileged_login
 
 
 class AnalysisTab(QWidget):
@@ -62,6 +63,7 @@ class AnalysisTab(QWidget):
 
     open_in_line_pulse = pyqtSignal(str)
     open_in_viewer = pyqtSignal(dict)
+    auth_changed = pyqtSignal(bool, str)
 
     def __init__(self):
         super().__init__()
@@ -75,14 +77,32 @@ class AnalysisTab(QWidget):
         self._db_lots: List[Dict[str, Any]] = []
         self._db_wafers: List[Dict[str, Any]] = []
         self._auto_loaded = False
+        self.analysis_authenticated = False
+        self.analysis_user = ""
         self.init_ui()
-        # Defer DB browse until first show (avoids slow import path)
-        QTimer.singleShot(0, self.refresh_from_db)
+        # DB browse starts after login (see _unlock_analysis_ui)
 
     # ────────── UI ──────────
 
     def init_ui(self):
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._auth_stack = QStackedWidget()
+        outer.addWidget(self._auth_stack)
+
+        self._lock_page = self._create_analysis_lock_page()
+        self._auth_stack.addWidget(self._lock_page)
+
+        workbench = QWidget()
+        self._build_workbench_ui(workbench)
+        self._workbench_page = workbench
+        self._auth_stack.addWidget(workbench)
+        self._auth_stack.setCurrentIndex(0)
+
+    def _build_workbench_ui(self, host):
+        root = QVBoxLayout(host)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
@@ -100,10 +120,135 @@ class AnalysisTab(QWidget):
         splitter.setSizes([340, 900])
         root.addWidget(splitter, 1)
 
-        self.status_label = QLabel("Ready — Loading inspection database…")
+        status_row = QHBoxLayout()
+        self.status_label = QLabel("Ready — Login required to unlock 3D Analysis")
         self.status_label.setStyleSheet(
             f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 9pt; padding: 4px;")
-        root.addWidget(self.status_label)
+        status_row.addWidget(self.status_label, 1)
+        self.analysis_lock_btn = QPushButton("Lock")
+        self.analysis_lock_btn.setFixedWidth(56)
+        self.analysis_lock_btn.setToolTip("Lock 3D Analysis (requires login again)")
+        self.analysis_lock_btn.setCursor(Qt.PointingHandCursor)
+        self.analysis_lock_btn.clicked.connect(self._lock_analysis_ui)
+        self.analysis_lock_btn.setVisible(False)
+        status_row.addWidget(self.analysis_lock_btn)
+        root.addLayout(status_row)
+
+    def _create_analysis_lock_page(self):
+        page = QWidget()
+        page.setStyleSheet(f"background: {SemiconductorTheme.BG_DARK};")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(24, 24, 24, 24)
+        outer.addStretch()
+
+        card = QFrame()
+        card.setMaximumWidth(440)
+        card.setStyleSheet(f"""
+            QFrame {{
+                background: {SemiconductorTheme.BG_PANEL};
+                border: 1px solid {SemiconductorTheme.BORDER_DEFAULT};
+                border-radius: 8px;
+            }}
+        """)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(20, 18, 20, 18)
+        card_layout.setSpacing(10)
+
+        title = QLabel("<b>3D ANALYSIS</b>")
+        title.setStyleSheet(
+            f"font-size: 12pt; color: {SemiconductorTheme.ACCENT_PRIMARY}; border: none;")
+        card_layout.addWidget(title)
+
+        desc = QLabel(
+            "SOH analytics workbench is locked.\n"
+            "Same credentials as Teaching → Enhance → Foundation Model."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet(
+            f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 9pt; border: none;")
+        card_layout.addWidget(desc)
+
+        self.analysis_activate_check = QCheckBox("Activate 3D Analysis")
+        self.analysis_activate_check.setStyleSheet(
+            f"color: {SemiconductorTheme.TEXT_PRIMARY}; border: none;")
+        self.analysis_activate_check.stateChanged.connect(self._on_analysis_activate_toggled)
+        card_layout.addWidget(self.analysis_activate_check)
+
+        self.analysis_auth_label = QLabel("Status: Locked — authentication required")
+        self.analysis_auth_label.setStyleSheet(
+            f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 9pt; border: none;")
+        card_layout.addWidget(self.analysis_auth_label)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(card)
+        row.addStretch()
+        outer.addLayout(row)
+        outer.addStretch()
+        return page
+
+    def _on_analysis_activate_toggled(self, state):
+        want = bool(state)
+        if not want:
+            self._lock_analysis_ui()
+            return
+
+        if self.analysis_authenticated and self.analysis_user:
+            self._unlock_analysis_ui()
+            return
+
+        user = prompt_privileged_login(
+            self,
+            title="3D Analysis Login",
+            message="Enter credentials to unlock 3D Analysis.",
+        )
+        if not user:
+            self.analysis_activate_check.blockSignals(True)
+            self.analysis_activate_check.setChecked(False)
+            self.analysis_activate_check.blockSignals(False)
+            self.analysis_authenticated = False
+            return
+
+        self.analysis_authenticated = True
+        self.analysis_user = user
+        self._unlock_analysis_ui()
+
+    def _unlock_analysis_ui(self):
+        self.analysis_auth_label.setText(f"Status: Authenticated as {self.analysis_user}")
+        self.analysis_auth_label.setStyleSheet(
+            f"color: {SemiconductorTheme.ACCENT_SUCCESS}; font-size: 9pt; border: none;")
+        self.analysis_lock_btn.setVisible(True)
+        self._auth_stack.setCurrentIndex(1)
+        self.auth_changed.emit(True, self.analysis_user)
+        if not self._auto_loaded:
+            QTimer.singleShot(0, self.refresh_from_db)
+        else:
+            self.status_label.setText(f"Authenticated as {self.analysis_user} · Ready")
+
+    def _lock_analysis_ui(self):
+        self.analysis_authenticated = False
+        self.analysis_user = ""
+        if hasattr(self, "analysis_activate_check"):
+            self.analysis_activate_check.blockSignals(True)
+            self.analysis_activate_check.setChecked(False)
+            self.analysis_activate_check.blockSignals(False)
+        if hasattr(self, "analysis_auth_label"):
+            self.analysis_auth_label.setText("Status: Locked — authentication required")
+            self.analysis_auth_label.setStyleSheet(
+                f"color: {SemiconductorTheme.TEXT_SECONDARY}; font-size: 9pt; border: none;")
+        if hasattr(self, "analysis_lock_btn"):
+            self.analysis_lock_btn.setVisible(False)
+        if hasattr(self, "_auth_stack"):
+            self._auth_stack.setCurrentIndex(0)
+        if hasattr(self, "status_label"):
+            self.status_label.setText("Ready — Login required to unlock 3D Analysis")
+        self.auth_changed.emit(False, "")
+
+    def _require_analysis_auth(self) -> bool:
+        if getattr(self, "analysis_authenticated", False):
+            return True
+        QMessageBox.warning(self, "3D Analysis", "Please activate and login first.")
+        return False
 
     # ── Left panel: scope browser + params + analysis set ──
 
@@ -205,7 +350,7 @@ class AnalysisTab(QWidget):
         params_row.addWidget(ng_label)
 
         self.ng_threshold_spin = QDoubleSpinBox()
-        self.ng_threshold_spin.setRange(0.0, 100.0)
+        self.ng_threshold_spin.setRange(0.0, 9999.0)
         self.ng_threshold_spin.setValue(5.0)
         self.ng_threshold_spin.setSingleStep(0.5)
         self.ng_threshold_spin.setSuffix(" %")
@@ -411,8 +556,8 @@ class AnalysisTab(QWidget):
 
         deep_link_row = QHBoxLayout()
         deep_link_row.setSpacing(4)
-        self.btn_open_line_pulse = QPushButton("Open in Line Pulse")
-        self.btn_open_line_pulse.setToolTip("Open the focused DB FOV in Line Pulse")
+        self.btn_open_line_pulse = QPushButton("Open in Live Review")
+        self.btn_open_line_pulse.setToolTip("Open the focused DB FOV in Live Review")
         self.btn_open_line_pulse.clicked.connect(self._open_focused_in_line_pulse)
         deep_link_row.addWidget(self.btn_open_line_pulse)
         self.btn_open_results = QPushButton("Open Results folder")
@@ -847,7 +992,7 @@ class AnalysisTab(QWidget):
             for row in fovs:
                 row["metric"] = self._map_metric_value(row)
             self._populate_fov_map(fovs)
-            focus = f" · focus Chip {self._map_focus_chip[0]},{self._map_focus_chip[1]}" if self._map_focus_chip else ""
+            focus = f" · focus Chip {self._map_focus_chip[1]},{self._map_focus_chip[0]}" if self._map_focus_chip else ""
             self.maps_status_label.setText(f"{len(chips)} die(s) · {self.maps_metric_combo.currentText()} mean{focus}")
             if include_mes_table:
                 self._refresh_mes_table(self._db.list_mes_joined(**scope, limit=10000))
@@ -868,9 +1013,9 @@ class AnalysisTab(QWidget):
         values = list(grid.values()); mean = sum(values) / len(values)
         deviation = max(abs(v - mean) for v in values)
         for (col, row_idx), value in grid.items():
-            item = QTableWidgetItem(f"{value:.3f}\nC{col},R{row_idx}")
+            item = QTableWidgetItem(f"{value:.3f}\nR{row_idx},C{col}")
             item.setTextAlignment(Qt.AlignCenter); item.setData(Qt.UserRole, (col, row_idx))
-            item.setToolTip(f"Chip {col},{row_idx}\n{self.maps_metric_combo.currentText()}: {value:.4f}\nSet mean: {mean:.4f}")
+            item.setToolTip(f"Chip {row_idx},{col}\n{self.maps_metric_combo.currentText()}: {value:.4f}\nSet mean: {mean:.4f}")
             item.setBackground(self._metrology_color(value, mean, deviation))
             item.setForeground(QColor(SemiconductorTheme.TEXT_ON_ACCENT))
             table.setItem(rows_idx.index(row_idx), cols.index(col), item)
@@ -907,7 +1052,7 @@ class AnalysisTab(QWidget):
         for r, row in enumerate(rows):
             raw_ratio = float(row.get("ratio") or 0.0)
             ratio = raw_ratio * (100 if raw_ratio <= 1 else 1)
-            values = [f"{row.get('chip_col', '')},{row.get('chip_row', '')}", row.get("fov_index", ""),
+            values = [f"{row.get('chip_row', '')},{row.get('chip_col', '')}", row.get("fov_index", ""),
                       row.get("layer_name", ""), f"{float(row.get('soh') or 0):.4f}", f"{ratio:.3f}%",
                       row.get("judgment", ""), row.get("grid_row", ""), row.get("grid_col", ""),
                       row.get("centroid_x", ""), row.get("centroid_y", "")]
@@ -1067,6 +1212,8 @@ class AnalysisTab(QWidget):
 
     def refresh_from_db(self):
         """Reload lot/wafer filters and rebuild scope tree from inspection.db."""
+        if not self._require_analysis_auth():
+            return
         try:
             self._db = get_db()
             self._db_lots = self._db.list_lots()
@@ -1091,7 +1238,8 @@ class AnalysisTab(QWidget):
             lf = lot.get("lot_foup_id") or ""
             n_w = lot.get("n_wafers") or 0
             n_f = lot.get("n_fov") or 0
-            label = f"{date_f} · {lf}  ({n_w}W / {n_f} FOV)"
+            date_disp = date_f if date_f else "(no date)"
+            label = f"{date_disp} · {lf}  ({n_w}W / {n_f} FOV)"
             self.lot_combo.addItem(label, (date_f, lf))
         self.lot_combo.blockSignals(False)
 
@@ -1114,7 +1262,14 @@ class AnalysisTab(QWidget):
         date_f, lf = data
         self._scope_lot = f"{date_f}|{lf}"
         try:
-            self._db_wafers = self._db.list_wafers(date_folder=date_f, lot_foup_id=lf)
+            if date_f:
+                self._db_wafers = self._db.list_wafers(date_folder=date_f, lot_foup_id=lf)
+            else:
+                # Empty date_folder = legacy Online filename layout (no host yy_mm_dd)
+                self._db_wafers = [
+                    w for w in self._db.list_wafers(date_folder="", lot_foup_id=lf)
+                    if not (w.get("date_folder") or "")
+                ]
         except Exception:
             self._db_wafers = []
         for w in self._db_wafers:
@@ -1265,6 +1420,8 @@ class AnalysisTab(QWidget):
 
     def load_selected_wafer(self):
         """Load all FOV runs for the selected wafer into the analysis set."""
+        if not self._require_analysis_auth():
+            return
         if not self._scope_wafer_key:
             QMessageBox.information(self, "Load", "Select a wafer first.")
             return
@@ -1292,6 +1449,8 @@ class AnalysisTab(QWidget):
 
     def load_checked_fovs(self):
         """Load only checked FOV runs."""
+        if not self._require_analysis_auth():
+            return
         ids = self._checked_run_ids()
         if not ids:
             QMessageBox.information(
@@ -1339,6 +1498,8 @@ class AnalysisTab(QWidget):
 
     def import_sample(self):
         """Import a single sample — browse for a folder containing measurement CSV(s)."""
+        if not self._require_analysis_auth():
+            return
         folder = QFileDialog.getExistingDirectory(
             self, "Select Sample Output Folder",
             "", QFileDialog.ShowDirsOnly)
@@ -1357,6 +1518,8 @@ class AnalysisTab(QWidget):
 
     def import_batch(self):
         """Import multiple samples — browse for a parent folder where each subfolder is a sample."""
+        if not self._require_analysis_auth():
+            return
         parent = QFileDialog.getExistingDirectory(
             self, "Select Parent Folder (each subfolder = 1 sample)",
             "", QFileDialog.ShowDirsOnly)
@@ -1474,6 +1637,8 @@ class AnalysisTab(QWidget):
 
     def remove_sample(self):
         """Remove selected units from the analysis set."""
+        if not self._require_analysis_auth():
+            return
         selected_items = self.sample_tree.selectedItems()
         if not selected_items:
             QMessageBox.warning(
@@ -1520,6 +1685,8 @@ class AnalysisTab(QWidget):
 
     def remove_all_samples(self):
         """Clear the analysis set."""
+        if not self._require_analysis_auth():
+            return
         if not self.samples:
             return
 
@@ -1556,7 +1723,7 @@ class AnalysisTab(QWidget):
             src = "DB" if getattr(sample, "source", "") == "db" else "CSV"
             if getattr(sample, "fov_index", 0):
                 title = (
-                    f"P{sample.fov_index} · C{sample.chip_col},{sample.chip_row}"
+                    f"P{sample.fov_index} · R{sample.chip_row},C{sample.chip_col}"
                     f" · {sample.wafer_id or sample.name}"
                 )
             else:
@@ -1663,7 +1830,7 @@ class AnalysisTab(QWidget):
         run = self._focused_run()
         if not run:
             QMessageBox.information(
-                self, "Line Pulse", "Select a DB-backed FOV in the Analysis Set first."
+                self, "Live Review", "Select a DB-backed FOV in the Analysis Set first."
             )
             return
         self.open_in_line_pulse.emit(str(run.get("run_id") or ""))
@@ -1935,6 +2102,8 @@ class AnalysisTab(QWidget):
 
     def _recalculate_all(self):
         """Recompute all SOH metrics using current NG threshold."""
+        if not self._require_analysis_auth():
+            return
         ng_threshold = self.ng_threshold_spin.value() / 100.0
 
         for sample in self.samples:
@@ -1959,6 +2128,8 @@ class AnalysisTab(QWidget):
 
     def export_report(self):
         """Export the summary table as CSV."""
+        if not self._require_analysis_auth():
+            return
         if not self.samples:
             QMessageBox.information(
                 self, "Export", "No data to export. Load a wafer from DB or import CSV first.")

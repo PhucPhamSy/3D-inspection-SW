@@ -11,7 +11,6 @@ from inno3d.features.batch_review.map_stage import MapStage
 from inno3d.features.batch_review.widgets import (
     build_wafer_context_from_db,
     WaferMapWidget, FovMapWidget,
-    FovSnapshotPanel,
     MiniBarChart,
 )
 
@@ -26,6 +25,7 @@ UI layout mirrors docs/mockups/batch_review_tab.html:
 
 import csv
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +62,7 @@ from PyQt5.QtWidgets import (
 from inno3d.core.inspection_db import InspectionDB, get_db
 from inno3d.core.lot_foup import (
     format_lot_foup_display,
+    format_slot_display,
     join_lot_foup,
     parse_date_folder_display,
     split_lot_foup,
@@ -70,20 +71,25 @@ from inno3d.core.product_labels import (
     BUMP_RESULTS,
     BUMPS_KPI,
     FOV_DONE_KPI,
-    LINE_PULSE_NAV,
-    LINE_PULSE_SUBTITLE,
-    LINE_PULSE_TITLE,
+    LIVE_REVIEW_NAV,
+    LIVE_REVIEW_SUBTITLE,
+    LIVE_REVIEW_TITLE,
     MES_HELPER,
     NG_FOV_KPI,
     OPEN_BUMP_STATS_CSV,
     YIELD_KPI,
 )
 from inno3d.core.styles import SemiconductorTheme
+from inno3d.features.viewer.shared_widgets import (
+    ExcelFilterHeader,
+    _category_item,
+    _numeric_item,
+)
 from inno3d.core.wafer_context import WaferContext
 
 
 class LiveStrip(QFrame):
-    """Compact, operator-facing summary of the latest Line Pulse FOV."""
+    """Operator summary: wafer scope, FOV progress (done/planned), last inspected site."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -91,55 +97,73 @@ class LiveStrip(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 5, 12, 5)
         layout.setSpacing(1)
-        self.scope_label = QLabel("● LIVE  ·  Waiting for catalogued FOV results")
+        self.scope_label = QLabel("● LIVE  ·  Waiting for inspection results")
         self.scope_label.setObjectName("LinePulseLiveScope")
-        self.metrics_label = QLabel("FOV 0  ░░░░░░░░░░  —%    Yield —   NG FOV 0   Last: —")
+        self.metrics_label = QLabel(
+            "FOV 0/—  ░░░░░░░░░░  —%    Yield —   NG FOV 0   Last: —"
+        )
         self.metrics_label.setObjectName("LinePulseLiveMetrics")
         layout.addWidget(self.scope_label)
         layout.addWidget(self.metrics_label)
 
-    def set_snapshot(self, kpis: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> None:
-        payload = payload or {}
-        n_fov = int(kpis.get("n_fov") or 0)
-        n_ng = int(kpis.get("n_ng") or 0)
-        yield_pct = float(kpis.get("yield_pct") or 0)
-        lot = str(payload.get("lot_id") or "")
-        foup = str(payload.get("foup_id") or "")
-        wafer = str(payload.get("wafer_id") or "")
+    def set_snapshot(
+        self,
+        progress: Dict[str, Any],
+        focus: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        progress = progress or {}
+        focus = focus or {}
+        n_fov = int(progress.get("n_fov") or 0)
+        n_expected = int(progress.get("n_expected") or 0)
+        n_ng = int(progress.get("n_ng") or 0)
+        yield_pct = float(progress.get("yield_pct") or 0)
+        progress_pct = float(progress.get("progress_pct") or 0)
+        if progress_pct <= 0 and n_expected > 0:
+            progress_pct = 100.0 * n_fov / n_expected
+        # Clamp display to 100% if n_fov > n_expected (rare, but show raw counts in text)
+        progress_pct = min(100.0, progress_pct)
+
+        lot = str(focus.get("lot_id") or "")
+        foup = str(focus.get("foup_id") or "")
+        wafer = str(focus.get("wafer_id") or "")
+        try:
+            slot = int(focus.get("slot") or 0)
+        except (TypeError, ValueError):
+            slot = 0
         if not (lot or foup or wafer):
-            parts = str(payload.get("wafer_key") or "").split("|")
+            parts = str(focus.get("wafer_key") or "").split("|")
             if len(parts) >= 3:
                 wafer = parts[2]
+            if slot <= 0 and len(parts) >= 4:
+                from inno3d.core.lot_foup import parse_slot_token
+
+                slot = parse_slot_token(parts[3])
+        slot_disp = format_slot_display(slot)
         scope = "  ·  ".join(
-            part for part in (
+            part
+            for part in (
                 f"LOT {lot}" if lot else "",
                 f"FOUP {foup}" if foup else "",
                 f"WAFER {wafer}" if wafer else "",
-            ) if part
+                slot_disp,
+            )
+            if part
         )
-        self.scope_label.setText(f"● LIVE  {scope or '· Current selection'}")
+        self.scope_label.setText(f"● LIVE  {scope or '· Current wafer'}")
 
-        total = next(
-            (
-                int(payload.get(key) or 0)
-                for key in ("total_fov", "expected_fov", "planned_fov")
-                if int(payload.get(key) or 0) > 0
-            ),
-            0,
-        )
-        progress = min(100, round(100 * n_fov / total)) if total else 0
-        bar = "█" * round(progress / 10) + "░" * (10 - round(progress / 10))
-        fov_text = f"{n_fov}/{total}" if total else str(n_fov)
-        col = payload.get("chip_col")
-        row = payload.get("chip_row")
-        point = payload.get("fov_index")
-        judgment = str(payload.get("judgment") or "").upper()
+        bar_n = min(10, max(0, round(progress_pct / 10)))
+        bar = "█" * bar_n + "░" * (10 - bar_n)
+        fov_text = f"{n_fov}/{n_expected}" if n_expected else str(n_fov)
+        col = focus.get("chip_col")
+        row = focus.get("chip_row")
+        point = focus.get("fov_index")
+        judgment = str(focus.get("judgment") or "").upper()
         if col is not None and row is not None and point:
             last = f"Chip {col},{row} P{point} {judgment or '—'}"
         else:
             last = "—"
         self.metrics_label.setText(
-            f"FOV {fov_text}  {bar}  {progress}%    "
+            f"FOV {fov_text}  {bar}  {progress_pct:.1f}%    "
             f"Yield {yield_pct:.1f}%   NG FOV {n_ng}   Last: {last}"
         )
 
@@ -160,6 +184,8 @@ class BatchReviewTab(QWidget):
         self._last_scope_fingerprint: Optional[tuple] = None
         self._lot_rows: List[Dict[str, Any]] = []
         self._pending_live_payload: Dict[str, Any] = {}
+        self._pending_run_id = ""
+        self._pending_wafer_key = ""
         self._live_refresh_timer = QTimer(self)
         self._live_refresh_timer.setSingleShot(True)
         self._live_refresh_timer.setInterval(500)
@@ -184,10 +210,10 @@ class BatchReviewTab(QWidget):
         hl.setContentsMargins(12, 8, 12, 8)
         title_col = QVBoxLayout()
         title_col.setSpacing(0)
-        title = QLabel(LINE_PULSE_TITLE)
+        title = QLabel(LIVE_REVIEW_TITLE)
         title.setObjectName("BatchReviewTitle")
         title_col.addWidget(title)
-        subtitle = QLabel(LINE_PULSE_SUBTITLE)
+        subtitle = QLabel(LIVE_REVIEW_SUBTITLE)
         subtitle.setObjectName("BatchReviewMuted")
         title_col.addWidget(subtitle)
         hl.addLayout(title_col)
@@ -202,11 +228,13 @@ class BatchReviewTab(QWidget):
         live_layout = QHBoxLayout(live_row)
         live_layout.setContentsMargins(0, 0, 0, 0)
         self.live_strip = LiveStrip()
-        self.live_auto_refresh = QCheckBox("Live auto-refresh")
-        self.live_auto_refresh.setChecked(False)
+        self.live_auto_refresh = QCheckBox("Follow live inspection")
+        self.live_auto_refresh.setChecked(True)
         self.live_auto_refresh.setToolTip(
-            "When enabled, refresh Line Pulse while Online is running "
-            "(poll every 5 s; full refresh on each catalogued FOV)."
+            "When Online finishes a FOV:\n"
+            "· Jump to that wafer and select the new result\n"
+            "· Refresh progress (done / planned FOV)\n"
+            "· Poll every 5 s while this tab is open (backup)"
         )
         self.live_auto_refresh.toggled.connect(self._sync_live_poll_timer)
         live_layout.addWidget(self.live_strip, 1)
@@ -242,7 +270,7 @@ class BatchReviewTab(QWidget):
 
         self.wafer_combo = QComboBox()
         self.wafer_combo.currentIndexChanged.connect(self._on_wafer_changed)
-        left_l.addWidget(self._field("Wafer", self.wafer_combo))
+        left_l.addWidget(self._field("Wafer · SLOT", self.wafer_combo))
 
         self.judge_combo = QComboBox()
         self.judge_combo.addItem("All judgments", "")
@@ -253,14 +281,19 @@ class BatchReviewTab(QWidget):
         left_l.addWidget(self._field("Judgment filter", self.judge_combo))
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Chip col,row / path / FOV…")
+        self.search_edit.setPlaceholderText("Chip row,col / path / FOV…")
         self.search_edit.returnPressed.connect(self._reload_fov_list)
         left_l.addWidget(self._field("Search", self.search_edit))
 
         # KPIs
         kpi_grid = QGridLayout()
         self.kpi_fov = self._kpi_card("0", FOV_DONE_KPI)
-        self.kpi_yield = self._kpi_card("—", YIELD_KPI)
+        self.kpi_fov.setToolTip(
+            "FOV done / planned\n"
+            "Planned = dies inside wafer circle \u00d7 9 FOV points (P1\u2013P9).\n"
+            "Counts latest result only per site (re-inspect does not inflate)."
+        )
+        self.kpi_yield = self._kpi_card("\u2014", YIELD_KPI)
         self.kpi_ng = self._kpi_card("0", NG_FOV_KPI)
         self.kpi_obj = self._kpi_card("0", BUMPS_KPI)
         kpi_grid.addWidget(self.kpi_fov, 0, 0)
@@ -294,12 +327,12 @@ class BatchReviewTab(QWidget):
         cl.setContentsMargins(8, 8, 8, 8)
         cl.setSpacing(8)
 
-        self.breadcrumb = QLabel(f"{LINE_PULSE_NAV}  ›  (select a wafer / FOV)")
+        self.breadcrumb = QLabel(f"{LIVE_REVIEW_NAV}  ›  (select a wafer / FOV)")
         self.breadcrumb.setObjectName("BatchReviewBreadcrumb")
         self.breadcrumb.setWordWrap(True)
         cl.addWidget(self.breadcrumb)
 
-        # Row 1: unified Map Stage (Wafer L0 → Chip FOV L1). Viewer-only for 3D.
+        # Row 1: Map Stage — one wafer canvas; zoom-in shows FOV P1–P9 in-die.
         self.map_stage = MapStage()
         self.map_stage.setMinimumHeight(300)
         self.map_stage.dieSelected.connect(self._on_die_clicked)
@@ -312,8 +345,8 @@ class BatchReviewTab(QWidget):
         self._wafer_ctx: Optional[WaferContext] = None
         cl.addWidget(self.map_stage, 4)
 
-        # Row 2: FOV run table
-        cl.addWidget(self._section_label("FOV RUNS · SELECT TO REPLAY"))
+        # Row 2: FOV run table (one row per site — latest result)
+        cl.addWidget(self._section_label("FOV SITES · LATEST PER POINT"))
         self.fov_table = QTableWidget(0, 8)
         self.fov_table.setHorizontalHeaderLabels(
             ["Run", "Chip", "FOV", "Judgment", "Bumps", "NG", "Total s", "Finished"]
@@ -325,8 +358,8 @@ class BatchReviewTab(QWidget):
         self.fov_table.horizontalHeader().setStretchLastSection(True)
         self.fov_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.fov_table.itemSelectionChanged.connect(self._on_fov_selected)
-        self.fov_table.setMaximumHeight(160)
-        cl.addWidget(self.fov_table)
+        self.fov_table.setMinimumHeight(120)
+        cl.addWidget(self.fov_table, 2)
 
         cl.addWidget(self._section_label(BUMP_RESULTS))
         mes_helper = QLabel(MES_HELPER)
@@ -334,17 +367,29 @@ class BatchReviewTab(QWidget):
         mes_helper.setWordWrap(True)
         cl.addWidget(mes_helper)
         self.mes_table = QTableWidget(0, 10)
+        self.mes_filter_header = ExcelFilterHeader(self.mes_table)
+        self.mes_table.setHorizontalHeader(self.mes_filter_header)
+        self.mes_filter_header.filter_applied.connect(self._apply_mes_excel_filters)
+        self.mes_filter_header.sortIndicatorChanged.connect(
+            lambda _idx, _order: self._apply_mes_excel_filters()
+        )
         self.mes_table.setHorizontalHeaderLabels(
             ["#", "Layer", "Bump ID", "B.H", "B.V", "V.V", "Ratio%", "Judgment", "Gap X", "Gap Y"]
         )
         self.mes_table.setAlternatingRowColors(True)
+        self.mes_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.mes_table.verticalHeader().setVisible(False)
         self.mes_table.horizontalHeader().setStretchLastSection(True)
-        self.mes_table.setMaximumHeight(160)
-        cl.addWidget(self.mes_table)
-
-        self.fov_snapshot_panel = FovSnapshotPanel()
-        cl.addWidget(self.fov_snapshot_panel)
+        self.mes_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.mes_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.mes_table.setSortingEnabled(True)
+        self.mes_table.horizontalHeader().setSortIndicatorShown(True)
+        self.mes_table.setMinimumHeight(140)
+        self.mes_table.setToolTip(
+            "BUMP RESULTS — click column header to sort\n"
+            "Click funnel icon for Excel-style value filter"
+        )
+        cl.addWidget(self.mes_table, 3)
 
         actions = QHBoxLayout()
         self.btn_open_results = QPushButton("Open Results folder")
@@ -540,14 +585,15 @@ class BatchReviewTab(QWidget):
             self.setUpdatesEnabled(True)
 
     def _scope_fingerprint(self) -> tuple:
-        """Cheap aggregate signature — detects new/changed FOV runs without rebuilding maps."""
-        k = self.db.global_kpis(self._current_wafer_key)
+        """Cheap signature — detects new/changed latest-per-FOV results."""
+        p = self.db.wafer_progress(self._current_wafer_key)
         return (
             self._current_wafer_key or "",
-            int(k.get("n_fov") or 0),
-            int(k.get("n_ok") or 0),
-            int(k.get("n_ng") or 0),
-            int(k.get("n_bump_ng") or 0),
+            int(p.get("n_fov") or 0),
+            int(p.get("n_ok") or 0),
+            int(p.get("n_ng") or 0),
+            int(p.get("n_bump_ng") or 0),
+            str(self._pending_run_id or ""),
         )
 
     def _remember_scope_fingerprint(self) -> None:
@@ -561,35 +607,131 @@ class BatchReviewTab(QWidget):
         if not key:
             self._wafer_runs_cache = []
             return
-        self._wafer_runs_cache = self.db.list_fov_runs(wafer_key=key, limit=5000)
+        self._wafer_runs_cache = self.db.list_fov_runs(
+            wafer_key=key, limit=5000, latest_only=True
+        )
 
     def on_run_catalogued(self, payload: Optional[Dict[str, Any]] = None) -> None:
-        """Debounce an Online completion into a refresh of the selected wafer scope."""
+        """Online completion → follow wafer, refresh, select the new FOV."""
         if not self.live_auto_refresh.isChecked():
             return
-        self._pending_live_payload = dict(payload or {})
+        data = dict(payload or {})
+        self._pending_live_payload = data
+        self._pending_run_id = str(data.get("run_id") or "")
+        self._pending_wafer_key = str(data.get("wafer_key") or "")
         self._live_refresh_timer.start()
 
     def _refresh_live_scope(self) -> None:
-        """Refresh selected-wafer UI after catalogued Online FOV or poll-detected change."""
+        """Follow the latest Online FOV, or quietly refresh when poll detects change."""
         if not self.live_auto_refresh.isChecked():
             return
+        payload = dict(self._pending_live_payload or {})
+        run_id = str(payload.get("run_id") or self._pending_run_id or "")
+        wafer_key = str(payload.get("wafer_key") or self._pending_wafer_key or "")
+        # Only a real Online catalog event may jump wafer / die / selected FOV.
+        follow_event = bool(run_id and wafer_key)
+
         self.setUpdatesEnabled(False)
         try:
+            if follow_event:
+                self._reload_date_lot_foup_filters()
+                self._focus_wafer_key(wafer_key)
+                chip_col = int(payload.get("chip_col") or 0)
+                chip_row = int(payload.get("chip_row") or 0)
+                if chip_col > 0 and chip_row > 0:
+                    self._die_filter = (chip_col, chip_row)
+                    self.search_edit.blockSignals(True)
+                    self.search_edit.setText(f"{chip_row},{chip_col}")
+                    self.search_edit.blockSignals(False)
+                # Reset judgment filter to "All" so a newly catalogued NG/OK
+                # FOV is never hidden by an active filter before the follow-jump.
+                self.judge_combo.blockSignals(True)
+                self.judge_combo.setCurrentIndex(0)  # index 0 = "All judgments", data=""
+                self.judge_combo.blockSignals(False)
+            elif not self._current_wafer_key:
+                self._reload_date_lot_foup_filters()
+                if self.wafer_combo.count():
+                    self._current_wafer_key = self.wafer_combo.currentData() or ""
+
+            self._wafer_runs_cache_key = ""
             self._ensure_wafer_runs_cache(force=True)
             self._reload_wafer_list()
             self._reload_fov_list()
             self._reload_kpis()
             self._reload_charts()
-            self._update_live_strip(self._pending_live_payload)
+            self._update_live_strip(payload if follow_event else None)
+            if follow_event:
+                self._select_run_by_id(run_id, load_detail=True)
+                # Consume one-shot follow target so poll won't re-jump.
+                self._pending_run_id = ""
+                self._pending_wafer_key = ""
             self._remember_scope_fingerprint()
         finally:
             self.setUpdatesEnabled(True)
 
-    def _update_live_strip(self, payload: Optional[Dict[str, Any]] = None) -> None:
+    def _focus_wafer_key(self, wafer_key: str) -> bool:
+        """Select Date / Lot / FOUP / Wafer combos for a canonical wafer_key."""
+        from inno3d.core.inspection_db import normalize_wafer_key
+        from inno3d.core.lot_foup import split_lot_foup
+
+        key = normalize_wafer_key(str(wafer_key or ""))
+        if not key:
+            return False
+        parts = key.split("|")
+        date_folder = parts[0] if len(parts) > 0 else ""
+        lot_foup = parts[1] if len(parts) > 1 else ""
+        lot_id, foup_id = split_lot_foup(lot_foup)
+
+        combos = (self.date_combo, self.lot_combo, self.foup_combo, self.wafer_combo)
+        for c in combos:
+            c.blockSignals(True)
+        try:
+            if date_folder:
+                self._restore_combo(self.date_combo, date_folder)
+            else:
+                restored = False
+                for i in range(self.date_combo.count()):
+                    if self.date_combo.itemData(i) == "__EMPTY__":
+                        self.date_combo.setCurrentIndex(i)
+                        restored = True
+                        break
+                if not restored:
+                    self.date_combo.setCurrentIndex(0)
+
+            self._reload_lot_combo(preserve_lot=lot_id, preserve_foup=foup_id)
+            self._reload_wafer_combo()
+            self._restore_combo(self.wafer_combo, key)
+            self._current_wafer_key = self.wafer_combo.currentData() or key
+        finally:
+            for c in combos:
+                c.blockSignals(False)
+        return True
+
+    def _select_run_by_id(self, run_id: str, load_detail: bool = True) -> bool:
+        rid = str(run_id or "")
+        if not rid:
+            return False
+        for i, run in enumerate(self._runs_cache):
+            if str(run.get("run_id") or "") != rid:
+                continue
+            # Avoid double _load_run_detail via itemSelectionChanged.
+            self.fov_table.blockSignals(True)
+            try:
+                self.fov_table.selectRow(i)
+            finally:
+                self.fov_table.blockSignals(False)
+            if load_detail:
+                self._load_run_detail(rid)
+            return True
+        return False
+
+    def _update_live_strip(self, focus: Optional[Dict[str, Any]] = None) -> None:
+        focus_data = dict(focus if focus is not None else self._pending_live_payload)
+        if self._current_wafer_key and not focus_data.get("wafer_key"):
+            focus_data.setdefault("wafer_key", self._current_wafer_key)
         self.live_strip.set_snapshot(
-            self.db.global_kpis(self._current_wafer_key),
-            payload if payload is not None else self._pending_live_payload,
+            self.db.wafer_progress(self._current_wafer_key),
+            focus_data,
         )
 
     def _poll_live_scope(self) -> None:
@@ -626,14 +768,23 @@ class BatchReviewTab(QWidget):
                 combo.setCurrentIndex(i)
                 return
 
-    def _rows_for_date(self, date_folder: str) -> List[Dict[str, Any]]:
+    def _selected_date_folder(self):
+        """Return date filter: ``None`` = all, ``\"\"`` = legacy empty, else ``yy_mm_dd``."""
+        data = self.date_combo.currentData() if self.date_combo.count() else None
+        if data is None:
+            return None
+        if data == "__EMPTY__":
+            return ""
+        return str(data)
+
+    def _rows_for_date(self, date_folder) -> List[Dict[str, Any]]:
         rows = self._lot_rows
-        if date_folder:
-            rows = [r for r in rows if (r.get("date_folder") or "") == date_folder]
-        return rows
+        if date_folder is None:
+            return rows
+        return [r for r in rows if (r.get("date_folder") or "") == (date_folder or "")]
 
     def _reload_date_lot_foup_filters(self):
-        cur_date = self.date_combo.currentData() if self.date_combo.count() else ""
+        cur_date = self.date_combo.currentData() if self.date_combo.count() else None
         cur_lot = self.lot_combo.currentData() if self.lot_combo.count() else ""
         cur_foup = self.foup_combo.currentData() if self.foup_combo.count() else ""
 
@@ -641,12 +792,12 @@ class BatchReviewTab(QWidget):
 
         self.date_combo.blockSignals(True)
         self.date_combo.clear()
-        self.date_combo.addItem("All dates", "")
-        dates = sorted(
-            {r.get("date_folder") or "" for r in self._lot_rows if r.get("date_folder")},
-            reverse=True,
-        )
-        for d in dates:
+        # None = All dates; "__EMPTY__" = legacy Online rows with blank date_folder
+        self.date_combo.addItem("All dates", None)
+        raw_dates = {r.get("date_folder") or "" for r in self._lot_rows}
+        if "" in raw_dates:
+            self.date_combo.addItem("(no date · legacy)", "__EMPTY__")
+        for d in sorted((x for x in raw_dates if x), reverse=True):
             self.date_combo.addItem(parse_date_folder_display(d), d)
         self._restore_combo(self.date_combo, cur_date)
         self.date_combo.blockSignals(False)
@@ -655,7 +806,7 @@ class BatchReviewTab(QWidget):
         self._reload_wafer_combo()
 
     def _reload_lot_combo(self, preserve_lot: Any = None, preserve_foup: Any = None):
-        date_folder = self.date_combo.currentData() or ""
+        date_folder = self._selected_date_folder()
         cur_lot = preserve_lot if preserve_lot is not None else (self.lot_combo.currentData() or "")
 
         self.lot_combo.blockSignals(True)
@@ -670,7 +821,7 @@ class BatchReviewTab(QWidget):
         self._reload_foup_combo(preserve_foup=preserve_foup)
 
     def _reload_foup_combo(self, preserve_foup: Any = None):
-        date_folder = self.date_combo.currentData() or ""
+        date_folder = self._selected_date_folder()
         lot_id = self.lot_combo.currentData() or ""
         cur_foup = preserve_foup if preserve_foup is not None else (self.foup_combo.currentData() or "")
 
@@ -695,23 +846,28 @@ class BatchReviewTab(QWidget):
         return ""
 
     def _list_filtered_wafers(self) -> List[Dict[str, Any]]:
-        date_folder = self.date_combo.currentData() or ""
+        date_sel = self._selected_date_folder()  # None | "" | yy_mm_dd
         lot_id = self.lot_combo.currentData() or ""
         foup_id = self.foup_combo.currentData() or ""
         lot_foup_id = self._current_lot_foup_id()
-        if lot_foup_id:
-            return self.db.list_wafers(date_folder=date_folder, lot_foup_id=lot_foup_id)
-        wafers = self.db.list_wafers(date_folder=date_folder, lot_foup_id="")
-        if lot_id:
-            wafers = [
-                w for w in wafers
-                if split_lot_foup(w.get("lot_foup_id") or "")[0] == lot_id
-            ]
-        if foup_id:
-            wafers = [
-                w for w in wafers
-                if split_lot_foup(w.get("lot_foup_id") or "")[1] == foup_id
-            ]
+        # DB helper: empty date_folder arg means "do not filter by date"
+        if date_sel:
+            wafers = self.db.list_wafers(date_folder=date_sel, lot_foup_id=lot_foup_id or "")
+        else:
+            wafers = self.db.list_wafers(date_folder="", lot_foup_id=lot_foup_id or "")
+            if date_sel == "":
+                wafers = [w for w in wafers if not (w.get("date_folder") or "")]
+        if not lot_foup_id:
+            if lot_id:
+                wafers = [
+                    w for w in wafers
+                    if split_lot_foup(w.get("lot_foup_id") or "")[0] == lot_id
+                ]
+            if foup_id:
+                wafers = [
+                    w for w in wafers
+                    if split_lot_foup(w.get("lot_foup_id") or "")[1] == foup_id
+                ]
         return wafers
 
     def _reload_wafer_combo(self):
@@ -720,7 +876,14 @@ class BatchReviewTab(QWidget):
         wafers = self._list_filtered_wafers()
         for w in wafers:
             y = w.get("yield_pct") or 0
-            label = f"{w.get('wafer_id') or '?'} · {w.get('n_fov', 0)} FOV · Yield {y:.1f}%"
+            slot_disp = format_slot_display(int(w.get("slot") or 0))
+            wafer_label = w.get("wafer_id") or "?"
+            if slot_disp:
+                wafer_label = f"{wafer_label} · {slot_disp}"
+            n_done = int(w.get("n_fov") or 0)
+            n_plan = int(w.get("n_expected") or 0)
+            fov_disp = f"{n_done}/{n_plan}" if n_plan else str(n_done)
+            label = f"{wafer_label} · FOV {fov_disp} · Yield {y:.1f}%"
             self.wafer_combo.addItem(label, w.get("wafer_key"))
         self.wafer_combo.blockSignals(False)
         if self.wafer_combo.count():
@@ -734,12 +897,20 @@ class BatchReviewTab(QWidget):
             y = w.get("yield_pct") or 0
             _, foup_id = split_lot_foup(w.get("lot_foup_id") or "")
             foup_disp = format_lot_foup_display("", foup_id)
+            slot_disp = format_slot_display(int(w.get("slot") or 0))
             last = w.get("last_run") or ""
             updated = str(last)[:19] if last else "—"
-            meta = f"{foup_disp} · updated {updated}" if foup_disp != "—" else f"updated {updated}"
+            meta_bits = [p for p in (foup_disp if foup_disp != "—" else "", slot_disp) if p]
+            meta = " · ".join(meta_bits + [f"updated {updated}"])
+            wafer_title = w.get("wafer_id") or "?"
+            if slot_disp:
+                wafer_title = f"{wafer_title} · {slot_disp}"
+            n_done = int(w.get("n_fov") or 0)
+            n_plan = int(w.get("n_expected") or 0)
+            fov_disp = f"{n_done}/{n_plan}" if n_plan else str(n_done)
             text = (
-                f"{w.get('wafer_id') or '?'}\n"
-                f"{w.get('n_fov', 0)} FOV done · Yield {y:.1f}% · NG {w.get('n_ng', 0)}\n"
+                f"{wafer_title}\n"
+                f"FOV {fov_disp} · Yield {y:.1f}% · NG {w.get('n_ng', 0)}\n"
                 f"{meta}"
             )
             item = QListWidgetItem(text)
@@ -749,11 +920,14 @@ class BatchReviewTab(QWidget):
             self.wafer_list.addItem(item)
 
     def _reload_kpis(self):
-        k = self.db.global_kpis(self._current_wafer_key)
-        self._set_kpi(self.kpi_fov, str(k.get("n_fov", 0)))
-        self._set_kpi(self.kpi_yield, f"{k.get('yield_pct', 0):.1f}%", ok_color=True)
-        self._set_kpi(self.kpi_ng, str(k.get("n_ng", 0)), ng_color=True)
-        n_bump = int(k.get("n_bump_ng") or 0)
+        p = self.db.wafer_progress(self._current_wafer_key)
+        n = int(p.get("n_fov") or 0)
+        expected = int(p.get("n_expected") or 0)
+        fov_disp = f"{n}/{expected}" if expected else str(n)
+        self._set_kpi(self.kpi_fov, fov_disp)
+        self._set_kpi(self.kpi_yield, f"{p.get('yield_pct', 0):.1f}%", ok_color=True)
+        self._set_kpi(self.kpi_ng, str(p.get("n_ng", 0)), ng_color=True)
+        n_bump = int(p.get("n_bump_ng") or 0)
         self._set_kpi(self.kpi_obj, str(n_bump), ng_color=bool(n_bump))
 
     def _reload_fov_list(self):
@@ -768,7 +942,7 @@ class BatchReviewTab(QWidget):
             q = search.lower()
             runs = [
                 x for x in runs
-                if q in f"{x.get('chip_col')},{x.get('chip_row')}".lower()
+                if q in f"{x.get('chip_row')},{x.get('chip_col')}".lower()
                 or q in str(x.get("fov_folder") or "").lower()
                 or q in str(x.get("results_dir") or "").lower()
                 or q in str(x.get("run_id") or "").lower()
@@ -781,7 +955,7 @@ class BatchReviewTab(QWidget):
         for i, run in enumerate(runs):
             cells = [
                 str(run.get("run_id") or "")[:10],
-                f"({run.get('chip_col')},{run.get('chip_row')})",
+                f"({run.get('chip_row')},{run.get('chip_col')})",
                 f"P{run.get('fov_index')}" if run.get("fov_index") else (run.get("fov_folder") or "—"),
                 str(run.get("judgment") or "—"),
                 str(run.get("n_objects") or 0),
@@ -811,12 +985,12 @@ class BatchReviewTab(QWidget):
         if ctx is not None:
             crumb = ctx.breadcrumb() if hasattr(ctx, "breadcrumb") else ""
             self.breadcrumb.setText(
-                f"{LINE_PULSE_NAV}  ›  {crumb or self._current_wafer_key or '—'}  ·  "
+                f"{LIVE_REVIEW_NAV}  ›  {crumb or self._current_wafer_key or '—'}  ·  "
                 f"{len(runs)} FOV run(s)  ·  yield {ctx.yield_pct:.1f}%"
             )
         else:
             self.breadcrumb.setText(
-                f"{LINE_PULSE_NAV}  ›  {self._current_wafer_key or '—'}  ·  {len(runs)} FOV run(s)"
+                f"{LIVE_REVIEW_NAV}  ›  {self._current_wafer_key or '—'}  ·  {len(runs)} FOV run(s)"
             )
 
     def _reload_charts(self):
@@ -845,6 +1019,7 @@ class BatchReviewTab(QWidget):
         self._reload_wafer_list()
         self._die_filter = None
         self._wafer_runs_cache_key = ""
+        self.map_stage.set_level(0)
         self._reload_fov_list()
         self._reload_kpis()
         self._reload_charts()
@@ -854,6 +1029,7 @@ class BatchReviewTab(QWidget):
         self._current_wafer_key = self.wafer_combo.currentData() or ""
         self._die_filter = None
         self._wafer_runs_cache_key = ""
+        self.map_stage.set_level(0)
         self._reload_wafer_list()
         self._reload_fov_list()
         self._reload_kpis()
@@ -873,6 +1049,7 @@ class BatchReviewTab(QWidget):
                 self.wafer_combo.blockSignals(False)
                 break
         self._die_filter = None
+        self.map_stage.set_level(0)
         self._reload_fov_list()
         self._reload_kpis()
         self._reload_charts()
@@ -898,27 +1075,28 @@ class BatchReviewTab(QWidget):
         )
         self._wafer_ctx = ctx
         self.map_stage.set_context(ctx)
-        # Keep Level 1 when a die is active; otherwise Wafer overview
-        if ctx and int(ctx.selected_col or 0) > 0 and die:
-            self.map_stage.set_level(1)
-        else:
-            self.map_stage.set_level(0)
+        # Do not change zoom here — die click / Fit wafer own the view.
         if not self._current_wafer_key and not (ctx and ctx.selected_col > 0):
             self.chip_label.setText("Select a wafer, then a die")
 
     def _on_die_clicked(self, col: int, row: int):
         self._die_filter = (col, row)
-        self.search_edit.setText(f"{col},{row}")
+        self.search_edit.setText(f"{row},{col}")
         self._refresh_context_maps(selected_col=col, selected_row=row, selected_fov=5)
         self.map_stage.set_level(1)
         self._reload_fov_list()
 
     def _on_fov_map_clicked(self, col: int, row: int, fov_index: int):
-        """Select latest run for this FOV point on the active die (MapStage L1)."""
+        """Select latest run for this FOV point (in-die P1–P9 click)."""
+        die_changed = getattr(self, "_die_filter", None) != (int(col), int(row))
         self._die_filter = (int(col), int(row))
+        self.search_edit.setText(f"{row},{col}")
         if self._wafer_ctx is not None:
+            self._wafer_ctx.select_chip(int(col), int(row))
             self._wafer_ctx.select_fov(int(fov_index))
             self.map_stage.set_context(self._wafer_ctx)
+        if die_changed:
+            self._reload_fov_list()
         for i, run in enumerate(self._runs_cache):
             if int(run.get("fov_index") or 0) != int(fov_index):
                 continue
@@ -956,53 +1134,93 @@ class BatchReviewTab(QWidget):
         self._current_run_id = run_id or ""
         run = self.db.get_run(run_id) if run_id else None
         self.timeline_list.clear()
+        self._clear_mes_excel_filters()
         self.mes_table.setRowCount(0)
         if not run:
             self.detail_label.setText("No run selected")
-            self.fov_snapshot_panel.set_run({})
             return
 
         date_disp = parse_date_folder_display(run.get("date_folder") or "")
         lot_id, foup_id = split_lot_foup(run.get("lot_foup_id") or "")
         lot_foup_disp = format_lot_foup_display(lot_id, foup_id)
+        slot_disp = format_slot_display(int(run.get("slot") or 0))
+        wafer_disp = str(run.get("wafer_id") or "—")
+        if slot_disp:
+            wafer_disp = f"{wafer_disp} · {slot_disp}"
         # Qt rich text
         self.breadcrumb.setTextFormat(Qt.RichText)
         self.breadcrumb.setText(
-            f"{LINE_PULSE_NAV} &nbsp;›&nbsp; {date_disp} &nbsp;›&nbsp; "
-            f"{lot_foup_disp} &nbsp;›&nbsp; <b>{run.get('wafer_id') or '—'}</b> "
-            f"&nbsp;›&nbsp; Chip ({run.get('chip_col')},{run.get('chip_row')}) "
-            f"&nbsp;›&nbsp; <b>FOV P{run.get('fov_index') or '?'}</b> "
+            f"{LIVE_REVIEW_NAV} &nbsp;›&nbsp; {date_disp} &nbsp;›&nbsp; "
+            f"{lot_foup_disp} &nbsp;›&nbsp; <b>{wafer_disp}</b> "
+            f"&nbsp;›&nbsp; Chip (R{run.get('chip_row')},C{run.get('chip_col')}) "
+            f"&nbsp;›&nbsp; <b>P{run.get('fov_index') or '?'}</b> "
             f"&nbsp;·&nbsp; run_id <span style='color:#22d3ee'>{run_id}</span> "
             f"&nbsp;·&nbsp; {run.get('config_path') or ''}"
         )
 
-        objs = run.get("mes_objects") or []
-        self.mes_table.setRowCount(len(objs))
+        objs = list(run.get("mes_objects") or [])
+        # Layer 1 → 12 ascending (natural), then bump grid position
+        def _mes_row_key(s: dict):
+            layer = str(s.get("layer_name") or "")
+            layer_key = [
+                int(p) if p.isdigit() else p.lower()
+                for p in re.split(r"(\d+)", layer)
+            ]
+            return (
+                layer in ("", "N/A", "ALL"),
+                layer_key,
+                int(s.get("grid_row") or 0),
+                int(s.get("grid_col") or 0),
+                int(s.get("row_id") or 0),
+            )
+
+        objs.sort(key=_mes_row_key)
+        table = self.mes_table
+        was_sorting = table.isSortingEnabled()
+        table.setSortingEnabled(False)
+        table.setRowCount(len(objs))
         for i, s in enumerate(objs):
             ratio = float(s.get("ratio") or 0)
             ratio_pct = ratio * 100 if ratio < 1e8 else float("nan")
             jud = str(s.get("judgment") or "")
-            cells = [
-                str(s.get("row_id") or i + 1),
-                str(s.get("layer_name") or ""),
-                f"({s.get('grid_row')},{s.get('grid_col')})",
-                f"{float(s.get('soh') or 0):.2f}",
-                f"{float(s.get('c1_volume') or 0):.1f}",
-                f"{float(s.get('c2_volume') or 0):.1f}",
-                f"{ratio_pct:.2f}" if ratio_pct == ratio_pct else "N/A",
-                jud,
-                f"{float(s.get('pitch_x') or 0):.3f}",
-                f"{float(s.get('pitch_y') or 0):.3f}",
+            try:
+                row_id_num = float(s.get("row_id") or i + 1)
+            except (TypeError, ValueError):
+                row_id_num = float(i + 1)
+            gr, gc = s.get("grid_row"), s.get("grid_col")
+            try:
+                bump_sort = float(gr) * 10000.0 + float(gc)
+            except (TypeError, ValueError):
+                bump_sort = float("-inf")
+            soh = float(s.get("soh") or 0)
+            c1 = float(s.get("c1_volume") or 0)
+            c2 = float(s.get("c2_volume") or 0)
+            px = float(s.get("pitch_x") or 0)
+            py = float(s.get("pitch_y") or 0)
+            items = [
+                _numeric_item(str(s.get("row_id") or i + 1), row_id_num),
+                _category_item(str(s.get("layer_name") or "")),
+                _numeric_item(f"({gr},{gc})", bump_sort),
+                _numeric_item(f"{soh:.2f}", soh),
+                _numeric_item(f"{c1:.1f}", c1),
+                _numeric_item(f"{c2:.1f}", c2),
+                _numeric_item(
+                    f"{ratio_pct:.2f}" if ratio_pct == ratio_pct else "N/A",
+                    ratio_pct if ratio_pct == ratio_pct else float("inf"),
+                ),
+                _category_item(jud),
+                _numeric_item(f"{px:.3f}", px),
+                _numeric_item(f"{py:.3f}", py),
             ]
-            for col, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            for col, item in enumerate(items):
                 if col == 7:
                     if jud.upper() == "NG":
                         item.setForeground(QColor(SemiconductorTheme.ACCENT_ERROR))
                     elif jud.upper() == "OK":
                         item.setForeground(QColor(SemiconductorTheme.ACCENT_SUCCESS))
-                self.mes_table.setItem(i, col, item)
+                table.setItem(i, col, item)
+        table.setSortingEnabled(was_sorting)
+        self._apply_mes_excel_filters()
 
         for t in run.get("timeline") or []:
             ts = str(t.get("ts") or "")[11:19]
@@ -1028,7 +1246,30 @@ class BatchReviewTab(QWidget):
         self._refresh_context_maps(
             selected_col=c, selected_row=r, selected_fov=fi or 5
         )
-        self.fov_snapshot_panel.set_run(run)
+
+    def _clear_mes_excel_filters(self) -> None:
+        header = getattr(self, "mes_filter_header", None)
+        if header is None:
+            return
+        header._filters = {}
+        try:
+            header.viewport().update()
+        except Exception:
+            pass
+        table = getattr(self, "mes_table", None)
+        if table is None:
+            return
+        for row in range(table.rowCount()):
+            table.setRowHidden(row, False)
+
+    def _apply_mes_excel_filters(self, _col_index: int = -1) -> None:
+        """Hide rows based on ExcelFilterHeader unchecked values."""
+        header = getattr(self, "mes_filter_header", None)
+        table = getattr(self, "mes_table", None)
+        if header is None or table is None:
+            return
+        for row in range(table.rowCount()):
+            table.setRowHidden(row, header.is_row_hidden(table, row))
 
     def select_run(self, run_id: str) -> bool:
         """Select and display a DB FOV run, including its wafer context."""
@@ -1121,8 +1362,8 @@ class BatchReviewTab(QWidget):
         if not path:
             return
         keys = [
-            "run_id", "date_folder", "lot_foup_id", "wafer_id",
-            "chip_col", "chip_row", "fov_index", "judgment", "n_objects", "n_ng",
+            "run_id", "date_folder", "lot_foup_id", "wafer_id", "slot",
+            "chip_row", "chip_col", "fov_index", "judgment", "n_objects", "n_ng",
             "total_sec", "results_dir", "input_path", "finished_at",
         ]
         with open(path, "w", newline="", encoding="utf-8") as f:
